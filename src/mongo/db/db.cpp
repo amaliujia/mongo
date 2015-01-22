@@ -35,7 +35,9 @@
 #include <boost/thread/thread.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
+#include <iostream>
 #include <limits>
+#include <signal.h>
 #include <string>
 
 #include "mongo/base/init.h"
@@ -73,10 +75,10 @@
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/network_interface_impl.h"
-#include "mongo/db/repl/repl_coordinator_external_state_impl.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_external_state_impl.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/restapi.h"
 #include "mongo/db/server_parameters.h"
@@ -115,6 +117,15 @@
 #endif
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::cout;
+    using std::cerr;
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     using logger::LogComponent;
 
@@ -443,7 +454,7 @@ namespace mongo {
         }
 
         DEV log(LogComponent::kControl) << "_DEBUG build (which is slower)" << endl;
-        logMongodStartupWarnings();
+        logMongodStartupWarnings(storageGlobalParams);
 
 #if defined(_WIN32)
         printTargetMinOS();
@@ -732,7 +743,7 @@ static void startupConfigActions(const std::vector<std::string>& args) {
         string procPath;
         if (!failed){
             try {
-                ifstream f (name.c_str());
+                std::ifstream f (name.c_str());
                 f >> pid;
                 procPath = (str::stream() << "/proc/" << pid);
                 if (!boost::filesystem::exists(procPath))

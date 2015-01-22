@@ -44,10 +44,14 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::min;
+    using std::string;
+    using std::stringstream;
 
     class CmdRenameCollection : public Command {
     public:
@@ -91,10 +95,6 @@ namespace mongo {
             }
 
             return indexes;
-        }
-
-        virtual void restoreIndexBuildsOnSource(std::vector<BSONObj> indexesInProg, std::string source) {
-            IndexBuilder::restoreIndexes( indexesInProg );
         }
 
         static void dropCollection(OperationContext* txn, Database* db, StringData collName) {
@@ -203,7 +203,9 @@ namespace mongo {
 
             const std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, sourceDB, cmdObj);
             // Dismissed on success
-            ScopeGuard indexBuildRestorer = MakeGuard(IndexBuilder::restoreIndexes, indexesInProg);
+            ScopeGuard indexBuildRestorer = MakeGuard(IndexBuilder::restoreIndexes,
+                                                      txn,
+                                                      indexesInProg);
 
             Database* const targetDB = dbHolder().openDb(txn, nsToDatabase(target));
 

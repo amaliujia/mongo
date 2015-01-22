@@ -33,6 +33,8 @@
 
 #include "mongo/db/storage/in_memory/in_memory_record_store.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/oplog_hack.h"
@@ -42,6 +44,9 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+
     class InMemoryRecordStore::InsertChange : public RecoveryUnit::Change {
     public:
         InsertChange(Data* data, RecordId loc) :_data(data), _loc(loc) {}
@@ -312,6 +317,10 @@ namespace mongo {
         return StatusWith<RecordId>(loc);
     }
 
+    bool InMemoryRecordStore::updateWithDamagesSupported() const {
+        return true;
+    }
+
     Status InMemoryRecordStore::updateWithDamages( OperationContext* txn,
                                                    const RecordId& loc,
                                                    const RecordData& oldRec,
@@ -385,17 +394,6 @@ namespace mongo {
             _data->dataSize -= it->second.size;
             _data->records.erase(it++);
         }
-    }
-
-    bool InMemoryRecordStore::compactSupported() const {
-        return false;
-    }
-    Status InMemoryRecordStore::compact(OperationContext* txn,
-                                        RecordStoreCompactAdaptor* adaptor,
-                                        const CompactOptions* options,
-                                        CompactStats* stats) {
-        // TODO might be possible to do something here
-        invariant(!"compact not yet implemented");
     }
 
     Status InMemoryRecordStore::validate(OperationContext* txn,

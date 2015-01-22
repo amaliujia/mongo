@@ -37,7 +37,7 @@
 // so we define the following macro
 #define MONGO_EXPOSE_MACROS 1
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <iostream>
 

@@ -214,13 +214,6 @@ namespace mongo {
              virtual bool pointsToSamePlaceAs(const Cursor& other) const = 0;
 
             /**
-             * If the SortedDataInterface impl calls the BucketNotificationCallback, the argument must
-             * be forwarded to all Cursors over that SortedData.
-             * TODO something better.
-             */
-            virtual void aboutToDeleteBucket(const RecordId& bucket) = 0;
-
-            /**
              * Position 'this' forward (reverse) cursor either at the entry or
              * immediately after (or immediately before) the specified key and RecordId.
              * The cursor should be positioned at EOF if no such entry exists.
@@ -240,8 +233,8 @@ namespace mongo {
             virtual void advanceTo(const BSONObj &keyPrefix,
                                    int prefixLen,
                                    bool prefixExclusive,
-                                   const vector<const BSONElement*>& keySuffix,
-                                   const vector<bool>& suffixInclusive) = 0;
+                                   const std::vector<const BSONElement*>& keySuffix,
+                                   const std::vector<bool>& suffixInclusive) = 0;
 
             /**
              * Position 'this' forward (reverse) cursor either at the first
@@ -293,8 +286,8 @@ namespace mongo {
             virtual void customLocate(const BSONObj& keyPrefix,
                                       int prefixLen,
                                       bool prefixExclusive,
-                                      const vector<const BSONElement*>& keySuffix,
-                                      const vector<bool>& suffixInclusive) = 0;
+                                      const std::vector<const BSONElement*>& keySuffix,
+                                      const std::vector<bool>& suffixInclusive) = 0;
 
             /**
              * Return the key associated with the current position of 'this' cursor.

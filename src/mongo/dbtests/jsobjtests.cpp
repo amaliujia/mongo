@@ -31,7 +31,9 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <iostream>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
@@ -45,6 +47,14 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     typedef std::map<std::string, BSONElement> BSONMap;
     BSONMap bson2map(const BSONObj& obj) {
         BSONMap m;
@@ -804,6 +814,9 @@ namespace JsobjTests {
 
                 b.append( "g" , -123.456 );
 
+                b.append( "h" , 0.0 );
+                b.append( "i" , -0.0 );
+
                 BSONObj x = b.obj();
                 keyTest(x);
 
@@ -817,6 +830,8 @@ namespace JsobjTests {
 
                 ASSERT_EQUALS( "-123.456" , x["g"].toString( false , true ) );
 
+                ASSERT_EQUALS( "0.0" , x["h"].toString( false , true ) );
+                ASSERT_EQUALS( "-0.0" , x["i"].toString( false , true ) );
             }
         };
 

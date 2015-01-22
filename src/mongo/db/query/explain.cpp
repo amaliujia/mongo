@@ -30,6 +30,8 @@
 
 #include "mongo/db/query/explain.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/query/get_executor.h"
@@ -46,6 +48,10 @@
 namespace {
 
     using namespace mongo;
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     /**
      * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
@@ -291,6 +297,7 @@ namespace mongo {
 
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nWouldDelete", spec->docsDeleted);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
             }
         }
         else if (STAGE_FETCH == stats.stageType) {
@@ -427,10 +434,8 @@ namespace mongo {
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nMatched", spec->nMatched);
                 bob->appendNumber("nWouldModify", spec->nModified);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
                 bob->appendBool("wouldInsert", spec->inserted);
-            }
-
-            if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendBool("fastmod", spec->fastmod);
                 bob->appendBool("fastmodinsert", spec->fastmodinsert);
             }
@@ -710,9 +715,6 @@ namespace mongo {
         const CommonStats* common = root->getCommonStats();
         statsOut->nReturned = common->advanced;
         statsOut->executionTimeMillis = common->executionTimeMillis;
-
-        // Generate the plan summary string.
-        statsOut->summaryStr = getPlanSummary(root);
 
         // The other fields are aggregations over the stages in the plan tree. We flatten
         // the tree into a list and then compute these aggregations.

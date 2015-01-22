@@ -44,12 +44,15 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/d_state.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     namespace {
 

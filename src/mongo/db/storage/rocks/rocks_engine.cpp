@@ -1,5 +1,3 @@
-// rocks_engine.cpp
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -31,6 +29,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/rocks/rocks_engine.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -58,12 +58,13 @@
 
 namespace mongo {
 
+    using boost::shared_ptr;
+
     const std::string RocksEngine::kOrderingPrefix("indexordering-");
     const std::string RocksEngine::kCollectionPrefix("collection-");
 
     RocksEngine::RocksEngine(const std::string& path, bool durable)
         : _path(path),
-          _collectionComparator(RocksRecordStore::newRocksCollectionComparator()),
           _durable(durable) {
 
         auto columnFamilyNames = _loadColumnFamilies();       // vector of column family names
@@ -319,16 +320,11 @@ namespace mongo {
 
     rocksdb::ColumnFamilyOptions RocksEngine::_collectionOptions() const {
         rocksdb::ColumnFamilyOptions options;
-        invariant( _collectionComparator.get() );
-        options.comparator = _collectionComparator.get();
         return options;
     }
 
     rocksdb::ColumnFamilyOptions RocksEngine::_indexOptions(const Ordering& order) const {
-        rocksdb::ColumnFamilyOptions options;
-        invariant( _collectionComparator.get() );
-        options.comparator = RocksSortedDataImpl::newRocksComparator(order);
-        return options;
+        return rocksdb::ColumnFamilyOptions();
     }
 
     Status toMongoStatus( rocksdb::Status s ) {

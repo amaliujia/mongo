@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
 #include <wiredtiger.h>
@@ -60,6 +61,8 @@ namespace mongo {
         void setSortedDataInterfaceExtraOptions( const std::string& options );
 
         virtual bool supportsDocLocking() const;
+
+        virtual bool supportsDirectoryPerDB() const;
 
         virtual bool isDurable() const { return _durable; }
 
@@ -124,7 +127,7 @@ namespace mongo {
 
         bool _hasUri(WT_SESSION* session, const std::string& uri) const;
 
-        string _uri( const StringData& ident ) const;
+        std::string _uri( const StringData& ident ) const;
         bool _drop( const StringData& ident );
 
         WT_CONNECTION* _conn;
@@ -133,14 +136,14 @@ namespace mongo {
         std::string _path;
         bool _durable;
 
-        string _rsOptions;
-        string _indexOptions;
+        std::string _rsOptions;
+        std::string _indexOptions;
 
         std::set<std::string> _identToDrop;
         mutable boost::mutex _identToDropMutex;
 
-        scoped_ptr<WiredTigerSizeStorer> _sizeStorer;
-        string _sizeStorerUri;
+        boost::scoped_ptr<WiredTigerSizeStorer> _sizeStorer;
+        std::string _sizeStorerUri;
         mutable ElapsedTracker _sizeStorerSyncTracker;
     };
 

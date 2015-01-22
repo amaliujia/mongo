@@ -35,6 +35,9 @@
 
 #include <cctype>
 #include <boost/filesystem/operations.hpp>
+#include <boost/scoped_array.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
@@ -45,6 +48,14 @@
 #include "mongo/util/text.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::set;
+    using std::string;
+
     long long Scope::_lastVersion = 1;
 
 namespace {
@@ -122,7 +133,7 @@ namespace {
         boost::filesystem::path p(filename);
 #endif
         if (!exists(p)) {
-            log() << "file [" << filename << "] doesn't exist" << endl;
+            error() << "file [" << filename << "] doesn't exist" << endl;
             return false;
         }
 
@@ -134,14 +145,14 @@ namespace {
             for (boost::filesystem::directory_iterator it (p); it != end; it++) {
                 empty = false;
                 boost::filesystem::path sub(*it);
-                if (!endsWith(sub.string().c_str(), ".js"))
+                if (!str::endsWith(sub.string().c_str(), ".js"))
                     continue;
                 if (!execFile(sub.string(), printResult, reportError, timeoutMs))
                     return false;
             }
 
             if (empty) {
-                log() << "directory [" << filename << "] doesn't have any *.js files" << endl;
+                error() << "directory [" << filename << "] doesn't have any *.js files" << endl;
                 return false;
             }
 
@@ -219,7 +230,7 @@ namespace {
                 _storedNames.insert(n.valuestr());
             }
             catch (const DBException& setElemEx) {
-                log() << "unable to load stored JavaScript function " << n.valuestr()
+                error() << "unable to load stored JavaScript function " << n.valuestr()
                       << "(): " << setElemEx.what() << endl;
             }
         }
@@ -349,7 +360,7 @@ namespace {
         static const unsigned kMaxPoolSize = 10;
         static const int kMaxScopeReuse = 10;
 
-        typedef deque<ScopeAndPool> Pools; // More-recently used Scopes are kept at the front.
+        typedef std::deque<ScopeAndPool> Pools; // More-recently used Scopes are kept at the front.
         Pools _pools;    // protected by _mutex
         mongo::mutex _mutex;
     };

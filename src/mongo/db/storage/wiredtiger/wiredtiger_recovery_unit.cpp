@@ -33,6 +33,7 @@
 #include <boost/thread/condition.hpp>
 #include <boost/thread/mutex.hpp>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -168,7 +169,7 @@ namespace mongo {
 
     WiredTigerRecoveryUnit* WiredTigerRecoveryUnit::get(OperationContext *txn) {
         invariant( txn );
-        return dynamic_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit());
+        return checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit());
     }
 
     void WiredTigerRecoveryUnit::assertInActiveTxn() const {
@@ -243,19 +244,28 @@ namespace mongo {
 
     // ---------------------
 
-    WiredTigerCursor::WiredTigerCursor(const std::string& uri, uint64_t id, WiredTigerRecoveryUnit* ru) {
-        _init( uri, id, ru );
+    WiredTigerCursor::WiredTigerCursor(const std::string& uri,
+                                       uint64_t id,
+                                       bool forRecordStore,
+                                       WiredTigerRecoveryUnit* ru) {
+        _init( uri, id, forRecordStore, ru );
     }
 
-    WiredTigerCursor::WiredTigerCursor(const std::string& uri, uint64_t id, OperationContext* txn) {
-        _init( uri, id, WiredTigerRecoveryUnit::get( txn ) );
+    WiredTigerCursor::WiredTigerCursor(const std::string& uri,
+                                       uint64_t id,
+                                       bool forRecordStore,
+                                       OperationContext* txn) {
+        _init( uri, id, forRecordStore, WiredTigerRecoveryUnit::get( txn ) );
     }
 
-    void WiredTigerCursor::_init( const std::string& uri, uint64_t id, WiredTigerRecoveryUnit* ru ) {
+    void WiredTigerCursor::_init( const std::string& uri,
+                                  uint64_t id,
+                                  bool forRecordStore,
+                                  WiredTigerRecoveryUnit* ru ) {
         _uriID = id;
         _ru = ru;
         _session = _ru->getSession();
-        _cursor = _session->getCursor( uri, id );
+        _cursor = _session->getCursor( uri, id, forRecordStore );
         if ( !_cursor ) {
             error() << "no cursor for uri: " << uri;
         }

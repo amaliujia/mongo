@@ -32,6 +32,8 @@
 
 #include "mongo/db/query/find.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -47,7 +49,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/oplog_hack.h"
@@ -59,6 +61,10 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+
+using boost::scoped_ptr;
+using std::auto_ptr;
+using std::endl;
 
 namespace mongo {
     // The .h for this in find_constants.h.
@@ -149,6 +155,7 @@ namespace mongo {
             : _cc(cc), _txn(txn) {
 
             // Save this for later.  We restore it upon destruction.
+            _txn->recoveryUnit()->commitAndRestart();
             _txnPreviousRecoveryUnit = txn->releaseRecoveryUnit();
 
             // Transfer ownership of the RecoveryUnit from the ClientCursor to the OpCtx.
@@ -157,6 +164,7 @@ namespace mongo {
         }
 
         ~ScopedRecoveryUnitSwapper() {
+            _txn->recoveryUnit()->commitAndRestart();
             _cc->setOwnedRecoveryUnit(_txn->releaseRecoveryUnit());
             _txn->setRecoveryUnit(_txnPreviousRecoveryUnit);
         }
@@ -190,9 +198,27 @@ namespace mongo {
 
         exhaust = false;
 
-        // This is a read lock.
         const NamespaceString nss(ns);
+
+        // Depending on the type of cursor being operated on, we hold locks for the whole getMore,
+        // or none of the getMore, or part of the getMore.  The three cases in detail:
+        //
+        // 1) Normal cursor: we lock with "ctx" and hold it for the whole getMore.
+        // 2) Cursor owned by global cursor manager: we don't lock anything.  These cursors don't
+        //    own any collection state.
+        // 3) Agg cursor: we lock with "ctx", then release, then relock with "unpinDBLock" and
+        //    "unpinCollLock".  This is because agg cursors handle locking internally (hence the
+        //    release), but the pin and unpin of the cursor must occur under the collection lock.
+        //    We don't use our AutoGetCollectionForRead "ctx" to relock, because
+        //    AutoGetCollectionForRead checks the sharding version (and we want the relock for the
+        //    unpin to succeed even if the sharding version has changed).
+        //
+        // Note that we declare our locks before our ClientCursorPin, in order to ensure that the
+        // pin's destructor is called before the lock destructors (so that the unpin occurs under
+        // the lock).
         boost::scoped_ptr<AutoGetCollectionForRead> ctx;
+        boost::scoped_ptr<Lock::DBLock> unpinDBLock;
+        boost::scoped_ptr<Lock::CollectionLock> unpinCollLock;
 
         CursorManager* cursorManager;
         CursorManager* globalCursorManager = CursorManager::getGlobalCursorManager();
@@ -203,7 +229,7 @@ namespace mongo {
             ctx.reset(new AutoGetCollectionForRead(txn, nss));
             Collection* collection = ctx->getCollection();
             uassert( 17356, "collection dropped between getMore calls", collection );
-            cursorManager = collection->cursorManager();
+            cursorManager = collection->getCursorManager();
         }
 
         QLOG() << "Running getMore, cursorid: " << cursorid << endl;
@@ -252,12 +278,10 @@ namespace mongo {
         else {
             // Check for spoofing of the ns such that it does not match the one originally
             // there for the cursor.
-            if (globalCursorManager->ownsCursorId(cursorid)) {
-                // TODO Implement auth check for global cursors.  SERVER-16657.
-            }
-            else {
-                uassert(17011, "auth error", str::equals(ns, cc->ns().c_str()));
-            }
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Requested getMore on namespace " << ns << ", but cursor "
+                                  << cursorid << " belongs to namespace " << cc->ns(),
+                    ns == cc->ns());
             *isCursorAuthorized = true;
 
             // Restore the RecoveryUnit if we need to.
@@ -376,6 +400,23 @@ namespace mongo {
                 saveClientCursor = true;
             }
 
+            // If we are operating on an aggregation cursor, then we dropped our collection lock
+            // earlier and need to reacquire it in order to clean up our ClientCursorPin.
+            //
+            // TODO: We need to ensure that this relock happens if we release the pin above in
+            // response to PlanExecutor::getNext() throwing an exception.
+            if (cc->isAggCursor()) {
+                invariant(NULL == ctx.get());
+                unpinDBLock.reset(new Lock::DBLock(txn->lockState(), nss.db(), MODE_IS));
+                unpinCollLock.reset(new Lock::CollectionLock(txn->lockState(), nss.ns(), MODE_IS));
+            }
+
+            // Our two possible ClientCursorPin cleanup paths are:
+            // 1) If the cursor is not going to be saved, we call deleteUnderlying() on the pin.
+            // 2) If the cursor is going to be saved, we simply let the pin go out of scope.  In
+            //    this case, the pin's destructor will be invoked, which will call release() on the
+            //    pin.  Because our ClientCursorPin is declared after our lock is declared, this
+            //    will happen under the lock.
             if (!saveClientCursor) {
                 ruSwapper.reset();
                 ccPin.deleteUnderlying();
@@ -536,11 +577,11 @@ namespace mongo {
     std::string runQuery(OperationContext* txn,
                          Message& m,
                          QueryMessage& q,
+                         const NamespaceString& nss,
                          CurOp& curop,
                          Message &result,
                          bool fromDBDirectClient) {
         // Validate the namespace.
-        const NamespaceString nss(q.ns);
         uassert(16256, str::stream() << "Invalid ns [" << nss.ns() << "]", nss.isValid());
 
         // Set curop information.
@@ -659,7 +700,6 @@ namespace mongo {
             BSONObj explainObj = explainBob.obj();
             bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
 
-            curop.debug().iscommand = true;
             // TODO: Does this get overwritten/do we really need to set this twice?
             curop.debug().query = q.query;
 
@@ -839,7 +879,9 @@ namespace mongo {
 
             // Allocate a new ClientCursor.  We don't have to worry about leaking it as it's
             // inserted into a global map by its ctor.
-            ClientCursor* cc = new ClientCursor(collection->cursorManager(), exec.get(),
+            ClientCursor* cc = new ClientCursor(collection->getCursorManager(),
+                                                exec.release(),
+                                                nss.ns(),
                                                 pq.getOptions().toInt(),
                                                 pq.getFilter());
             ccId = cc->cursorid();
@@ -854,6 +896,7 @@ namespace mongo {
             else {
                 // We stash away the RecoveryUnit in the ClientCursor.  It's used for subsequent
                 // getMore requests.  The calling OpCtx gets a fresh RecoveryUnit.
+                txn->recoveryUnit()->commitAndRestart();
                 cc->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
                 StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
                 txn->setRecoveryUnit(storageEngine->newRecoveryUnit());
@@ -861,9 +904,6 @@ namespace mongo {
 
             QLOG() << "caching executor with cursorid " << ccId
                    << " after returning " << numResults << " results" << endl;
-
-            // ClientCursor takes ownership of executor.  Release to make sure it's not deleted.
-            exec.release();
 
             // TODO document
             if (pq.getOptions().oplogReplay && !slaveReadTill.isNull()) {

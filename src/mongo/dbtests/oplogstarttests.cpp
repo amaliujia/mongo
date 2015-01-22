@@ -22,6 +22,8 @@
 
 #include "mongo/dbtests/dbtests.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/oplogstart.h"
@@ -34,6 +36,9 @@
 #include "mongo/db/catalog/collection.h"
 
 namespace OplogStartTests {
+
+    using boost::scoped_ptr;
+    using std::string;
 
     class Base {
     public:

@@ -30,7 +30,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <time.h>
 
@@ -64,6 +64,11 @@
 #include "mongo/util/version_reporting.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
 #if 0
     namespace cloud {

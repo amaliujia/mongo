@@ -39,6 +39,7 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 #include <map>
 #include <string>
@@ -67,7 +68,7 @@
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logger/ramlog.h"
@@ -93,6 +94,7 @@
 using namespace std;
 
 namespace {
+    using boost::scoped_ptr;
     using mongo::WriteConcernOptions;
     using mongo::repl::ReplicationCoordinator;
 

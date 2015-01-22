@@ -47,6 +47,8 @@
 
 namespace ExecutorRegistry {
 
+    using std::auto_ptr;
+
     class ExecutorRegistryBase {
     public:
         ExecutorRegistryBase()
@@ -90,7 +92,7 @@ namespace ExecutorRegistry {
         void registerExecutor( PlanExecutor* exec ) {
             WriteUnitOfWork wuow(&_opCtx);
             _ctx->ctx().db()->getOrCreateCollection(&_opCtx, ns())
-                            ->cursorManager()
+                            ->getCursorManager()
                             ->registerExecutor(exec);
             wuow.commit();
         }
@@ -98,7 +100,7 @@ namespace ExecutorRegistry {
         void deregisterExecutor( PlanExecutor* exec ) {
             WriteUnitOfWork wuow(&_opCtx);
             _ctx->ctx().db()->getOrCreateCollection(&_opCtx, ns())
-                            ->cursorManager()
+                            ->getCursorManager()
                             ->deregisterExecutor(exec);
             wuow.commit();
         }

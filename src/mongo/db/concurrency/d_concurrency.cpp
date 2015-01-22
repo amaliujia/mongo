@@ -30,6 +30,8 @@
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
+#include <string>
+
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/namespace_string.h"
@@ -48,6 +50,7 @@ namespace mongo {
 
     //  SERVER-14668: Remove or invert sense once MMAPv1 CLL can be default
     MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableCollectionLocking, bool, true);
+
 
     DBTryLockTimeoutException::DBTryLockTimeoutException() {}
     DBTryLockTimeoutException::~DBTryLockTimeoutException() throw() { }
@@ -131,6 +134,20 @@ namespace mongo {
         _lockState->unlockAll();
     }
 
+    Lock::GlobalLock::GlobalLock(Locker* lockState, LockMode lockMode)
+        : ScopedLock(lockState) {
+
+        LockResult result = _lockState->lockGlobalBegin(lockMode);
+        if (result == LOCK_WAITING) {
+            result = _lockState->lockGlobalComplete(UINT_MAX);
+        }
+
+        invariant(result == LOCK_OK);
+    }
+
+    Lock::GlobalLock::~GlobalLock() {
+        _lockState->unlockAll();
+    }
 
     Lock::DBLock::DBLock(Locker* lockState, const StringData& db, LockMode mode)
         : ScopedLock(lockState),
@@ -143,7 +160,15 @@ namespace mongo {
         const bool isRead = (_mode == MODE_S || _mode == MODE_IS);
 
         _lockState->lockGlobal(isRead ? MODE_IS : MODE_IX);
+
         if (supportsDocLocking() || enableCollectionLocking) {
+
+            // The check for the admin db is to ensure direct writes to auth collections
+            // are serialized (see SERVER-16092).
+            if (_id == resourceIdAdminDB && !isRead) {
+                _mode = MODE_X;
+            }
+
             _lockState->lock(_id, _mode);
         }
         else {
@@ -213,6 +238,29 @@ namespace mongo {
         }
     }
 
+namespace {
+    boost::mutex oplogSerialization; // for OplogIntentWriteLock
+} // namespace
+
+    Lock::OplogIntentWriteLock::OplogIntentWriteLock(Locker* lockState)
+          : _lockState(lockState),
+            _serialized(false) {
+        _lockState->lock(resourceIdOplog, MODE_IX);
+    }
+
+    Lock::OplogIntentWriteLock::~OplogIntentWriteLock() {
+        if (_serialized) {
+            oplogSerialization.unlock();
+        }
+        _lockState->unlock(resourceIdOplog);
+    }
+
+    void Lock::OplogIntentWriteLock::serializeIfNeeded() {
+        if (!supportsDocLocking() && !_serialized) {
+            oplogSerialization.lock();
+            _serialized = true;
+        }
+    }
 
     Lock::ResourceLock::ResourceLock(Locker* lockState, ResourceId rid, LockMode mode)
             : _rid(rid),

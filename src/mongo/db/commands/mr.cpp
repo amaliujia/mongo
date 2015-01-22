@@ -34,6 +34,8 @@
 
 #include "mongo/db/commands/mr.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -50,7 +52,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_impl.h"
@@ -65,6 +67,14 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     namespace mr {
 
@@ -334,7 +344,7 @@ namespace mongo {
             if (_useIncremental) {
                 // We don't want to log the deletion of incLong as it isn't replicated. While
                 // harmless, this would lead to a scary looking warning on the secondaries.
-                ScopedTransaction(_txn, MODE_IX);
+                ScopedTransaction scopedXact(_txn, MODE_IX);
                 Lock::DBLock lk(_txn->lockState(),
                                 nsToDatabaseSubstring(_config.incLong),
                                 MODE_X);
@@ -601,7 +611,7 @@ namespace mongo {
                                _safeCount(_db, _config.tempNamespace, BSONObj()));
                 auto_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace , BSONObj());
                 while (cursor->more()) {
-                    ScopedTransaction(_txn, MODE_IX);
+                    ScopedTransaction scopedXact(_txn, MODE_IX);
                     Lock::DBLock lock(_txn->lockState(),
                                       nsToDatabaseSubstring(_config.outputOptions.finalNamespace),
                                       MODE_X);
@@ -1330,17 +1340,22 @@ namespace mongo {
                     progress.showTotal(showTotal);
                     ProgressMeterHolder pm(progress);
 
-                    wassert( config.limit < 0x4000000 ); // see case on next line to 32 bit unsigned
+                    // See cast on next line to 32 bit unsigned
+                    wassert(config.limit < 0x4000000);
 
                     long long mapTime = 0;
                     long long reduceTime = 0;
                     long long numInputs = 0;
+
                     {
-                        // We've got a cursor preventing migrations off, now re-establish our useful cursor
+                        // We've got a cursor preventing migrations off, now re-establish our
+                        // useful cursor.
 
                         const NamespaceString nss(config.ns);
 
                         // Need lock and context to use it
+                        scoped_ptr<ScopedTransaction> scopedXact(
+                                                        new ScopedTransaction(txn, MODE_IS));
                         scoped_ptr<AutoGetDb> scopedAutoDb(new AutoGetDb(txn, nss.db(), MODE_S));
 
                         const WhereCallbackReal whereCallback(txn, nss.db());
@@ -1405,9 +1420,15 @@ namespace mongo {
                                 // state and yield inside the reduceAndSpillInMemoryState method, so
                                 // it only happens if necessary.
                                 exec->saveState();
+
                                 scopedAutoDb.reset();
+                                scopedXact.reset();
+
                                 state.reduceAndSpillInMemoryStateIfNeeded();
+
+                                scopedXact.reset(new ScopedTransaction(txn, MODE_IS));
                                 scopedAutoDb.reset(new AutoGetDb(txn, nss.db(), MODE_S));
+
                                 exec->restoreState(txn);
 
                                 // Need to reload the database, in case it was dropped after we

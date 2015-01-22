@@ -32,6 +32,7 @@
 
 #include "mongo/db/commands/write_commands/batch_executor.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <memory>
 
 #include "mongo/base/error_codes.h"
@@ -56,8 +57,8 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/operation_context_impl.h"
@@ -72,6 +73,12 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     namespace {
 
@@ -629,7 +636,8 @@ namespace mongo {
                    << ", continuing " << causedBy( opError->getErrMessage() ) << endl;
         }
 
-        bool logAll = logger::globalLogDomain()->shouldLog( logger::LogSeverity::Debug( 1 ) );
+        bool logAll = logger::globalLogDomain()->shouldLog(logger::LogComponent::kWrite,
+                                                           logger::LogSeverity::Debug(1));
         bool logSlow = executionTime
                        > ( serverGlobalParams.slowMS + currentOp->getExpectedLatencyMs() );
 
@@ -637,8 +645,8 @@ namespace mongo {
             LOG(0) << currentOp->debug().report( *currentOp ) << endl;
         }
 
-        if ( currentOp->shouldDBProfile( executionTime ) ) {
-            profile( txn, *txn->getClient(), currentOp->getOp(), *currentOp );
+        if (currentOp->shouldDBProfile(executionTime)) {
+            profile(txn, txn->getCurOp()->getOp());
         }
     }
 
@@ -1158,20 +1166,8 @@ namespace mongo {
         Command::appendCommandStatus(resultBuilder, success, errmsg);
         BSONObj cmdResult = resultBuilder.done();
         uassertStatusOK(Command::getStatusFromCommandResult(cmdResult));
-        const long long numIndexesBefore = cmdResult["numIndexesBefore"].safeNumberLong();
-        const long long numIndexesAfter = cmdResult["numIndexesAfter"].safeNumberLong();
-        if (numIndexesAfter - numIndexesBefore == 1) {
-            result->getStats().n = 1;
-        }
-        else if (numIndexesAfter != 0 && numIndexesAfter != numIndexesBefore) {
-            severe() <<
-                "Created multiple indexes while attempting to create only 1; numIndexesBefore = " <<
-                numIndexesBefore << "; numIndexesAfter = " << numIndexesAfter;
-            fassertFailed(28547);
-        }
-        else {
-            result->getStats().n = 0;
-        }
+        result->getStats().n =
+            cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
     }
 
     static void multiUpdate( OperationContext* txn,
@@ -1279,8 +1275,9 @@ namespace mongo {
                 continue;
             }
 
+            OpDebug* debug = &txn->getCurOp()->debug();
+
             try {
-                OpDebug* debug = &txn->getCurOp()->debug();
                 invariant(collection);
                 PlanExecutor* rawExec;
                 uassertStatusOK(getExecutorUpdate(txn, collection, &parsedUpdate, debug, &rawExec));
@@ -1301,6 +1298,7 @@ namespace mongo {
                 result->getStats().upsertedID = resUpsertedID;
             }
             catch ( const WriteConflictException& dle ) {
+                debug->writeConflicts++;
                 if ( isMulti ) {
                     log() << "Had WriteConflict during multi update, aborting";
                     throw;
@@ -1387,6 +1385,7 @@ namespace mongo {
                 break;
             }
             catch ( const WriteConflictException& dle ) {
+                txn->getCurOp()->debug().writeConflicts++;
                 WriteConflictException::logAndBackoff( attempt++, "delete", nss.ns() );
             }
             catch ( const DBException& ex ) {

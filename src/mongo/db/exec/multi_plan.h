@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -121,7 +123,7 @@ namespace mongo {
          * Gathers execution stats for all losing plans. Caller takes ownership of
          * all pointers in the returned vector.
          */
-        vector<PlanStageStats*> generateCandidateStats();
+        std::vector<PlanStageStats*> generateCandidateStats();
 
         static const char* kStageType;
 

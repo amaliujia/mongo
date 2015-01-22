@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -239,6 +240,7 @@ __log_acquire(WT_SESSION_IMPL *session, uint64_t recsize, WT_LOGSLOT *slot)
 		if (log->log_close_fh != NULL)
 			F_SET(slot, SLOT_CLOSEFH);
 	}
+
 	/*
 	 * Checkpoints can be configured based on amount of log written.
 	 * Add in this log record to the sum and if needed, signal the
@@ -415,7 +417,7 @@ __log_file_header(
 	if (end_lsn != NULL)
 		*end_lsn = tmp.slot_end_lsn;
 
-err:	__wt_scr_free(&buf);
+err:	__wt_scr_free(session, &buf);
 	return (ret);
 }
 
@@ -440,7 +442,7 @@ __log_openfile(WT_SESSION_IMPL *session,
 	 * XXX - if we are not creating the file, we should verify the
 	 * log file header record for the magic number and versions here.
 	 */
-err:	__wt_scr_free(&path);
+err:	__wt_scr_free(session, &path);
 	return (ret);
 }
 
@@ -488,8 +490,8 @@ __log_alloc_prealloc(WT_SESSION_IMPL *session, uint32_t to_num)
 	 */
 	WT_ERR(__wt_rename(session, from_path->data, to_path->data));
 
-err:	__wt_scr_free(&from_path);
-	__wt_scr_free(&to_path);
+err:	__wt_scr_free(session, &from_path);
+	__wt_scr_free(session, &to_path);
 	if (logfiles != NULL)
 		__wt_log_files_free(session, logfiles, logcount);
 	return (ret);
@@ -612,8 +614,8 @@ __wt_log_allocfile(
 	 */
 	WT_ERR(__wt_rename(session, from_path->data, to_path->data));
 
-err:	__wt_scr_free(&from_path);
-	__wt_scr_free(&to_path);
+err:	__wt_scr_free(session, &from_path);
+	__wt_scr_free(session, &to_path);
 	if (log_fh != NULL)
 		WT_TRET(__wt_close(session, log_fh));
 	return (ret);
@@ -635,7 +637,7 @@ __wt_log_remove(WT_SESSION_IMPL *session,
 	WT_ERR(__wt_verbose(session, WT_VERB_LOG,
 	    "log_remove: remove log %s", (char *)path->data));
 	WT_ERR(__wt_remove(session, path->data));
-err:	__wt_scr_free(&path);
+err:	__wt_scr_free(session, &path);
 	return (ret);
 }
 
@@ -856,7 +858,6 @@ __log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
-	WT_FH *close_fh;
 	WT_LOG *log;
 	WT_LSN sync_lsn;
 	size_t write_size;
@@ -866,17 +867,6 @@ __log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot)
 	conn = S2C(session);
 	log = conn->log;
 	locked = 0;
-
-	/*
-	 * If we're going to have to close our log file, make a local copy
-	 * of the file handle structure.
-	 */
-	close_fh = NULL;
-	if (F_ISSET(slot, SLOT_CLOSEFH)) {
-		close_fh = log->log_close_fh;
-		log->log_close_fh = NULL;
-		F_CLR(slot, SLOT_CLOSEFH);
-	}
 
 	/* Write the buffered records */
 	if (F_ISSET(slot, SLOT_BUFFERED)) {
@@ -894,13 +884,22 @@ __log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot)
 		__wt_yield();
 	log->write_lsn = slot->slot_end_lsn;
 
+	if (F_ISSET(slot, SLOT_CLOSEFH))
+		WT_ERR(__wt_cond_signal(session, conn->log_close_cond));
+
 	/*
 	 * Try to consolidate calls to fsync to wait less.  Acquire a spin lock
 	 * so that threads finishing writing to the log will wait while the
 	 * current fsync completes and advance log->sync_lsn.
 	 */
 	while (F_ISSET(slot, SLOT_SYNC | SLOT_SYNC_DIR)) {
-		if (__wt_spin_trylock(session, &log->log_sync_lock, &id) != 0) {
+		/*
+		 * We have to wait until earlier log files have finished their
+		 * sync operations.  The most recent one will set the LSN to the
+		 * beginning of our file.
+		 */
+		if (log->sync_lsn.file < slot->slot_end_lsn.file ||
+		    __wt_spin_trylock(session, &log->log_sync_lock, &id) != 0) {
 			WT_ERR(__wt_cond_wait(
 			    session, log->log_sync_cond, 10000));
 			continue;
@@ -908,10 +907,10 @@ __log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot)
 		locked = 1;
 
 		/*
-		 * Record the current end of log after we grabbed the lock.
+		 * Record the current end of our update after the lock.
 		 * That is how far our calls can guarantee.
 		 */
-		sync_lsn = log->write_lsn;
+		sync_lsn = slot->slot_end_lsn;
 		/*
 		 * Check if we have to sync the parent directory.  Some
 		 * combinations of sync flags may result in the log file
@@ -955,12 +954,6 @@ __log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot)
 		WT_ERR(__wt_buf_grow(session,
 		    &slot->slot_buf, slot->slot_buf.memsize * 2));
 	}
-	/*
-	 * If we have a file to close, close it now.
-	 */
-	if (close_fh)
-		WT_ERR(__wt_close(session, close_fh));
-
 err:	if (locked)
 		__wt_spin_unlock(session, &log->log_sync_lock);
 	if (ret != 0 && slot->slot_error == 0)
@@ -1075,7 +1068,7 @@ __wt_log_read(WT_SESSION_IMPL *session, WT_ITEM *record, WT_LSN *lsnp,
 		*uncitem = swap;
 	}
 
-err:	__wt_scr_free(&uncitem);
+err:	__wt_scr_free(session, &uncitem);
 	return (ret);
 }
 
@@ -1366,7 +1359,7 @@ advance:
 				    &uncitem));
 				WT_ERR((*func)(session, uncitem, &rd_lsn,
 				    cookie, firstrecord));
-				__wt_scr_free(&uncitem);
+				__wt_scr_free(session, &uncitem);
 			} else
 				WT_ERR((*func)(session, &buf, &rd_lsn, cookie,
 				    firstrecord));
@@ -1389,7 +1382,7 @@ err:	WT_STAT_FAST_CONN_INCR(session, log_scans);
 	if (logfiles != NULL)
 		__wt_log_files_free(session, logfiles, logcount);
 	__wt_buf_free(session, &buf);
-	__wt_scr_free(&uncitem);
+	__wt_scr_free(session, &uncitem);
 	/*
 	 * If the caller wants one record and it is at the end of log,
 	 * return WT_NOTFOUND.
@@ -1464,6 +1457,13 @@ __wt_log_write(WT_SESSION_IMPL *session, WT_ITEM *record, WT_LSN *lsnp,
 
 	conn = S2C(session);
 	log = conn->log;
+	/*
+	 * An error during opening the logging subsystem can result in it
+	 * being enabled, but without an open log file.  In that case,
+	 * just return.
+	 */
+	if (log->log_fh == NULL)
+		return (0);
 	ip = record;
 	if ((compressor = conn->log_compressor) != NULL &&
 	    record->size < log->allocsize)
@@ -1538,7 +1538,7 @@ __wt_log_write(WT_SESSION_IMPL *session, WT_ITEM *record, WT_LSN *lsnp,
 	}
 	ret = __log_write_internal(session, ip, lsnp, flags);
 
-err:	__wt_scr_free(&citem);
+err:	__wt_scr_free(session, &citem);
 	return (ret);
 }
 
@@ -1716,6 +1716,6 @@ __wt_log_vprintf(WT_SESSION_IMPL *session, const char *fmt, va_list ap)
 
 	logrec->size += len;
 	WT_ERR(__wt_log_write(session, logrec, NULL, 0));
-err:	__wt_scr_free(&logrec);
+err:	__wt_scr_free(session, &logrec);
 	return (ret);
 }

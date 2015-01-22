@@ -32,6 +32,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <time.h>
 
 #include "mongo/base/disallow_copying.h"
@@ -69,8 +70,8 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repair_database.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
@@ -82,10 +83,16 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/print.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::ostringstream;
     using std::string;
+    using std::stringstream;
 
     CmdShutdown cmdShutdown;
 
@@ -288,7 +295,7 @@ namespace mongo {
             Status status = repairDatabase(txn, engine, dbname, preserveClonedFilesOnFailure,
                                            backupOriginalFiles );
 
-            IndexBuilder::restoreIndexes(indexesInProg);
+            IndexBuilder::restoreIndexes(txn, indexesInProg);
 
             // Open database before returning
             dbHolder().openDb(txn, dbname);
@@ -344,10 +351,16 @@ namespace mongo {
 
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int options,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
+
             // Needs to be locked exclusively, because creates the system.profile collection
             // in the local database.
-            //
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             Client::Context ctx(txn, dbname);
@@ -357,21 +370,26 @@ namespace mongo {
             result.append("slowms", serverGlobalParams.slowMS);
 
             int p = (int) e.number();
-            bool ok = false;
+            Status status = Status::OK();
 
-            if ( p == -1 )
-                ok = true;
+            if (p == -1)
+                status = Status::OK();
             else if ( p >= 0 && p <= 2 ) {
-                ok = ctx.db()->setProfilingLevel( txn, p , errmsg );
+                status = ctx.db()->setProfilingLevel(txn, p);
             }
 
-            BSONElement slow = cmdObj["slowms"];
+            const BSONElement slow = cmdObj["slowms"];
             if (slow.isNumber()) {
                 serverGlobalParams.slowMS = slow.numberInt();
             }
 
-            return ok;
+            if (!status.isOK()) {
+                errmsg = status.reason();
+            }
+
+            return status.isOK();
         }
+
     } cmdProfile;
 
     class CmdDiagLogging : public Command {
@@ -443,7 +461,7 @@ namespace mongo {
         virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
                                                      Database* db,
                                                      const BSONObj& cmdObj) {
-            std::string nsToDrop = db->name() + '.' + cmdObj.firstElement().valuestrsafe();
+            const std::string nsToDrop = parseNsCollectionRequired(db->name(), cmdObj);
 
             IndexCatalog::IndexKillCriteria criteria;
             criteria.ns = nsToDrop;
@@ -451,13 +469,8 @@ namespace mongo {
         }
 
         virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            const std::string collToDrop = cmdObj.firstElement().valuestrsafe();
-            if (collToDrop.empty()) {
-                errmsg = "no collection name specified";
-                return false;
-            }
+            const std::string nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
 
-            const std::string nsToDrop = dbname + '.' + collToDrop;
             if (!serverGlobalParams.quiet) {
                 LOG(0) << "CMD: drop " << nsToDrop << endl;
             }
@@ -578,8 +591,9 @@ namespace mongo {
 
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
             Client::Context ctx(txn, ns);
+
+            WriteUnitOfWork wunit(txn);
 
             // Create collection.
             status =  userCreateNS(txn, ctx.db(), ns.c_str(), options, !fromRepl);
@@ -1005,24 +1019,21 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            const std::string collName = jsobj.firstElement().valuestrsafe();
-            if (collName.empty()) {
-                errmsg = "no collection name specified";
-                return false;
-            }
-
-            const std::string ns = dbname + "." + collName;
+            const std::string ns = parseNsCollectionRequired(dbname, jsobj);
 
             ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
-            Client::Context ctx(txn,  ns );
+            AutoGetDb autoDb(txn, dbname, MODE_X);
+            Database* const db = autoDb.getDb();
+            Collection* coll = db ? db->getCollection(ns) : NULL;
 
-            Collection* coll = ctx.db()->getCollection( ns );
-            if ( !coll ) {
+            // If db/collection does not exist, short circuit and return.
+            if ( !db || !coll ) {
                 errmsg = "ns does not exist";
                 return false;
             }
+
+            Client::Context ctx(txn,  ns);
+            WriteUnitOfWork wunit(txn);
 
             bool ok = true;
 
@@ -1416,7 +1427,7 @@ namespace mongo {
         if (!c->maintenanceOk()
                 && replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
                 && !replCoord->canAcceptWritesForDatabase(dbname)
-                && !replCoord->getCurrentMemberState().secondary()) {
+                && !replCoord->getMemberState().secondary()) {
             result.append( "note" , "from execCommand" );
             appendCommandStatus(result, false, "node is recovering");
             return;

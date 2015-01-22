@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <iostream>
+
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/dbdirectclient.h"
@@ -47,11 +49,17 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-    void assembleRequest( const string &ns, BSONObj query, int nToReturn, int nToSkip,
+    void assembleRequest( const std::string &ns, BSONObj query, int nToReturn, int nToSkip,
                          const BSONObj *fieldsToReturn, int queryOptions, Message &toSend );
 }
 
 namespace QueryTests {
+
+    using std::auto_ptr;
+    using std::cout;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     class Base {
     public:
@@ -265,7 +273,7 @@ namespace QueryTests {
             {
                 // Check internal server handoff to getmore.
                 Client::WriteContext ctx(&_txn,  ns);
-                ClientCursorPin clientCursor( ctx.getCollection()->cursorManager(), cursorId );
+                ClientCursorPin clientCursor( ctx.getCollection()->getCursorManager(), cursorId );
                 // pq doesn't exist if it's a runner inside of the clientcursor.
                 // ASSERT( clientCursor.c()->pq );
                 // ASSERT_EQUALS( 2, clientCursor.c()->pq->getNumToReturn() );
@@ -319,7 +327,7 @@ namespace QueryTests {
             // Check that the cursor has been removed.
             {
                 AutoGetCollectionForRead ctx(&_txn, ns);
-                ASSERT(0 == ctx.getCollection()->cursorManager()->numCursors());
+                ASSERT(0 == ctx.getCollection()->getCursorManager()->numCursors());
             }
 
             ASSERT_FALSE(CursorManager::eraseCursorGlobal(&_txn, cursorId));
@@ -369,8 +377,8 @@ namespace QueryTests {
             // Check that the cursor still exists
             {
                 AutoGetCollectionForRead ctx(&_txn, ns);
-                ASSERT(1 == ctx.getCollection()->cursorManager()->numCursors());
-                ASSERT(ctx.getCollection()->cursorManager()->find(cursorId, false));
+                ASSERT(1 == ctx.getCollection()->getCursorManager()->numCursors());
+                ASSERT(ctx.getCollection()->getCursorManager()->find(cursorId, false));
             }
 
             // Check that the cursor can be iterated until all documents are returned.
@@ -665,7 +673,7 @@ namespace QueryTests {
             ASSERT_EQUALS( two, c->next()["ts"].Date() );
             long long cursorId = c->getCursorId();
             
-            ClientCursorPin clientCursor( ctx.db()->getCollection( ns )->cursorManager(),
+            ClientCursorPin clientCursor( ctx.db()->getCollection( ns )->getCursorManager(),
                                           cursorId );
             ASSERT_EQUALS( three.millis, clientCursor.c()->getSlaveReadTill().asDate() );
         }
@@ -1172,7 +1180,7 @@ namespace QueryTests {
             Collection* collection = ctx.getCollection();
             if ( !collection )
                 return 0;
-            return collection->cursorManager()->numCursors();
+            return collection->getCursorManager()->numCursors();
         }
 
         const char * ns() {
@@ -1496,7 +1504,8 @@ namespace QueryTests {
             DbMessage dbMessage( message );
             QueryMessage queryMessage( dbMessage );
             Message result;
-            string exhaust = runQuery( &_txn, message, queryMessage, *cc().curop(), result, false );
+            string exhaust = runQuery( &_txn, message, queryMessage, NamespaceString(ns()),
+                                       *cc().curop(), result, false );
             ASSERT( exhaust.size() );
             ASSERT_EQUALS( string( ns() ), exhaust );
         }
@@ -1516,7 +1525,8 @@ namespace QueryTests {
             ClientCursor *clientCursor = 0;
             {
                 AutoGetCollectionForRead ctx(&_txn, ns());
-                ClientCursorPin clientCursorPointer(ctx.getCollection()->cursorManager(), cursorId);
+                ClientCursorPin clientCursorPointer(ctx.getCollection()->getCursorManager(),
+                                                    cursorId);
                 clientCursor = clientCursorPointer.c();
                 // clientCursorPointer destructor unpins the cursor.
             }
@@ -1553,8 +1563,9 @@ namespace QueryTests {
             
             {
                 Client::WriteContext ctx(&_txn,  ns() );
-                ClientCursorPin pinCursor( ctx.ctx().db()->getCollection( ns())->cursorManager(),
-                                                                          cursorId );
+                ClientCursorPin pinCursor( ctx.ctx().db()->getCollection( ns() )
+                                                         ->getCursorManager(),
+                                           cursorId );
                 string expectedAssertion =
                         str::stream() << "Cannot kill active cursor " << cursorId; 
                 ASSERT_THROWS_WHAT(CursorManager::eraseCursorGlobal(&_txn, cursorId),

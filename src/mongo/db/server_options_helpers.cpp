@@ -37,6 +37,7 @@
 #include <syslog.h>
 #endif
 #include <ios>
+#include <iostream>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 
@@ -54,6 +55,7 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 
+using std::endl;
 using std::string;
 
 namespace mongo {

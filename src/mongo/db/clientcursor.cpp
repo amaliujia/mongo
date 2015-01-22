@@ -47,10 +47,13 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/exit.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     static Counter64 cursorStatsOpen; // gauge
     static Counter64 cursorStatsOpenPinned; // gauge
@@ -72,27 +75,28 @@ namespace mongo {
 
     ClientCursor::ClientCursor(CursorManager* cursorManager,
                                PlanExecutor* exec,
+                               const std::string& ns,
                                int qopts,
                                const BSONObj query,
                                bool isAggCursor)
-        : _cursorManager(cursorManager),
+        : _ns(ns),
+          _cursorManager(cursorManager),
           _countedYet(false),
           _isAggCursor(isAggCursor),
           _unownedRU(NULL) {
 
         _exec.reset(exec);
-        _ns = exec->ns();
         _query = query;
         _queryOptions = qopts;
         if (exec->collection()) {
-            invariant(cursorManager == exec->collection()->cursorManager());
+            invariant(cursorManager == exec->collection()->getCursorManager());
         }
         init();
     }
 
-    ClientCursor::ClientCursor(CursorManager* cursorManager)
-        : _ns(cursorManager->ns()),
-          _cursorManager(cursorManager),
+    ClientCursor::ClientCursor(const Collection* collection)
+        : _ns(collection->ns().ns()),
+          _cursorManager(collection->getCursorManager()),
           _countedYet(false),
           _queryOptions(QueryOption_NoCursorTimeout),
           _isAggCursor(false),
@@ -215,8 +219,6 @@ namespace mongo {
 
     //
     // Pin methods
-    // TODO: Simplify when we kill Cursor.  In particular, once we've pinned a CC, it won't be
-    // deleted from underneath us, so we can save the pointer and ignore the ID.
     //
 
     ClientCursorPin::ClientCursorPin( CursorManager* cursorManager, long long cursorid )
@@ -227,7 +229,7 @@ namespace mongo {
 
     ClientCursorPin::~ClientCursorPin() {
         cursorStatsOpenPinned.decrement();
-        DESTRUCTOR_GUARD( release(); );
+        release();
     }
 
     void ClientCursorPin::release() {
@@ -245,9 +247,12 @@ namespace mongo {
             // Unpin the cursor under the collection cursor manager lock.
             _cursor->cursorManager()->unpin( _cursor );
         }
+
+        _cursor = NULL;
     }
 
     void ClientCursorPin::deleteUnderlying() {
+        invariant( _cursor );
         invariant( _cursor->isPinned() );
         // Note the following subtleties of this method's implementation:
         // - We must unpin the cursor before destruction, since it is an error to destroy a pinned

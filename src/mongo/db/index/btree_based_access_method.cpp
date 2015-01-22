@@ -47,14 +47,11 @@
 
 namespace mongo {
 
+    using std::endl;
+    using std::set;
+    using std::vector;
+
     MONGO_EXPORT_SERVER_PARAMETER(failIndexKeyTooLong, bool, true);
-
-    void BtreeBasedAccessMethod::InvalidateCursorsNotification::aboutToDeleteBucket(
-            const RecordId& bucket) {
-        BtreeIndexCursor::aboutToDeleteBucket(bucket);
-    }
-
-    BtreeBasedAccessMethod::InvalidateCursorsNotification BtreeBasedAccessMethod::invalidateCursors;
 
     BtreeBasedAccessMethod::BtreeBasedAccessMethod(IndexCatalogEntry* btreeState,
                                                    SortedDataInterface* btree)

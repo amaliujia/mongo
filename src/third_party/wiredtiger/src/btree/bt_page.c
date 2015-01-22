@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -36,8 +37,11 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page)
 	    page->type != WT_PAGE_ROW_LEAF)
 		return (0);
 
-	/* Eviction may be turned off, although that's rare. */
-	if (F_ISSET(btree, WT_BTREE_NO_EVICTION))
+	/*
+	 * Eviction may be turned off (although that's rare), or we may be in
+	 * the middle of a checkpoint.
+	 */
+	if (F_ISSET(btree, WT_BTREE_NO_EVICTION) || btree->checkpointing)
 		return (0);
 
 	/*
@@ -127,7 +131,13 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 			    force_attempts < 10 &&
 			    __evict_force_check(session, page)) {
 				++force_attempts;
-				WT_RET(__wt_page_release(session, ref, flags));
+				if ((ret = __wt_page_release_busy(
+				    session, ref, flags)) == EBUSY) {
+					/* If forced eviction fails, stall. */
+					ret = 0;
+					wait_cnt += 1000;
+				} else
+					WT_RET(ret);
 				WT_STAT_FAST_CONN_INCR(
 				    session, page_forcible_evict_blocked);
 				break;
@@ -164,7 +174,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 		 */
 		if (++wait_cnt < 1000)
 			__wt_yield();
-		 else {
+		else {
 			sleep_cnt = WT_MIN(wait_cnt, 10000);
 			wait_cnt *= 2;
 			WT_STAT_FAST_CONN_INCRV(session, page_sleep, sleep_cnt);
@@ -642,7 +652,7 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 		}
 	}
 
-err:	__wt_scr_free(&current);
+err:	__wt_scr_free(session, &current);
 	return (ret);
 }
 

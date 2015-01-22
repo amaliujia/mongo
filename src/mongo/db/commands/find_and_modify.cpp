@@ -32,6 +32,8 @@
 
 #include "mongo/db/commands/find_and_modify.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
@@ -44,6 +46,11 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
 
     /* Find and Modify an object returning either the old (default) or new value*/
     class CmdFindAndModify : public Command {
@@ -73,13 +80,7 @@ namespace mongo {
                          BSONObjBuilder& result,
                          bool fromRepl) {
 
-            const std::string coll = cmdObj.firstElement().valuestrsafe();
-            if (coll.empty()) {
-                errmsg = "no collection name specified";
-                return false;
-            }
-
-            const std::string ns = dbname + '.' + coll;
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj fields = cmdObj.getObjectField("fields");
@@ -93,6 +94,10 @@ namespace mongo {
             if ( remove ) {
                 if ( upsert ) {
                     errmsg = "remove and upsert can't co-exist";
+                    return false;
+                }
+                if ( !update.isEmpty() ) {
+                    errmsg = "remove and update can't co-exist";
                     return false;
                 }
                 if ( returnNew ) {
@@ -126,6 +131,7 @@ namespace mongo {
                     break;
                 }
                 catch (const WriteConflictException&) {
+                    txn->getCurOp()->debug().writeConflicts++;
                     if ( attempt++ > 1 ) {
                         log() << "got WriteConflictException on findAndModify for " << ns
                               <<  " retrying attempt: " << attempt;

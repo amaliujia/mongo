@@ -43,6 +43,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     // Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a valid
     // non-zero max time to fail immediately.  Any getmore operation on a cursor already created
     // with a valid non-zero max time will also fail immediately.
@@ -288,10 +290,13 @@ namespace mongo {
     static Counter64 idhackCounter;
     static Counter64 scanAndOrderCounter;
     static Counter64 fastmodCounter;
+    static Counter64 writeConflictsCounter;
 
     static ServerStatusMetricField<Counter64> displayIdhack( "operation.idhack", &idhackCounter );
     static ServerStatusMetricField<Counter64> displayScanAndOrder( "operation.scanAndOrder", &scanAndOrderCounter );
     static ServerStatusMetricField<Counter64> displayFastMod( "operation.fastmod", &fastmodCounter );
+    static ServerStatusMetricField<Counter64> displayWriteConflicts( "operation.writeConflicts",
+                                                                     &writeConflictsCounter );
 
     void OpDebug::recordStats() {
         if ( nreturned > 0 )
@@ -313,6 +318,8 @@ namespace mongo {
             scanAndOrderCounter.increment();
         if ( fastmod )
             fastmodCounter.increment();
+        if ( writeConflicts )
+            writeConflictsCounter.increment( writeConflicts );
     }
 
     CurOp::MaxTimeTracker::MaxTimeTracker() {

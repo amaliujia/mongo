@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <iostream>
 
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/global_environment_experiment.h"
@@ -45,6 +46,9 @@
 #include "mongo/util/timer.h"
 
 namespace MMapTests {
+
+    using std::endl;
+    using std::string;
 
     class LeakTest  {
         const string fn;

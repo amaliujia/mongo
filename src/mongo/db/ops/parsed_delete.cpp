@@ -39,7 +39,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -73,7 +73,6 @@ namespace mongo {
                                                      whereCallback);
 
         if (status.isOK()) {
-            cqRaw->setIsForWrite(true);
             _canonicalQuery.reset(cqRaw);
         }
 

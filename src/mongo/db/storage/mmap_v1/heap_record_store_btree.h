@@ -81,6 +81,10 @@ namespace mongo {
             invariant(false);
         }
 
+        virtual bool updateWithDamagesSupported() const {
+            return true;
+        }
+
         virtual Status updateWithDamages(OperationContext* txn,
                                          const RecordId& loc,
                                          const RecordData& oldRec,
@@ -112,13 +116,6 @@ namespace mongo {
         }
 
         virtual bool compactSupported() const { invariant(false); }
-
-        virtual Status compact(OperationContext* txn,
-                               RecordStoreCompactAdaptor* adaptor,
-                               const CompactOptions* options,
-                               CompactStats* stats) {
-            invariant(false);
-        }
 
         virtual Status validate(OperationContext* txn,
                                 bool full,
@@ -157,6 +154,12 @@ namespace mongo {
         virtual bool isCapped() const { invariant(false); }
 
         virtual const char* name() const { invariant(false); }
+
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) {
+            invariant(false);
+        }
         // more things that we actually care about below
 
     private:

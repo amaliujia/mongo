@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
 #include "mongo/db/catalog/collection_options.h"
@@ -123,6 +124,8 @@ namespace mongo {
                                                   bool enforceQuota,
                                                   UpdateMoveNotifier* notifier );
 
+        virtual bool updateWithDamagesSupported() const;
+
         virtual Status updateWithDamages( OperationContext* txn,
                                           const RecordId& loc,
                                           const RecordData& oldRec,
@@ -139,6 +142,7 @@ namespace mongo {
         virtual Status truncate( OperationContext* txn );
 
         virtual bool compactSupported() const { return true; }
+        virtual bool compactsInPlace() const { return true; }
 
         virtual Status compact( OperationContext* txn,
                                 RecordStoreCompactAdaptor* adaptor,
@@ -156,8 +160,6 @@ namespace mongo {
                                         BSONObjBuilder* result,
                                         double scale ) const;
 
-        virtual Status touch( OperationContext* txn, BSONObjBuilder* output ) const;
-
         virtual Status setCustomOption( OperationContext* txn,
                                         const BSONElement& option,
                                         BSONObjBuilder* info = NULL );
@@ -171,6 +173,10 @@ namespace mongo {
 
         virtual Status oplogDiskLocRegister( OperationContext* txn,
                                              const OpTime& opTime );
+
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize);
 
         bool isOplog() const { return _isOplog; }
         bool usingOplogHack() const { return _useOplogHack; }
@@ -219,7 +225,7 @@ namespace mongo {
             RecoveryUnit* _savedRecoveryUnit; // only used to sanity check between save/restore
             const bool _forward;
             bool _forParallelCollectionScan;
-            scoped_ptr<WiredTigerCursor> _cursor;
+            boost::scoped_ptr<WiredTigerCursor> _cursor;
             bool _eof;
             const RecordId _readUntilForOplog;
 

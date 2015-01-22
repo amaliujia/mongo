@@ -38,6 +38,8 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::string;
 
     class ParallelCollectionScanCmd : public Command {
     public:
@@ -137,19 +139,15 @@ namespace mongo {
                 for (size_t i = 0; i < execs.size(); i++) {
                     // transfer ownership of an executor to the ClientCursor (which manages its own
                     // lifetime).
-                    ClientCursor* cc = new ClientCursor( collection->cursorManager(),
-                                                         execs.releaseAt(i) );
+                    ClientCursor* cc = new ClientCursor( collection->getCursorManager(),
+                                                         execs.releaseAt(i),
+                                                         ns.ns() );
 
-                    // we are mimicking the aggregation cursor output here
-                    // that is why there are ns, ok and empty firstBatch
                     BSONObjBuilder threadResult;
-                    {
-                        BSONObjBuilder cursor;
-                        cursor.appendArray( "firstBatch", BSONObj() );
-                        cursor.append( "ns", ns );
-                        cursor.append( "id", cc->cursorid() );
-                        threadResult.append( "cursor", cursor.obj() );
-                    }
+                    appendCursorResponseObject( cc->cursorid(),
+                                                ns.ns(),
+                                                BSONArray(),
+                                                &threadResult );
                     threadResult.appendBool( "ok", 1 );
 
                     bucketsBuilder.append( threadResult.obj() );

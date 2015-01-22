@@ -38,6 +38,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     class RepairCursorCmd : public Command {
     public:
         RepairCursorCmd() : Command("repairCursor") {}
@@ -102,13 +104,11 @@ namespace mongo {
 
             // ClientCursors' constructor inserts them into a global map that manages their
             // lifetimes. That is why the next line isn't leaky.
-            ClientCursor* cc = new ClientCursor(collection->cursorManager(), exec.release());
+            ClientCursor* cc = new ClientCursor(collection->getCursorManager(),
+                                                exec.release(),
+                                                ns.ns());
 
-            BSONObjBuilder cursorObj(result.subobjStart("cursor"));
-            cursorObj.append("id", cc->cursorid());
-            cursorObj.append("ns", ns);
-            cursorObj.append("firstBatch", BSONArray());
-            cursorObj.done();
+            appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &result);
 
             return true;
 

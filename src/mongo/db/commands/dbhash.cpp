@@ -32,6 +32,8 @@
 
 #include "mongo/db/commands/dbhash.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/catalog/database.h"
@@ -42,6 +44,14 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::list;
+    using std::endl;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     DBHashCmd dbhashCmd;
 

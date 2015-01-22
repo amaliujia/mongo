@@ -50,7 +50,7 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/util/exit.h"
@@ -58,6 +58,8 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
 
 namespace repl {
 #if defined(MONGO_PLATFORM_64)
@@ -99,104 +101,6 @@ namespace repl {
             }
             return false;
         }
-
-        size_t hashBSONObj(const BSONObj& obj);
-
-        size_t hashBSONElement(const BSONElement& elem) {
-            size_t hash = 0;
-
-            boost::hash_combine(hash, elem.canonicalType());
-
-            const StringData fieldName = elem.fieldNameStringData();
-            if (!fieldName.empty()) {
-                boost::hash_combine(hash, StringData::Hasher()(fieldName));
-            }
-
-            switch (elem.type()) {
-                // Order of types is the same as in compareElementValues().
-
-            case mongo::EOO:
-            case mongo::Undefined:
-            case mongo::jstNULL:
-            case mongo::MaxKey:
-            case mongo::MinKey:
-                // These are valueless types
-                break;
-
-            case mongo::Bool:
-                boost::hash_combine(hash, elem.boolean());
-                break;
-
-            case mongo::Timestamp:
-            case mongo::Date:
-                // Need to treat these the same until SERVER-3304 is resolved.
-                boost::hash_combine(hash, elem.date().asInt64());
-                break;
-
-            case mongo::NumberDouble:
-            case mongo::NumberLong:
-            case mongo::NumberInt: {
-                // This converts all numbers to doubles for compatibility with woCompare.
-                // This ignores // the low-order bits of NumberLongs > 2**53, but that is required
-                // until SERVER-3719 is resolved.
-                const double dbl = elem.numberDouble();
-                if (isNaN(dbl)) {
-                    boost::hash_combine(hash, numeric_limits<double>::quiet_NaN());
-                }
-                else {
-                    boost::hash_combine(hash, dbl);
-                }
-                break;
-            }
-
-            case mongo::jstOID:
-                elem.__oid().hash_combine(hash);
-                break;
-
-            case mongo::Code:
-            case mongo::Symbol:
-            case mongo::String:
-                boost::hash_combine(hash, StringData::Hasher()(elem.valueStringData()));
-                break;
-
-            case mongo::Object:
-            case mongo::Array:
-                boost::hash_combine(hash, hashBSONObj(elem.embeddedObject()));
-                break;
-
-            case mongo::DBRef:
-            case mongo::BinData:
-                // All bytes of the value are required to be identical.
-                boost::hash_combine(hash, StringData::Hasher()(StringData(elem.value(),
-                                                                          elem.valuesize())));
-                break;
-
-            case mongo::RegEx:
-                boost::hash_combine(hash, StringData::Hasher()(elem.regex()));
-                boost::hash_combine(hash, StringData::Hasher()(elem.regexFlags()));
-                break;
-
-            case mongo::CodeWScope: {
-                // SERVER-7804
-                // Intentionally not using codeWScopeCodeLen for compatibility with
-                // compareElementValues. Using codeWScopeScopeDataUnsafe (as a string!) for the same
-                // reason.
-                boost::hash_combine(hash, StringData::Hasher()(elem.codeWScopeCode()));
-                boost::hash_combine(hash, StringData::Hasher()(elem.codeWScopeScopeDataUnsafe()));
-                break;
-            }
-            }
-            return hash;
-        }
-
-        size_t hashBSONObj(const BSONObj& obj) {
-            size_t hash = 0;
-            BSONForEach(elem, obj) {
-                boost::hash_combine(hash, hashBSONElement(elem));
-            }
-            return hash;
-        }
-
     }
 
     SyncTail::SyncTail(BackgroundSyncInterface *q, MultiSyncApplyFunc func) :
@@ -365,7 +269,7 @@ namespace repl {
         Lock::ParallelBatchWriterMode pbwm;
 
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (replCoord->getCurrentMemberState().primary() &&
+        if (replCoord->getMemberState().primary() &&
             !replCoord->isWaitingForApplierToDrain()) {
 
             severe() << "attempting to replicate ops while primary";
@@ -405,7 +309,7 @@ namespace repl {
                     break;
                 }
 
-                const size_t idHash = hashBSONElement( id );
+                const size_t idHash = BSONElement::Hasher()( id );
                 MurmurHash3_x86_32(&idHash, sizeof(idHash), hash, &hash);
             }
 
@@ -486,7 +390,7 @@ namespace {
         }
 
         // Only state RECOVERING can transition to SECONDARY.
-        MemberState state(replCoord->getCurrentMemberState());
+        MemberState state(replCoord->getMemberState());
         if (!state.recovering()) {
             return;
         }
@@ -499,7 +403,7 @@ namespace {
         bool worked = replCoord->setFollowerMode(MemberState::RS_SECONDARY);
         if (!worked) {
             warning() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
-                      << ". Current state: " << replCoord->getCurrentMemberState();
+                      << ". Current state: " << replCoord->getMemberState();
         }
     }
 }
@@ -681,7 +585,7 @@ namespace {
 
         // ignore slaveDelay if the box is still initializing. once
         // it becomes secondary we can worry about it.
-        if( slaveDelaySecs > 0 && replCoord->getCurrentMemberState().secondary() ) {
+        if( slaveDelaySecs > 0 && replCoord->getMemberState().secondary() ) {
             const OpTime ts = lastOp["ts"]._opTime();
             long long a = ts.getSecs();
             long long b = time(0);

@@ -31,6 +31,7 @@
 #include "mongo/dbtests/framework_options.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <iostream>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
@@ -44,6 +45,11 @@
 #include "mongo/util/password.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     FrameworkGlobalParams frameworkGlobalParams;
 

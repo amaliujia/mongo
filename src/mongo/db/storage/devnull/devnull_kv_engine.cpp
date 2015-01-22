@@ -107,12 +107,16 @@ namespace mongo {
             return StatusWith<RecordId>( oldLocation );
         }
 
+        virtual bool updateWithDamagesSupported() const {
+            return false;
+        }
+
         virtual Status updateWithDamages( OperationContext* txn,
                                           const RecordId& loc,
                                           const RecordData& oldRec,
                                           const char* damageSource,
                                           const mutablebson::DamageVector& damages ) {
-            return Status::OK();
+            invariant(false);
         }
 
         virtual RecordIterator* getIterator( OperationContext* txn,
@@ -137,12 +141,6 @@ namespace mongo {
                                               RecordId end,
                                               bool inclusive) { }
 
-        virtual bool compactSupported() const { return false; }
-        virtual Status compact( OperationContext* txn,
-                                RecordStoreCompactAdaptor* adaptor,
-                                const CompactOptions* options,
-                                CompactStats* stats ) { return Status::OK(); }
-
         virtual Status validate( OperationContext* txn,
                                  bool full, bool scanData,
                                  ValidateAdaptor* adaptor,
@@ -164,6 +162,11 @@ namespace mongo {
                                         const BSONElement& option,
                                         BSONObjBuilder* info = NULL ) {
             return Status::OK();
+        }
+
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) {
         }
 
     private:

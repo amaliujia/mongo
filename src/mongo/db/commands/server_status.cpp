@@ -30,7 +30,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -52,6 +52,11 @@
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::map;
+    using std::string;
+    using std::stringstream;
 
     class CmdServerStatus : public Command {
     public:

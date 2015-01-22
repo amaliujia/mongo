@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <climits> // For UINT_MAX
 
@@ -127,6 +128,18 @@ namespace mongo {
             ~GlobalRead();
         };
 
+        /**
+         * Global lock.
+         *
+         * Grabs global resource lock. Allows further (recursive) acquisition of the global lock
+         * in any mode, see LockMode.
+         * NOTE: Does not acquire flush lock.
+         */
+        class GlobalLock : public ScopedLock {
+        public:
+            GlobalLock(Locker* lockState, LockMode lockMode);
+            ~GlobalLock();
+        };
 
         /**
          * Database lock with support for collection- and document-level locking
@@ -190,6 +203,22 @@ namespace mongo {
             Locker* const _lockState;
         };
 
+        /**
+         * Like the CollectionLock, but optimized for the local oplog. Always locks in MODE_IX,
+         * must call serializeIfNeeded() before doing any concurrent operations in order to
+         * support storage engines without document level locking. It is an error, checked with a
+         * dassert(), to not have a suitable database lock when taking this lock.
+         */
+        class OplogIntentWriteLock {
+            MONGO_DISALLOW_COPYING(OplogIntentWriteLock);
+        public:
+            explicit OplogIntentWriteLock(Locker* lockState);
+            ~OplogIntentWriteLock();
+            void serializeIfNeeded();
+        private:
+            Locker* const _lockState;
+            bool _serialized;
+        };
 
         /**
          * General purpose RAII wrapper for a resource managed by the lock manager

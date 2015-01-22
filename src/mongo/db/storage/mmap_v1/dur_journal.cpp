@@ -40,14 +40,13 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
+#include "mongo/db/storage/mmap_v1/aligned_builder.h"
 #include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/random.h"
-#include "mongo/server.h"
-#include "mongo/util/alignedbuilder.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
 #include "mongo/util/exit.h"
@@ -65,8 +64,11 @@ using namespace mongoutils;
 
 namespace mongo {
 
-    class AlignedBuilder;
+    using std::endl;
+    using std::hex;
+    using std::string;
 
+    class AlignedBuilder;
 
     namespace dur {
         // Rotate after reaching this data size in a journal (j._<n>) file
@@ -727,8 +729,9 @@ namespace mongo {
         void WRITETOJOURNAL(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             Timer t;
             j.journal(h, uncompressed);
-            stats.curr->_writeToJournalMicros += t.micros();
+            stats.curr()->_writeToJournalMicros += t.micros();
         }
+
         void Journal::journal(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             static AlignedBuilder b(32*1024*1024);
             /* buffer to journal will be
@@ -776,11 +779,11 @@ namespace mongo {
                 // must already be open -- so that _curFileId is correct for previous buffer building
                 verify( _curLogFile );
 
-                stats.curr->_uncompressedBytes += uncompressed.len();
+                stats.curr()->_uncompressedBytes += uncompressed.len();
                 unsigned w = b.len();
                 _written += w;
                 verify( w <= L );
-                stats.curr->_journaledBytes += L;
+                stats.curr()->_journaledBytes += L;
                 _curLogFile->synchronousAppend((const void *) b.buf(), L);
                 _rotate();
             }

@@ -50,6 +50,10 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::vector;
+
     AuthzManagerExternalStateMongos::AuthzManagerExternalStateMongos() {}
 
     AuthzManagerExternalStateMongos::~AuthzManagerExternalStateMongos() {}

@@ -52,7 +52,7 @@
 #include "mongo/db/db.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/client/connpool.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
@@ -67,6 +67,11 @@
 
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     // -----ShardingState START ----
 

@@ -54,7 +54,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/db/operation_context_impl.h"
@@ -65,6 +65,14 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::ios_base;
+    using std::ofstream;
+    using std::set;
+    using std::string;
+    using std::stringstream;
 
     using logger::LogComponent;
 

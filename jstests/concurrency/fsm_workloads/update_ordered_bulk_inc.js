@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * update_ordered_bulk_inc.js
  *
@@ -8,6 +10,8 @@
  *
  * Uses an ordered, bulk operation to perform the updates.
  */
+load('jstests/concurrency/fsm_workload_helpers/server_types.js'); // for isMMAPv1 and isMongod
+
 var $config = (function() {
 
     var states = {
@@ -34,11 +38,25 @@ var $config = (function() {
 
         find: function find(db, collName) {
             var docs = db[collName].find().toArray();
-            assertWhenOwnColl.eq(this.docCount, docs.length);
+            var serverStatus = db.serverStatus();
+            // In MMAP v1, some documents may appear twice due to moves
+            if (isMongod(serverStatus) && !isMMAPv1(serverStatus)) {
+                assertWhenOwnColl.eq(this.docCount, docs.length);
+            }
+            assertWhenOwnColl.gte(docs.length, this.docCount);
 
-            docs.forEach(function (doc) {
-                assertWhenOwnColl.eq(this.count, doc[this.fieldName]);
-            });
+            // It is possible that a document was not incremented in MMAP v1 because
+            // updates skip documents that were invalidated during yielding
+            if (isMongod(serverStatus) && !isMMAPv1(serverStatus)) {
+                docs.forEach(function(doc) {
+                    assertWhenOwnColl.eq(this.count, doc[this.fieldName]);
+                }, this);
+            }
+
+            docs.forEach(function(doc) {
+                assertWhenOwnColl.lte(doc[this.fieldName], this.count);
+                assertWhenOwnColl.lt(doc._id, this.docCount);
+            }, this);
         }
     };
 
@@ -56,8 +74,8 @@ var $config = (function() {
     }
 
     return {
-        threadCount: 30,
-        iterations: 100,
+        threadCount: 10,
+        iterations: 20,
         states: states,
         transitions: transitions,
         setup: setup,

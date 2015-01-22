@@ -55,6 +55,9 @@
 
 namespace mongo {
 
+    using std::set;
+    using std::string;
+
     namespace {
         int mdb_handle_error(WT_EVENT_HANDLER *handler, WT_SESSION *session,
                              int errorCode, const char *message) {
@@ -141,6 +144,7 @@ namespace mongo {
         ss << "create,";
         ss << "cache_size=" << cacheSizeGB << "G,";
         ss << "session_max=20000,";
+        ss << "eviction=(threads_max=4),";
         ss << "statistics=(fast),";
         if ( _durable ) {
             ss << "log=(enabled=true,archive=true,path=journal,compressor=";
@@ -446,6 +450,10 @@ namespace mongo {
         return true;
     }
 
+    bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
+        return true;
+    }
+
     bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, const StringData& ident) const {
         return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession(), _uri(ident));
     }
@@ -464,7 +472,7 @@ namespace mongo {
 
     std::vector<std::string> WiredTigerKVEngine::getAllIdents( OperationContext* opCtx ) const {
         std::vector<std::string> all;
-        WiredTigerCursor cursor( "metadata:", WiredTigerSession::kMetadataCursorId, opCtx );
+        WiredTigerCursor cursor( "metadata:", WiredTigerSession::kMetadataCursorId, false, opCtx );
         WT_CURSOR* c = cursor.get();
         if ( !c )
             return all;

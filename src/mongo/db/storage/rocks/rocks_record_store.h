@@ -1,5 +1,3 @@
-// rocks_record_store.h
-
 /**
 *    Copyright (C) 2014 MongoDB Inc.
 *
@@ -32,6 +30,8 @@
 #pragma once
 
 #include <atomic>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <string>
 #include <memory>
 #include <vector>
@@ -126,6 +126,8 @@ namespace mongo {
                                                   bool enforceQuota,
                                                   UpdateMoveNotifier* notifier );
 
+        virtual bool updateWithDamagesSupported() const;
+
         virtual Status updateWithDamages( OperationContext* txn,
                                           const RecordId& loc,
                                           const RecordData& oldRec,
@@ -142,6 +144,7 @@ namespace mongo {
         virtual Status truncate( OperationContext* txn );
 
         virtual bool compactSupported() const { return true; }
+        virtual bool compactsInPlace() const { return true; }
 
         virtual Status compact( OperationContext* txn,
                                 RecordStoreCompactAdaptor* adaptor,
@@ -157,8 +160,6 @@ namespace mongo {
                                         BSONObjBuilder* result,
                                         double scale ) const;
 
-        virtual Status touch( OperationContext* txn, BSONObjBuilder* output ) const;
-
         virtual Status setCustomOption( OperationContext* txn,
                                         const BSONElement& option,
                                         BSONObjBuilder* info = NULL );
@@ -171,6 +172,12 @@ namespace mongo {
                                                          const RecordId& startingPosition) const;
 
         virtual Status oplogDiskLocRegister(OperationContext* txn, const OpTime& opTime);
+
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) {
+            // TODO
+        }
 
         void setCappedDeleteCallback(CappedDocumentDeleteCallback* cb) {
           _cappedDeleteCallback = cb;
@@ -231,9 +238,9 @@ namespace mongo {
         bool cappedAndNeedDelete(long long dataSizeDelta, long long numRecordsDelta) const;
         void cappedDeleteAsNeeded(OperationContext* txn, const RecordId& justInserted);
 
-        // The use of this function requires that the passed in RecordId outlives the returned Slice
-        // TODO possibly make this safer in the future
-        static rocksdb::Slice _makeKey( const RecordId& loc );
+        // The use of this function requires that the passed in storage outlives the returned Slice
+        static rocksdb::Slice _makeKey(const RecordId& loc, int64_t* storage);
+
         void _changeNumRecords(OperationContext* txn, bool insert);
         void _increaseDataSize(OperationContext* txn, int amount);
 
@@ -259,7 +266,7 @@ namespace mongo {
         std::atomic<long long> _dataSize;
         std::atomic<long long> _numRecords;
 
-        const string _dataSizeKey;
-        const string _numRecordsKey;
+        const std::string _dataSizeKey;
+        const std::string _numRecordsKey;
     };
 }

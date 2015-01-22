@@ -35,6 +35,11 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::list;
+    using std::string;
+    using std::vector;
+
     // static
     const char* MergeSortStage::kStageType = "SORT_MERGE";
 
@@ -181,7 +186,6 @@ namespace mongo {
 
         // But don't return it if it's flagged.
         if (_ws->isFlagged(*out)) {
-            _ws->free(*out);
             return PlanStage::NEED_TIME;
         }
 

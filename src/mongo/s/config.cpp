@@ -32,6 +32,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include "pcrecpp.h"
 
 #include "mongo/client/connpool.h"
@@ -59,6 +60,14 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::pair;
+    using std::set;
+    using std::stringstream;
+    using std::vector;
 
     int ConfigServer::VERSION = 3;
     Shard Shard::EMPTY;
@@ -836,8 +845,7 @@ namespace mongo {
         _primary = Shard(_primary.getName(),
                          ConnectionString(fullString, ConnectionString::SYNC),
                          _primary.getMaxSizeMB(),
-                         _primary.isDraining(),
-                         _primary.tags());
+                         _primary.isDraining());
         Shard::installShard(_primary.getName(), _primary);
 
         LOG(1) << " config string : " << fullString << endl;
@@ -1014,6 +1022,7 @@ namespace mongo {
             }
 
             if (localCheckOnly) {
+                conn.done();
                 return true;
             }
 

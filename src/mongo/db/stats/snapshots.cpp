@@ -30,7 +30,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/stats/snapshots.h"
 
@@ -43,6 +43,9 @@
    handles snapshotting performance metrics and other such things
  */
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
 
     void SnapshotData::takeSnapshot() {
         _created = curTimeMicros64();

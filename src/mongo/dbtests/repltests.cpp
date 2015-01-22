@@ -40,8 +40,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_coordinator_mock.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/sync.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/catalog/collection.h"
@@ -53,6 +53,12 @@
 using namespace mongo::repl;
 
 namespace ReplTests {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     BSONObj f( const char *s ) {
         return fromjson( s );

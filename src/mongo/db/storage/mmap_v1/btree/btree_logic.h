@@ -28,20 +28,20 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/db/catalog/head_manager.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/mmap_v1/btree/btree_ondisk.h"
-#include "mongo/db/storage/mmap_v1/btree/bucket_deletion_notification.h"
 #include "mongo/db/storage/mmap_v1/btree/key.h"
 #include "mongo/db/storage/mmap_v1/diskloc.h"
 
-
 namespace mongo {
 
-    class BucketDeletionNotification;
     class RecordStore;
+    class SavedCursorRegistry;
 
     // Used for unit-testing only
     template <class BtreeLayout> class BtreeLogicTestBase;
@@ -77,15 +77,14 @@ namespace mongo {
          */
         BtreeLogic(HeadManager* head,
                    RecordStore* store,
+                   SavedCursorRegistry* cursors,
                    const Ordering& ordering,
-                   const string& indexName,
-                   BucketDeletionNotification* bucketDeletion)
+                   const std::string& indexName)
             : _headManager(head),
               _recordStore(store),
+              _cursorRegistry(cursors),
               _ordering(ordering),
-              _indexName(indexName),
-              _bucketDeletion(bucketDeletion) { 
-        
+              _indexName(indexName) {
         }
 
         //
@@ -121,7 +120,7 @@ namespace mongo {
 
             DiskLoc _rightLeafLoc; // DiskLoc of right-most (highest) leaf bucket.
             bool _dupsAllowed;
-            auto_ptr<KeyDataOwnedType> _keyLast;
+            std::auto_ptr<KeyDataOwnedType> _keyLast;
 
             // Not owned.
             OperationContext* _txn;
@@ -200,8 +199,8 @@ namespace mongo {
                           const BSONObj& keyBegin,
                           int keyBeginLen,
                           bool afterKey,
-                          const vector<const BSONElement*>& keyEnd,
-                          const vector<bool>& keyEndInclusive,
+                          const std::vector<const BSONElement*>& keyEnd,
+                          const std::vector<bool>& keyEndInclusive,
                           int direction) const;
 
         void advanceTo(OperationContext*,
@@ -210,8 +209,8 @@ namespace mongo {
                        const BSONObj &keyBegin,
                        int keyBeginLen,
                        bool afterKey,
-                       const vector<const BSONElement*>& keyEnd,
-                       const vector<bool>& keyEndInclusive,
+                       const std::vector<const BSONElement*>& keyEnd,
+                       const std::vector<bool>& keyEndInclusive,
                        int direction) const;
 
         void restorePosition(OperationContext* txn,
@@ -235,6 +234,8 @@ namespace mongo {
         //
 
         const RecordStore* getRecordStore() const { return _recordStore; }
+
+        SavedCursorRegistry* savedCursors() const { return _cursorRegistry; }
 
         static int lowWaterMark();
 
@@ -350,10 +351,10 @@ namespace mongo {
                           const BSONObj& keyBegin,
                           int keyBeginLen,
                           bool afterKey,
-                          const vector<const BSONElement*>& keyEnd,
-                          const vector<bool>& keyEndInclusive,
+                          const std::vector<const BSONElement*>& keyEnd,
+                          const std::vector<bool>& keyEndInclusive,
                           int direction,
-                          pair<DiskLoc, int>& bestParent) const;
+                          std::pair<DiskLoc, int>& bestParent) const;
 
         Status _find(OperationContext* txn,
                      BucketType* bucket,
@@ -369,13 +370,13 @@ namespace mongo {
                         const BSONObj& keyBegin,
                         int keyBeginLen,
                         bool afterKey,
-                        const vector<const BSONElement*>& keyEnd,
-                        const vector<bool>& keyEndInclusive,
+                        const std::vector<const BSONElement*>& keyEnd,
+                        const std::vector<bool>& keyEndInclusive,
                         const Ordering& order,
                         int direction,
                         DiskLoc* thisLocInOut,
                         int* keyOfsInOut,
-                        pair<DiskLoc, int>& bestParent) const;
+                        std::pair<DiskLoc, int>& bestParent) const;
 
         void advanceToImpl(OperationContext* txn,
                            DiskLoc* thisLocInOut,
@@ -383,8 +384,8 @@ namespace mongo {
                            const BSONObj &keyBegin,
                            int keyBeginLen,
                            bool afterKey,
-                           const vector<const BSONElement*>& keyEnd,
-                           const vector<bool>& keyEndInclusive,
+                           const std::vector<const BSONElement*>& keyEnd,
+                           const std::vector<bool>& keyEndInclusive,
                            int direction) const;
 
         bool wouldCreateDup(OperationContext* txn,
@@ -591,12 +592,12 @@ namespace mongo {
         // Not owned here.
         RecordStore* _recordStore;
 
+        // Not owned Here.
+        SavedCursorRegistry* _cursorRegistry;
+
         Ordering _ordering;
 
-        string _indexName;
-
-        // Not owned here
-        BucketDeletionNotification* _bucketDeletion;
+        std::string _indexName;
     };
 
 }  // namespace mongo

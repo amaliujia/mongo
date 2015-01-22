@@ -33,6 +33,8 @@
 
 #include "mongo/db/repl/rs_rollback.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/client.h"
@@ -49,8 +51,8 @@
 #include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/repl/repl_coordinator.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/util/log.h"
 
@@ -93,6 +95,16 @@
  */
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::pair;
+
 namespace repl {
 namespace {
 
@@ -723,7 +735,7 @@ namespace {
          *  also, this is better for status reporting - we know what is happening.
          */
         if (!replCoord->setFollowerMode(MemberState::RS_ROLLBACK)) {
-            warning() << "Cannot transition from " << replCoord->getCurrentMemberState() <<
+            warning() << "Cannot transition from " << replCoord->getMemberState() <<
                 " to " << MemberState(MemberState::RS_ROLLBACK);
             return 0;
         }
@@ -777,7 +789,7 @@ namespace {
         if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
             warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING) <<
                 "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK) <<
-                "but found self in " << replCoord->getCurrentMemberState();
+                "but found self in " << replCoord->getMemberState();
         }
 
         return 0;

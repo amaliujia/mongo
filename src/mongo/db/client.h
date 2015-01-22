@@ -36,6 +36,8 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/catalog/database.h"
@@ -53,9 +55,7 @@
 namespace mongo {
 
     class AuthenticationInfo;
-    class Database;
     class CurOp;
-    class Client;
     class Collection;
     class AbstractMessagingPort;
     class Locker;
@@ -200,7 +200,7 @@ namespace mongo {
 
         std::string clientAddress(bool includePort=false) const;
         CurOp* curop() const { return _curOp; }
-        const StringData desc() const { return _desc; }
+        const std::string& desc() const { return _desc; }
         void setLastOp( OpTime op ) { _lastOp = op; }
         OpTime getLastOp() const { return _lastOp; }
 

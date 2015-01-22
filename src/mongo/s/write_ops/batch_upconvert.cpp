@@ -28,6 +28,8 @@
 
 #include "mongo/s/write_ops/batch_upconvert.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
@@ -40,7 +42,10 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
     using mongoutils::str::stream;
+    using std::auto_ptr;
+    using std::string;
     using std::vector;
 
     void msgToBatchRequests( const Message& msg, vector<BatchedCommandRequest*>* requests ) {

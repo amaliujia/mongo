@@ -1,5 +1,3 @@
-// rocks_record_store_harness_test.cpp
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -28,10 +26,13 @@
  *    it in the license file.
  */
 
-#include <memory>
-#include <vector>
+#include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+#include <memory>
+#include <vector>
 
 #include <rocksdb/comparator.h>
 #include <rocksdb/db.h>
@@ -48,6 +49,10 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::string;
+
     class RocksRecordStoreHarnessHelper : public HarnessHelper {
     public:
         RocksRecordStoreHarnessHelper() : _tempDir(_testNamespace) {
@@ -56,7 +61,6 @@ namespace mongo {
             std::vector<rocksdb::ColumnFamilyDescriptor> cfs;
             cfs.emplace_back();
             cfs.emplace_back("record_store", rocksdb::ColumnFamilyOptions());
-            cfs[1].options.comparator = RocksRecordStore::newRocksCollectionComparator();
             rocksdb::DBOptions db_options;
             db_options.create_if_missing = true;
             db_options.create_missing_column_families = true;

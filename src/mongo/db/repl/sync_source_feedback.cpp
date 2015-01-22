@@ -42,13 +42,16 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
 
 namespace repl {
 
@@ -107,7 +110,7 @@ namespace repl {
 
     bool SyncSourceFeedback::replHandshake(OperationContext* txn) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (replCoord->getCurrentMemberState().primary()) {
+        if (replCoord->getMemberState().primary()) {
             // primary has no one to handshake to
             return true;
         }
@@ -194,7 +197,7 @@ namespace repl {
 
     Status SyncSourceFeedback::updateUpstream(OperationContext* txn) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (replCoord->getCurrentMemberState().primary()) {
+        if (replCoord->getMemberState().primary()) {
             // primary has no one to update to
             return Status::OK();
         }
@@ -266,7 +269,7 @@ namespace repl {
                 _handshakeNeeded = false;
             }
 
-            MemberState state = replCoord->getCurrentMemberState();
+            MemberState state = replCoord->getMemberState();
             if (state.primary() || state.startup()) {
                 _resetConnection();
                 continue;

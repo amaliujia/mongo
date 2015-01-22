@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/background.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -40,6 +42,11 @@
 #include "mongo/db/operation_context_impl.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::string;
+    using std::stringstream;
+
 namespace {
 
     Status cloneCollectionAsCapped( OperationContext* txn,
@@ -198,8 +205,7 @@ namespace {
         virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
                                                      Database* db,
                                                      const BSONObj& cmdObj) {
-            std::string collName = cmdObj.firstElement().valuestrsafe();
-            std::string ns = db->name() + "." + collName;
+            const std::string ns = parseNsCollectionRequired(db->name(), cmdObj);
 
             IndexCatalog::IndexKillCriteria criteria;
             criteria.ns = ns;

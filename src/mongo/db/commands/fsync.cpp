@@ -50,7 +50,11 @@
 
 
 namespace mongo {
-    
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+
     class FSyncLockThread : public BackgroundJob {
         void doRealWork();
     public:
@@ -124,7 +128,7 @@ namespace mongo {
                     return false;
                 }
                 
-                log() << "db is now locked for snapshotting, no writes allowed. db.fsyncUnlock() to unlock" << endl;
+                log() << "db is now locked, no writes allowed. db.fsyncUnlock() to unlock" << endl;
                 log() << "    For more info see " << FSyncCommand::url() << endl;
                 result.append("info", "now locked against writes, use db.fsyncUnlock() to unlock");
                 result.append("seeAlso", FSyncCommand::url());
@@ -140,6 +144,9 @@ namespace mongo {
 
                     //  No WriteUnitOfWork needed, as this does no writes of its own.
                 }
+
+                // Take a global IS lock to ensure the storage engine is not shutdown
+                Lock::GlobalLock global(txn->lockState(), MODE_IS);
                 StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
                 result.append( "numFiles" , storageEngine->flushAllFiles( sync ) );
             }

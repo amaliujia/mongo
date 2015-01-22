@@ -48,6 +48,7 @@
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/explain.h"
@@ -63,7 +64,7 @@
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/stage_builder.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -72,6 +73,11 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     // static
     void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
@@ -119,6 +125,7 @@ namespace mongo {
                                                         desc->getAccessMethodName(),
                                                         desc->isMultikey(txn),
                                                         desc->isSparse(),
+                                                        desc->unique(),
                                                         desc->indexName(),
                                                         desc->infoObj()));
         }
@@ -168,8 +175,19 @@ namespace mongo {
             plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
         }
 
-        plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
         plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+
+        // Doc-level locking storage engines cannot answer predicates implicitly via exact index
+        // bounds for index intersection plans, as this can lead to spurious matches.
+        //
+        // Such storage engines do not use the invalidation framework, and therefore
+        // have no need for KEEP_MUTATIONS.
+        if (supportsDocLocking()) {
+            plannerParams->options |= QueryPlannerParams::CANNOT_TRIM_IXISECT;
+        }
+        else {
+            plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
+        }
     }
 
     namespace {
@@ -670,8 +688,8 @@ namespace mongo {
         PlanStage* root;
         QuerySolution* querySolution;
         const size_t defaultPlannerOptions = 0;
-        Status status = prepareExecution(txn, collection, ws.get(), cq.get(), defaultPlannerOptions,
-                                         &root, &querySolution);
+        Status status = prepareExecution(txn, collection, ws.get(), cq.get(),
+                                         defaultPlannerOptions, &root, &querySolution);
         if (!status.isOK()) {
             return status;
         }
@@ -1090,6 +1108,7 @@ namespace mongo {
                                                            desc->getAccessMethodName(),
                                                            desc->isMultikey(txn),
                                                            desc->isSparse(),
+                                                           desc->unique(),
                                                            desc->indexName(),
                                                            desc->infoObj()));
             }

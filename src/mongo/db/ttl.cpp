@@ -48,13 +48,19 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::vector;
 
     Counter64 ttlPasses;
     Counter64 ttlDeletedDocuments;
@@ -63,6 +69,7 @@ namespace mongo {
     ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments", &ttlDeletedDocuments);
 
     MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorEnabled, bool, true );
+    MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorSleepSecs, int, 60 ); //used for testing
 
     class TTLMonitor : public BackgroundJob {
     public:
@@ -78,7 +85,7 @@ namespace mongo {
             cc().getAuthorizationSession()->grantInternalAuthorization();
 
             while ( ! inShutdown() ) {
-                sleepsecs( 60 );
+                sleepsecs( ttlMonitorSleepSecs );
 
                 LOG(3) << "TTLMonitor thread awake" << endl;
 
@@ -100,7 +107,7 @@ namespace mongo {
                 // if part of replSet but not in a readable state (e.g. during initial sync), skip.
                 if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
                         repl::ReplicationCoordinator::modeReplSet &&
-                        !repl::getGlobalReplicationCoordinator()->getCurrentMemberState().readable())
+                        !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
                     continue;
 
                 set<string> dbs;
@@ -117,8 +124,16 @@ namespace mongo {
                     for ( vector<BSONObj>::const_iterator it = indexes.begin();
                           it != indexes.end(); ++it ) {
 
-                        if ( !doTTLForIndex( &txn, db, *it ) ) {
-                            break;  // stop processing TTL indexes on this database
+                        BSONObj idx = *it;
+                        try {
+                            if ( !doTTLForIndex( &txn, db, idx ) ) {
+                                break;  // stop processing TTL indexes on this database
+                            }
+                        } catch (const DBException& dbex) {
+                            error() << "Error processing ttl index: " << idx
+                                    << " -- " << dbex.toString();
+                            // continue on to the next index
+                            continue;
                         }
                     }
                 }
@@ -185,6 +200,7 @@ namespace mongo {
          */
         bool doTTLForIndex( OperationContext* txn, const string& dbName, const BSONObj& idx ) {
             BSONObj key = idx["key"].Obj();
+            const string ns = idx["ns"].String();
             if ( key.nFields() != 1 ) {
                 error() << "key for ttl index can only have 1 field" << endl;
                 return true;
@@ -204,13 +220,11 @@ namespace mongo {
                 query = BSON( key.firstElement().fieldName() << b.obj() );
             }
 
-            LOG(1) << "TTL: " << key << " \t " << query << endl;
+            LOG(1) << "TTL -- ns: " << ns << "key:" << key << " query: " << query << endl;
 
             long long numDeleted = 0;
             int attempt = 1;
             while (1) {
-                const string ns = idx["ns"].String();
-
                 ScopedTransaction scopedXact(txn, MODE_IX);
                 AutoGetDb autoDb(txn, dbName, MODE_IX);
                 Database* db = autoDb.getDb();
