@@ -129,6 +129,68 @@ static int __wt_huffman_read(WT_SESSION_IMPL *,
     WT_CONFIG_ITEM *, struct __wt_huffman_table **, u_int *, u_int *);
 
 /*
+ * __huffman_confchk_file --
+ *	Check for a Huffman configuration file and return the file name.
+ */
+static int
+__huffman_confchk_file(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *v, int *is_utf8p, FILE **fpp)
+{
+	FILE *fp;
+	WT_DECL_RET;
+	size_t len;
+	char *fname;
+
+	/* Look for a prefix and file name. */
+	len = 0;
+	if (is_utf8p != NULL)
+		*is_utf8p = 0;
+	if (WT_PREFIX_MATCH(v->str, "utf8")) {
+		if (is_utf8p != NULL)
+			*is_utf8p = 1;
+		len = strlen("utf8");
+	} else if (WT_PREFIX_MATCH(v->str, "utf16"))
+		len = strlen("utf16");
+	if (len == 0 || len >= v->len)
+		WT_RET_MSG(session, EINVAL,
+		    "illegal Huffman configuration: %.*s", (int)v->len, v->str);
+
+	/* Check the file exists. */
+	WT_RET(__wt_strndup(session, v->str + len, v->len - len, &fname));
+	WT_ERR(__wt_fopen(session,
+	    fname, WT_FHANDLE_READ, WT_FOPEN_FIXED, &fp));
+
+	/* Optionally return the file handle. */
+	if (fpp == NULL)
+		(void)__wt_fclose(session, &fp, WT_FHANDLE_READ);
+	else
+		*fpp = fp;
+
+err:	__wt_free(session, fname);
+
+	return (ret);
+}
+
+/*
+ * __wt_huffman_confchk --
+ *	Verify Huffman configuration.
+ */
+int
+__wt_huffman_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *v)
+{
+	if (v->len == 0)
+		return (0);
+
+	/* Standard Huffman encodings, no work to be done. */
+	if (WT_STRING_MATCH("english", v->str, v->len))
+		return (0);
+	if (WT_STRING_MATCH("none", v->str, v->len))
+		return (0);
+
+	return (__huffman_confchk_file(session, v, NULL, NULL));
+}
+
+/*
  * __wt_btree_huffman_open --
  *	Configure Huffman encoding for the tree.
  */
@@ -146,8 +208,10 @@ __wt_btree_huffman_open(WT_SESSION_IMPL *session)
 	cfg = btree->dhandle->cfg;
 
 	WT_RET(__wt_config_gets_none(session, cfg, "huffman_key", &key_conf));
+	WT_RET(__wt_huffman_confchk(session, &key_conf));
 	WT_RET(
 	    __wt_config_gets_none(session, cfg, "huffman_value", &value_conf));
+	WT_RET(__wt_huffman_confchk(session, &value_conf));
 	if (key_conf.len == 0 && value_conf.len == 0)
 		return (0);
 
@@ -168,7 +232,7 @@ __wt_btree_huffman_open(WT_SESSION_IMPL *session)
 
 	if (key_conf.len == 0) {
 		;
-	} else if (strncasecmp(key_conf.str, "english", key_conf.len) == 0) {
+	} else if (strncmp(key_conf.str, "english", key_conf.len) == 0) {
 		struct __wt_huffman_table
 		    copy[WT_ELEMENTS(__wt_huffman_nytenglish)];
 
@@ -179,7 +243,7 @@ __wt_btree_huffman_open(WT_SESSION_IMPL *session)
 		    1, &btree->huffman_key));
 
 		/* Check for a shared key/value table. */
-		if (value_conf.len != 0 && strncasecmp(
+		if (value_conf.len != 0 && strncmp(
 		    value_conf.str, "english", value_conf.len) == 0) {
 			btree->huffman_value = btree->huffman_key;
 			return (0);
@@ -203,8 +267,7 @@ __wt_btree_huffman_open(WT_SESSION_IMPL *session)
 
 	if (value_conf.len == 0) {
 		;
-	} else if (
-	    strncasecmp(value_conf.str, "english", value_conf.len) == 0) {
+	} else if (strncmp(value_conf.str, "english", value_conf.len) == 0) {
 		struct __wt_huffman_table
 		    copy[WT_ELEMENTS(__wt_huffman_nytenglish)];
 
@@ -237,54 +300,37 @@ __wt_huffman_read(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *ip,
 	struct __wt_huffman_table *table, *tp;
 	FILE *fp;
 	WT_DECL_RET;
-	uint64_t symbol, frequency;
+	int64_t symbol, frequency;
 	u_int entries, lineno;
-	char *file;
+	int is_utf8;
 
 	*tablep = NULL;
 	*entriesp = *numbytesp = 0;
 
 	fp = NULL;
-	file = NULL;
 	table = NULL;
+
+	/*
+	 * Try and open the backing file.
+	 */
+	WT_RET(__huffman_confchk_file(session, ip, &is_utf8, &fp));
 
 	/*
 	 * UTF-8 table is 256 bytes, with a range of 0-255.
 	 * UTF-16 is 128KB (2 * 65536) bytes, with a range of 0-65535.
 	 */
-	if (strncasecmp(ip->str, "utf8", 4) == 0) {
+	if (is_utf8) {
 		entries = UINT8_MAX;
 		*numbytesp = 1;
 		WT_ERR(__wt_calloc_def(session, entries, &table));
-
-		if (ip->len == 4)
-			WT_ERR_MSG(session, EINVAL,
-			    "no Huffman table file name specified");
-		WT_ERR(__wt_calloc_def(session, ip->len, &file));
-		memcpy(file, ip->str + 4, ip->len - 4);
-	} else if (strncasecmp(ip->str, "utf16", 5) == 0) {
+	} else {
 		entries = UINT16_MAX;
 		*numbytesp = 2;
 		WT_ERR(__wt_calloc_def(session, entries, &table));
-
-		if (ip->len == 5)
-			WT_ERR_MSG(session, EINVAL,
-			    "no Huffman table file name specified");
-		WT_ERR(__wt_calloc_def(session, ip->len, &file));
-		memcpy(file, ip->str + 5, ip->len - 5);
-	} else {
-		WT_ERR_MSG(session, EINVAL,
-		    "unknown Huffman configuration value %.*s",
-		    (int)ip->len, ip->str);
 	}
 
-	if ((fp = fopen(file, "r")) == NULL)
-		WT_ERR_MSG(session, __wt_errno(),
-		    "unable to read Huffman table file %.*s",
-		    (int)ip->len, ip->str);
-
 	for (tp = table, lineno = 1; (ret =
-	    fscanf(fp, "%" SCNu64 " %" SCNu64, &symbol, &frequency)) != EOF;
+	    fscanf(fp, "%" SCNi64 " %" SCNi64, &symbol, &frequency)) != EOF;
 	    ++tp, ++lineno) {
 		if (lineno > entries)
 			WT_ERR_MSG(session, EINVAL,
@@ -296,30 +342,33 @@ __wt_huffman_read(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *ip,
 			    "line %u of Huffman table file %.*s is corrupted: "
 			    "expected two unsigned integral values",
 			    lineno, (int)ip->len, ip->str);
-		if (symbol > entries)
+		if (symbol < 0 || symbol > entries)
 			WT_ERR_MSG(session, EINVAL,
-			    "line %u of Huffman table file %.*s is corrupted: "
-			    "symbol larger than maximum value of %u",
-			    lineno, (int)ip->len, ip->str, entries);
-		if (frequency > UINT32_MAX)
+			    "line %u of Huffman file %.*s is corrupted; "
+			    "symbol %" PRId64 " not in range, maximum "
+			    "value is %u",
+			    lineno, (int)ip->len, ip->str, symbol, entries);
+		if (frequency < 0 || frequency > UINT32_MAX)
 			WT_ERR_MSG(session, EINVAL,
-			    "line %u of Huffman table file %.*s is corrupted: "
-			    "frequency larger than maximum value of %" PRIu32,
-			    lineno, (int)ip->len, ip->str, UINT32_MAX);
+			    "line %u of Huffman file %.*s is corrupted; "
+			    "frequency %" PRId64 " not in range, maximum "
+			    "value is %" PRIu32,
+			    lineno, (int)ip->len, ip->str, frequency,
+			    (uint32_t)UINT32_MAX);
 
 		tp->symbol = (uint32_t)symbol;
 		tp->frequency = (uint32_t)frequency;
 	}
 
+	if (ret == EOF)
+		ret = 0;
 	*entriesp = lineno - 1;
 	*tablep = table;
 
 	if (0) {
 err:		__wt_free(session, table);
 	}
-	if (fp != NULL)
-		(void)fclose(fp);
-	__wt_free(session, file);
+	(void)__wt_fclose(session, &fp, WT_FHANDLE_READ);
 	return (ret);
 }
 

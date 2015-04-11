@@ -26,11 +26,11 @@
  *    then also delete it in the license file.
  */
 
-// strategy_sharded.cpp
-
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
+
+#include "mongo/s/strategy.h"
 
 #include <boost/scoped_ptr.hpp>
 
@@ -49,14 +49,15 @@
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/bson_serializable.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/client/dbclient_multi_command.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/cluster_write.h"
-#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/dbclient_shard_resolver.h"
-#include "mongo/s/dbclient_multi_command.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request.h"
 #include "mongo/s/stale_exception.h"
@@ -72,6 +73,7 @@
 namespace mongo {
 
     using boost::scoped_ptr;
+    using boost::shared_ptr;
     using std::endl;
     using std::set;
     using std::string;
@@ -85,14 +87,18 @@ namespace mongo {
     /**
      * Returns true if request is a query for sharded indexes.
      */
-    static bool doShardedIndexQuery( Request& r, const QuerySpec& qSpec ) {
-
+    static bool doShardedIndexQuery(Request& r, const QuerySpec& qSpec) {
         // Extract the ns field from the query, which may be embedded within the "query" or
         // "$query" field.
-        string indexNSQuery(qSpec.filter()["ns"].str());
-        DBConfigPtr config = grid.getDBConfig( r.getns() );
+        const NamespaceString indexNSSQuery(qSpec.filter()["ns"].str());
 
-        if ( !config->isSharded( indexNSQuery )) {
+        auto status = grid.catalogCache()->getDatabase(indexNSSQuery.db().toString());
+        if (!status.isOK()) {
+            return false;
+        }
+
+        shared_ptr<DBConfig> config = status.getValue();
+        if (!config->isSharded(indexNSSQuery.ns())) {
             return false;
         }
 
@@ -102,7 +108,7 @@ namespace mongo {
 
         ShardPtr shard;
         ChunkManagerPtr cm;
-        config->getChunkManagerOrPrimary( indexNSQuery, cm, shard );
+        config->getChunkManagerOrPrimary(indexNSSQuery.ns(), cm, shard);
         if ( cm ) {
             set<Shard> shards;
             cm->getAllShards( shards );
@@ -213,7 +219,7 @@ namespace mongo {
             BufBuilder buffer( ShardedClientCursor::INIT_REPLY_BUFFER_SIZE );
             int docCount = 0;
             const int startFrom = cc->getTotalSent();
-            bool hasMore = cc->sendNextBatch( r, q.ntoreturn, buffer, docCount );
+            bool hasMore = cc->sendNextBatch(q.ntoreturn, buffer, docCount);
 
             if ( hasMore ) {
                 LOG(5) << "storing cursor : " << cc->getId() << endl;
@@ -330,6 +336,7 @@ namespace mongo {
         }
     }
 
+    // TODO: remove after MongoDB 3.2
     bool Strategy::handleSpecialNamespaces( Request& r , QueryMessage& q ) {
         const char * ns = strstr( r.getns() , ".$cmd.sys." );
         if ( ! ns )
@@ -385,40 +392,18 @@ namespace mongo {
             arr.done();
         }
         else if ( strcmp( ns , "killop" ) == 0 ) {
-            const bool isAuthorized = authSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::killop);
-            audit::logKillOpAuthzCheck(
-                    client,
-                    q.query,
-                    isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
-            uassert(ErrorCodes::Unauthorized, "not authorized to run killop", isAuthorized);
+            BSONObjBuilder cmdBob;
+            cmdBob.append("killOp", 1);
+            cmdBob.appendElements(q.query); // fields are validated by ClusterKillOpCommand
+            auto interposedCmd = cmdBob.done();
 
-            BSONElement e = q.query["op"];
-            if ( e.type() != String ) {
-                b.append( "err" , "bad op" );
-                b.append( e );
-            }
-            else {
-                b.append( e );
-                string s = e.String();
-                string::size_type i = s.find( ':' );
-                if ( i == string::npos ) {
-                    b.append( "err" , "bad opid" );
-                }
-                else {
-                    string shard = s.substr( 0 , i );
-                    int opid = atoi( s.substr( i + 1 ).c_str() );
-                    b.append( "shard" , shard );
-                    b.append( "shardid" , opid );
+            NamespaceString nss(r.getns());
+            NamespaceString interposedNss(nss.db(), "$cmd");
 
-                    log() << "want to kill op: " << e << endl;
-                    Shard s(shard);
-
-                    ScopedDbConnection conn(s.getConnString());
-                    conn->findOne( r.getns() , BSON( "op" << opid ) );
-                    conn.done();
-                }
-            }
+            Command::runAgainstRegistered(interposedNss.ns().c_str(),
+                                          interposedCmd,
+                                          b,
+                                          q.queryOptions);
         }
         else if ( strcmp( ns , "unlock" ) == 0 ) {
             b.append( "err" , "can't do unlock through mongos" );
@@ -472,9 +457,9 @@ namespace mongo {
         // Note that this implementation will not handle targeting retries and does not completely
         // emulate write behavior
 
-        ChunkManagerTargeter targeter;
-        Status status =
-            targeter.init(NamespaceString(targetingBatchItem.getRequest()->getTargetingNS()));
+        ChunkManagerTargeter targeter(NamespaceString(
+                                        targetingBatchItem.getRequest()->getTargetingNS()));
+        Status status = targeter.init();
         if (!status.isOK())
             return status;
 
@@ -554,15 +539,15 @@ namespace mongo {
 
         // Note that this implementation will not handle targeting retries and fails when the
         // sharding metadata is too stale
-
-        DBConfigPtr conf = grid.getDBConfig(db , false);
-        if (!conf) {
+        auto status = grid.catalogCache()->getDatabase(db);
+        if (!status.isOK()) {
             mongoutils::str::stream ss;
             ss << "Passthrough command failed: " << command.toString()
-               << " on ns " << versionedNS << ". Cannot find db config info.";
+               << " on ns " << versionedNS << ". Caused by " << causedBy(status.getStatus());
             return Status(ErrorCodes::IllegalOperation, ss);
         }
 
+        shared_ptr<DBConfig> conf = status.getValue();
         if (conf->isSharded(versionedNS)) {
             mongoutils::str::stream ss;
             ss << "Passthrough command failed: " << command.toString()
@@ -576,7 +561,13 @@ namespace mongo {
         try {
             ShardConnection conn(primaryShard, "");
             // TODO: this can throw a stale config when mongos is not up-to-date -- fix.
-            conn->runCommand(db, command, shardResult, options);
+            if (!conn->runCommand(db, command, shardResult, options)) {
+                conn.done();
+                return Status(ErrorCodes::OperationFailed,
+                              str::stream() << "Passthrough command failed: " << command
+                                            << " on ns " << versionedNS
+                                            << "; result: " << shardResult);
+            }
             conn.done();
         }
         catch (const DBException& ex) {
@@ -592,14 +583,26 @@ namespace mongo {
     }
 
     void Strategy::getMore( Request& r ) {
-
         Timer getMoreTimer;
 
-        const char *ns = r.getns();
+        const char* ns = r.getns();
+        const int ntoreturn = r.d().pullInt();
+        const long long id = r.d().pullInt64();
 
         // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
         // for now has same semantics as legacy request
-        DBConfigPtr config = grid.getDBConfig( ns );
+        const NamespaceString nss(ns);
+        auto statusGetDb = grid.catalogCache()->getDatabase(nss.db().toString());
+        if (statusGetDb == ErrorCodes::DatabaseNotFound) {
+            cursorCache.remove(id);
+            replyToQuery(ResultFlag_CursorNotFound, r.p(), r.m(), 0, 0, 0);
+            return;
+        }
+
+        uassertStatusOK(statusGetDb);
+
+        shared_ptr<DBConfig> config = statusGetDb.getValue();
+
         ShardPtr primary;
         ChunkManagerPtr info;
         config->getChunkManagerOrPrimary( ns, info, primary );
@@ -607,10 +610,7 @@ namespace mongo {
         //
         // TODO: Cleanup cursor cache, consolidate into single codepath
         //
-
-        int ntoreturn = r.d().pullInt();
-        long long id = r.d().pullInt64();
-        string host = cursorCache.getRef( id );
+        const string host = cursorCache.getRef(id);
         ShardedClientCursorPtr cursor = cursorCache.get( id );
         int cursorMaxTimeMS = cursorCache.getMaxTimeMS( id );
 
@@ -661,7 +661,7 @@ namespace mongo {
             BufBuilder buffer( ShardedClientCursor::INIT_REPLY_BUFFER_SIZE );
             int docCount = 0;
             const int startFrom = cursor->getTotalSent();
-            bool hasMore = cursor->sendNextBatch( r, ntoreturn, buffer, docCount );
+            bool hasMore = cursor->sendNextBatch(ntoreturn, buffer, docCount);
 
             if ( hasMore ) {
                 // still more data

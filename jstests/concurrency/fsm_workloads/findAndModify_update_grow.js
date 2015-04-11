@@ -90,12 +90,11 @@ var $config = (function() {
             // Get the DiskLoc of the document after its potential move
             var after = db[collName].find({ _id: before._id }).showDiskLoc().next();
 
-            var status = db.serverStatus();
-            if (isMongod(status) && isMMAPv1(status)) {
+            if (isMongod(db) && isMMAPv1(db)) {
                 // Since the document has at least doubled in size, and the default
                 // allocation strategy of mmapv1 is to use power of two sizes, the
                 // document will have always moved
-                assertWhenOwnColl.neq(before.$diskLoc, after.$diskLoc,
+                assertWhenOwnColl.neq(before.$recordId, after.$recordId,
                                       'document should have moved');
             }
         }

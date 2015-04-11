@@ -29,6 +29,7 @@
 #include <boost/scoped_ptr.hpp>
 #include <memory>
 
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/count.h"
@@ -123,7 +124,16 @@ namespace QueryStageCount {
         void update(const RecordId& oldLoc, const BSONObj& newDoc) {
             WriteUnitOfWork wunit(&_txn);
             BSONObj oldDoc = _coll->getRecordStore()->dataFor( &_txn, oldLoc ).releaseToBson();
-            _coll->updateDocument(&_txn, oldLoc, oldDoc, newDoc, false, true, NULL);
+            oplogUpdateEntryArgs args;
+            _coll->updateDocument(&_txn,
+                                  oldLoc,
+                                  Snapshotted<BSONObj>(_txn.recoveryUnit()->getSnapshotId(),
+                                                       oldDoc),
+                                  newDoc,
+                                  false,
+                                  true,
+                                  NULL,
+                                  args);
             wunit.commit();
         }
 
@@ -229,7 +239,7 @@ namespace QueryStageCount {
         OperationContextImpl _txn;
         ScopedTransaction _scopedXact;
         Lock::DBLock _dbLock;
-        Client::Context _ctx;
+        OldClientContext _ctx;
         Collection* _coll;
     };
 
@@ -314,11 +324,11 @@ namespace QueryStageCount {
         void interject(CountStage& count_stage, int interjection) {
             if (interjection == 0) {
                 count_stage.invalidate(&_txn, _locs[0], INVALIDATION_MUTATION);
-                OID id1 = _coll->docFor(&_txn, _locs[0]).getField("_id").OID();
+                OID id1 = _coll->docFor(&_txn, _locs[0]).value().getField("_id").OID();
                 update(_locs[0], BSON("_id" << id1 << "x" << 100));
 
                 count_stage.invalidate(&_txn, _locs[1], INVALIDATION_MUTATION);
-                OID id2 = _coll->docFor(&_txn, _locs[1]).getField("_id").OID();
+                OID id2 = _coll->docFor(&_txn, _locs[1]).value().getField("_id").OID();
                 update(_locs[1], BSON("_id" << id2 << "x" << 100));
             }
         }

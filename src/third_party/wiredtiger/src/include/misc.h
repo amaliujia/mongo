@@ -21,14 +21,7 @@
 #define	WT_GIGABYTE	(1073741824)
 #define	WT_TERABYTE	((uint64_t)1099511627776)
 #define	WT_PETABYTE	((uint64_t)1125899906842624)
-
-/*
- * Number of directory entries can grow dynamically.
- */
-#define	WT_DIR_ENTRY	32
-
-#define	WT_DIRLIST_EXCLUDE	0x1	/* Exclude files matching prefix */
-#define	WT_DIRLIST_INCLUDE	0x2	/* Include files matching prefix */
+#define	WT_EXABYTE	((uint64_t)1152921504606846976)
 
 /*
  * Sizes that cannot be larger than 2**32 are stored in uint32_t fields in
@@ -181,10 +174,6 @@
 #define	WT_STRING_MATCH(str, bytes, len)				\
 	(((const char *)str)[0] == ((const char *)bytes)[0] &&		\
 	    strncmp(str, bytes, len) == 0 && (str)[(len)] == '\0')
-#define	WT_STRING_CASE_MATCH(str, bytes, len)				\
-	(tolower(((const char *)str)[0]) ==				\
-	    tolower(((const char *)bytes)[0]) &&			\
-	    strncasecmp(str, bytes, len) == 0 && (str)[(len)] == '\0')
 
 /*
  * Macro that produces a string literal that isn't wrapped in quotes, to avoid

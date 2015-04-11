@@ -28,7 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include <third_party/gperftools-2.2/src/gperftools/malloc_extension.h>
+#include "gperftools/malloc_extension.h"
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/init.h"
@@ -130,7 +130,7 @@ namespace {
         if (getenv("TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES")) {
             return Status::OK();
         }
-        return tcmallocMaxTotalThreadCacheBytesParameter.setFromString("0x4000000" /* 64MB */);
+        return tcmallocMaxTotalThreadCacheBytesParameter.setFromString("0x40000000" /* 1024MB */);
     }
 
 }  // namespace

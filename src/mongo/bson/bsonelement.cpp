@@ -31,6 +31,7 @@
 
 #include "mongo/bson/bsonelement.h"
 
+#include <cmath>
 #include <boost/functional/hash.hpp>
 
 #include "mongo/base/compare_numbers.h"
@@ -49,8 +50,6 @@ namespace mongo {
     using std::string;
 
     string BSONElement::jsonString( JsonStringFormat format, bool includeFieldNames, int pretty ) const {
-        int sign;
-
         std::stringstream s;
         if ( includeFieldNames )
             s << '"' << escape( fieldName() ) << "\" : ";
@@ -81,11 +80,11 @@ namespace mongo {
             // This is not valid JSON, but according to RFC-4627, "Numeric values that cannot be
             // represented as sequences of digits (such as Infinity and NaN) are not permitted." so
             // we are accepting the fact that if we have such values we cannot output valid JSON.
-            else if ( mongo::isNaN(number()) ) {
+            else if ( std::isnan(number()) ) {
                 s << "NaN";
             }
-            else if ( mongo::isInf(number(), &sign) ) {
-                s << ( sign == 1 ? "Infinity" : "-Infinity");
+            else if ( std::isinf(number()) ) {
+                s << ( number() > 0 ? "Infinity" : "-Infinity");
             }
             else {
                 StringBuilder ss;
@@ -265,7 +264,7 @@ namespace mongo {
             s << "\"" << escape(_asCode()) << "\"";
             break;
 
-        case Timestamp:
+        case bsonTimestamp:
             if ( format == TenGen ) {
                 s << "Timestamp( " << ( timestampTime() / 1000 ) << ", " << timestampInc() << " )";
             }
@@ -423,7 +422,7 @@ namespace mongo {
         return b.obj();
     }
 
-    BSONObj BSONElement::wrap( const StringData& newName ) const {
+    BSONObj BSONElement::wrap( StringData newName ) const {
         BSONObjBuilder b(size() + 6 + newName.size());
         b.appendAs(*this,newName);
         return b.obj();
@@ -462,7 +461,7 @@ namespace mongo {
         case NumberInt:
             x = 4;
             break;
-        case Timestamp:
+        case bsonTimestamp:
         case mongo::Date:
         case NumberDouble:
         case NumberLong:
@@ -542,7 +541,7 @@ namespace mongo {
         case NumberInt:
             x = 4;
             break;
-        case Timestamp:
+        case bsonTimestamp:
         case mongo::Date:
         case NumberDouble:
         case NumberLong:
@@ -701,7 +700,7 @@ namespace mongo {
                 }
             }
             break;
-        case Timestamp:
+        case bsonTimestamp:
             s << "Timestamp " << timestampTime() << "|" << timestampInc();
             break;
         default:
@@ -744,6 +743,13 @@ namespace mongo {
         if ( !isNumber() )
             return false;
         *out = numberInt();
+        return true;
+    }
+
+    template<> bool BSONElement::coerce<long long>( long long* out ) const {
+        if ( !isNumber() )
+            return false;
+        *out = numberLong();
         return true;
     }
 
@@ -837,7 +843,7 @@ namespace mongo {
             return f==0 ? 0 : 1;
         case Bool:
             return *l.value() - *r.value();
-        case Timestamp:
+        case bsonTimestamp:
             // unsigned compare for timestamps - note they are not really dates but (ordinal + time_t)
             if ( l.date() < r.date() )
                 return -1;
@@ -957,8 +963,8 @@ namespace mongo {
             boost::hash_combine(hash, elem.boolean());
             break;
 
-        case mongo::Timestamp:
-            boost::hash_combine(hash, elem._opTime().asDate());
+        case mongo::bsonTimestamp:
+            boost::hash_combine(hash, elem.timestamp().asULL());
             break;
 
         case mongo::Date:
@@ -973,7 +979,7 @@ namespace mongo {
             // equal numbers and is still likely to be different for different numbers.
             // SERVER-16851
             const double dbl = elem.numberDouble();
-            if (isNaN(dbl)) {
+            if (std::isnan(dbl)) {
                 boost::hash_combine(hash, std::numeric_limits<double>::quiet_NaN());
             }
             else {

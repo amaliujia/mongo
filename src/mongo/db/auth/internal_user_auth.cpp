@@ -59,14 +59,14 @@ namespace mongo {
         if (!isInternalAuthSet()) {
             authParamsSet = true;
         }
-        boost::mutex::scoped_lock lk(authParamMutex);
+        boost::lock_guard<boost::mutex> lk(authParamMutex);
 
         if (authParamsIn["mechanism"].String() != "SCRAM-SHA-1") {
             authParams = authParamsIn.copy();
             return;
         }
 
-        // Create authParams for legacy MONGODB-CR authentication for 2.6/2.8 mixed
+        // Create authParams for legacy MONGODB-CR authentication for 2.6/3.0 mixed
         // mode if applicable.
         mmb::Document fallback(authParamsIn);
         fallback.root().findFirstChildNamed("mechanism").setValueString("MONGODB-CR");
@@ -83,7 +83,7 @@ namespace mongo {
             return BSONObj();
         }
 
-        boost::mutex::scoped_lock lk(authParamMutex);
+        boost::lock_guard<boost::mutex> lk(authParamMutex);
         return authParams.copy();
     }
 

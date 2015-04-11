@@ -31,51 +31,42 @@
 #pragma once
 
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+#include <string>
+#include <vector>
 
-#include "mongo/util/time_support.h"
-#include "mongo/util/concurrency/mutex.h"
-
-#include "mongo/s/config.h"  // DBConfigPtr
-#include "mongo/s/type_settings.h"
+#include "mongo/s/config.h"
 
 namespace mongo {
 
+    class CatalogCache;
+    class CatalogManager;
+    class DBConfig;
+    class SettingsType;
+    template<typename T> class StatusWith;
+
+
     /**
-     * stores meta-information about the grid
-     * TODO: used shard_ptr for DBConfig pointers
+     * Holds the global sharding context. Single instance exists for a running server. Exists on
+     * both MongoD and MongoS.
      */
     class Grid {
     public:
-        Grid() : _lock( "Grid" ) , _allowLocalShard( true ) { }
+        Grid();
 
         /**
-         * gets the config the db.
-         * will return an empty DBConfig if not in db already
+         * Called at startup time so the catalog manager can be set.
+         *
+         * Returns whether the catalog manager has been initialized successfully. Must be called
+         * only once.
          */
-        DBConfigPtr getDBConfig( const StringData& ns , bool create=true , const std::string& shardNameHint="" );
+        bool initCatalogManager(const std::vector<std::string>& configHosts);
 
         /**
-         * removes db entry.
-         * on next getDBConfig call will fetch from db
+         * Implicitly creates the specified database as non-sharded.
          */
-        void removeDB( const std::string& db );
-
-        /**
-         * removes db entry - only this DBConfig object will be removed,
-         *  other DBConfigs which may have been created in the meantime will not be harmed
-         *  on next getDBConfig call will fetch from db
-         *
-         *  Using this method avoids race conditions where multiple threads detect a database
-         *  reload has failed.
-         *
-         *  Example : N threads receive version exceptions and dbConfig.reload(), while
-         *  simultaneously a dropDatabase is occurring.  In the meantime, the dropDatabase call
-         *  attempts to create a DBConfig object if one does not exist, to load the db info,
-         *  but the config is repeatedly deleted as soon as it is created.  Using this method
-         *  prevents the deletion of configs we don't know about.
-         *
-         */
-        void removeDBIfExists( const DBConfig& database );
+        StatusWith<boost::shared_ptr<DBConfig>> implicitCreateDb(const std::string& dbName);
 
         /**
          * @return true if shards and config servers are allowed to use 'localhost' in address
@@ -86,21 +77,6 @@ namespace mongo {
          * @param whether to allow shards and config servers to use 'localhost' in address
          */
         void setAllowLocalHost( bool allow );
-
-        /**
-         *
-         * addShard will create a new shard in the grid. It expects a mongod process to be running
-         * on the provided address. Adding a shard that is a replica set is supported.
-         *
-         * @param name is an optional std::string with the name of the shard. if omitted, grid will
-         *        generate one and update the parameter.
-         * @param servers is the connection std::string of the shard being added
-         * @param maxSize is the optional space quota in bytes. Zeros means there's no limitation to
-         *        space usage
-         * @param errMsg is the error description in case the operation failed.
-         * @return true if shard was successfully added.
-         */
-        bool addShard( std::string* name , const ConnectionString& servers , long long maxSize , std::string& errMsg );
 
         /**
          * @return true if the config database knows about a host 'name'
@@ -132,6 +108,9 @@ namespace mongo {
          */
         bool getCollShouldBalance(const std::string& ns) const;
 
+        CatalogManager* catalogManager() const { return _catalogManager.get(); }
+        CatalogCache* catalogCache() const { return _catalogCache.get(); }
+
         /**
          * 
          * Obtain grid configuration and settings data.
@@ -140,10 +119,6 @@ namespace mongo {
          * @return a BSON object containing the requested data.
          */
         BSONObj getConfigSetting( const std::string& name ) const;
-
-        unsigned long long getNextOpTime() const;
-        
-        void flushConfig();
 
         // exposed methods below are for testing only
 
@@ -155,21 +130,11 @@ namespace mongo {
         static bool _inBalancingWindow( const BSONObj& balancerDoc , const boost::posix_time::ptime& now );
 
     private:
-        mongo::mutex              _lock;            // protects _databases; TODO: change to r/w lock ??
-        std::map<std::string, DBConfigPtr > _databases;       // maps ns to DBConfig's
-        bool                      _allowLocalShard; // can 'localhost' be used in shard addresses?
+        boost::scoped_ptr<CatalogManager> _catalogManager;
+        boost::scoped_ptr<CatalogCache> _catalogCache;
 
-        /**
-         * @param name is the chose name for the shard. Parameter is mandatory.
-         * @return true if it managed to generate a shard name. May return false if (currently)
-         * 10000 shard
-         */
-        bool _getNewShardName( std::string* name ) const;
-
-        /**
-         * @return whether a give dbname is used for shard "local" databases (e.g., admin or local)
-         */
-        static bool _isSpecialLocalDB( const std::string& dbName );
+        // can 'localhost' be used in shard addresses?
+        bool _allowLocalShard;
     };
 
     extern Grid grid;

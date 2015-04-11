@@ -59,18 +59,22 @@
 
 /*
  * Possible values for the consolidation array slot states:
+ * (NOTE: Any new states must be > WT_LOG_SLOT_DONE and < WT_LOG_SLOT_READY.)
+ *
  * < WT_LOG_SLOT_DONE - threads are actively writing to the log.
  * WT_LOG_SLOT_DONE - all activity on this slot is complete.
  * WT_LOG_SLOT_FREE - slot is available for allocation.
  * WT_LOG_SLOT_PENDING - slot is transitioning from ready to active.
+ * WT_LOG_SLOT_WRITTEN - slot is written and should be processed by worker.
  * WT_LOG_SLOT_READY - slot is ready for threads to join.
  * > WT_LOG_SLOT_READY - threads are actively consolidating on this slot.
  */
 #define	WT_LOG_SLOT_DONE	0
 #define	WT_LOG_SLOT_FREE	1
 #define	WT_LOG_SLOT_PENDING	2
-#define	WT_LOG_SLOT_READY	3
-typedef struct {
+#define	WT_LOG_SLOT_WRITTEN	3
+#define	WT_LOG_SLOT_READY	4
+typedef WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) struct {
 	int64_t	 slot_state;		/* Slot state */
 	uint64_t slot_group_size;	/* Group size */
 	int32_t	 slot_error;		/* Error value */
@@ -90,11 +94,13 @@ typedef struct {
 #define	SLOT_SYNC	0x08			/* Needs sync on release */
 #define	SLOT_SYNC_DIR	0x10			/* Directory sync on release */
 	uint32_t flags;			/* Flags */
-} WT_LOGSLOT WT_GCC_ATTRIBUTE((aligned(WT_CACHE_LINE_ALIGNMENT)));
+} WT_LOGSLOT;
+
+#define	SLOT_INIT_FLAGS	(SLOT_BUFFERED)
 
 typedef struct {
 	WT_LOGSLOT	*slot;
-	wt_off_t		 offset;
+	wt_off_t	 offset;
 } WT_MYSLOT;
 
 					/* Offset of first record */
@@ -135,6 +141,8 @@ typedef struct {
 
 	/* Notify any waiting threads when sync_lsn is updated. */
 	WT_CONDVAR	*log_sync_cond;
+	/* Notify any waiting threads when write_lsn is updated. */
+	WT_CONDVAR	*log_write_cond;
 
 	/*
 	 * Consolidation array information

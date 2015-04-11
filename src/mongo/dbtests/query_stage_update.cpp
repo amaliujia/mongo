@@ -34,6 +34,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/eof.h"
@@ -60,13 +61,13 @@ namespace QueryStageUpdate {
             : _client(&_txn),
               _ns("unittests.QueryStageUpdate"),
               _nsString(StringData(ns())) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
             _client.createCollection(ns());
         }
 
         virtual ~QueryStageUpdateBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
@@ -123,7 +124,7 @@ namespace QueryStageUpdate {
                 if (PlanStage::ADVANCED == state) {
                     WorkingSetMember* member = ws.get(id);
                     verify(member->hasObj());
-                    out->push_back(member->obj);
+                    out->push_back(member->obj.value());
                 }
             }
         }
@@ -186,9 +187,9 @@ namespace QueryStageUpdate {
         void run() {
             // Run the update.
             {
-                Client::WriteContext ctx(&_txn, ns());
+                OldClientWriteContext ctx(&_txn, ns());
                 Client& c = cc();
-                CurOp& curOp = *c.curop();
+                CurOp& curOp = *CurOp::get(c);
                 OpDebug* opDebug = &curOp.debug();
                 UpdateDriver driver( (UpdateDriver::Options()) );
                 Collection* collection = ctx.getCollection();
@@ -248,7 +249,7 @@ namespace QueryStageUpdate {
         void run() {
             // Run the update.
             {
-                Client::WriteContext ctx(&_txn, ns());
+                OldClientWriteContext ctx(&_txn, ns());
 
                 // Populate the collection.
                 for (int i = 0; i < 10; ++i) {
@@ -257,10 +258,10 @@ namespace QueryStageUpdate {
                 ASSERT_EQUALS(10U, count(BSONObj()));
 
                 Client& c = cc();
-                CurOp& curOp = *c.curop();
+                CurOp& curOp = *CurOp::get(c);
                 OpDebug* opDebug = &curOp.debug();
                 UpdateDriver driver( (UpdateDriver::Options()) );
-                Database* db = ctx.ctx().db();
+                Database* db = ctx.db();
                 Collection* coll = db->getCollection(ns());
 
                 // Get the RecordIds that would be returned by an in-order scan.
@@ -314,7 +315,7 @@ namespace QueryStageUpdate {
                 // Remove locs[targetDocIndex];
                 updateStage->saveState();
                 updateStage->invalidate(&_txn, locs[targetDocIndex], INVALIDATION_DELETION);
-                BSONObj targetDoc = coll->docFor(&_txn, locs[targetDocIndex]);
+                BSONObj targetDoc = coll->docFor(&_txn, locs[targetDocIndex]).value();
                 ASSERT(!targetDoc.isEmpty());
                 remove(targetDoc);
                 updateStage->restoreState(&_txn);

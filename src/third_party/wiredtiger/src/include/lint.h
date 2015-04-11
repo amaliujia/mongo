@@ -6,8 +6,17 @@
  * See the file LICENSE for redistribution information.
  */
 
-#define	WT_GCC_ATTRIBUTE(x)
+#define	WT_SIZET_FMT	"zu"			/* size_t format string */
+
+#define	WT_COMPILER_TYPE_ALIGN(x)
+
+#define	WT_PACKED_STRUCT_BEGIN(name)					\
+	struct name {
+#define	WT_PACKED_STRUCT_END						\
+	};
+
 #define	WT_GCC_FUNC_ATTRIBUTE(x)
+#define	WT_GCC_FUNC_DECL_ATTRIBUTE(x)
 
 #define	__WT_ATOMIC_ADD(v, val)						\
     ((v) += (val))

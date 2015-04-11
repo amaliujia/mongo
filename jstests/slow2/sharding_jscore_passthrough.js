@@ -1,4 +1,4 @@
-var myShardingTest = new ShardingTest("sharding_passthrough", 2, 0, 1);
+var myShardingTest = new ShardingTest("sharding_passthrough", 1, 0, 1);
 myShardingTest.adminCommand({ enablesharding : "test" });
 
 var db = myShardingTest.getDB("test");
@@ -72,6 +72,7 @@ files.forEach(function(x) {
         'profile\\d*|' +
         'dbhash|' +
         'dbhash2|' +
+        'explain_missing_database|' +
         'median|' +
         'evalb|' +
         'evald|' +
@@ -121,7 +122,6 @@ files.forEach(function(x) {
         'indexStatsCommand|' +
         'storageDetailsCommand|' +
         'reversecursor|' +
-        'block_check_supported|' +
         'stages.*|' +
         'top|' +
         'repair_cursor1|' +

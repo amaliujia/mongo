@@ -30,7 +30,10 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#include <cmath>
+
 #include "mongo/platform/basic.h"
+#include "mongo/config.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
@@ -147,7 +150,7 @@ TEST(KeyStringTest, AllTypesSimple) {
     ROUNDTRIP(BSON("" << BSONCode("abc_code")));
     ROUNDTRIP(BSON("" << BSONCodeWScope("def_code", BSON("x_scope" << "a"))));
     ROUNDTRIP(BSON("" << 5));
-    ROUNDTRIP(BSON("" << OpTime(123123, 123)));
+    ROUNDTRIP(BSON("" << Timestamp(123123, 123)));
     ROUNDTRIP(BSON("" << 1235123123123LL));
 }
 
@@ -307,12 +310,12 @@ TEST(KeyStringTest, RecordIdOrder2Double) {
     ASSERT_LESS_THAN(a, c);
 }
 
-TEST(KeyStringTest, OpTime) {
+TEST(KeyStringTest, Timestamp) {
 
-    BSONObj a = BSON("" << OpTime(0, 0));
-    BSONObj b = BSON("" << OpTime(1234, 1));
-    BSONObj c = BSON("" << OpTime(1234, 2));
-    BSONObj d = BSON("" << OpTime(1235, 1));
+    BSONObj a = BSON("" << Timestamp(0, 0));
+    BSONObj b = BSON("" << Timestamp(1234, 1));
+    BSONObj c = BSON("" << Timestamp(1234, 2));
+    BSONObj d = BSON("" << Timestamp(1235, 1));
 
     {
         ROUNDTRIP(a);
@@ -617,7 +620,7 @@ TEST(KeyStringTest, AllPermCompare) {
 
 TEST(KeyStringTest, AllPerm2Compare) {
     // This test can take over a minute without optimizations. Re-enable if you need to debug it.
-#if !defined(MONGO_OPTIMIZED_BUILD)
+#if !defined(MONGO_CONFIG_OPTIMIZED_BUILD)
     log() << "\t\t\tskipping test on non-optimized build";
     return;
 #endif
@@ -701,10 +704,10 @@ TEST(KeyStringTest, NaNs) {
     ASSERT_EQ(ks1a, ks2a);
     ASSERT_EQ(ks1d, ks2d);
 
-    ASSERT(isNaN(toBson(ks1a, ONE_ASCENDING)[""].Double()));
-    ASSERT(isNaN(toBson(ks2a, ONE_ASCENDING)[""].Double()));
-    ASSERT(isNaN(toBson(ks1d, ONE_DESCENDING)[""].Double()));
-    ASSERT(isNaN(toBson(ks2d, ONE_DESCENDING)[""].Double()));
+    ASSERT(std::isnan(toBson(ks1a, ONE_ASCENDING)[""].Double()));
+    ASSERT(std::isnan(toBson(ks2a, ONE_ASCENDING)[""].Double()));
+    ASSERT(std::isnan(toBson(ks1d, ONE_DESCENDING)[""].Double()));
+    ASSERT(std::isnan(toBson(ks2d, ONE_DESCENDING)[""].Double()));
 }
 TEST(KeyStringTest, NumberOrderLots) {
     std::vector<BSONObj> numbers;

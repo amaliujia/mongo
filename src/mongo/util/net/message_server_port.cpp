@@ -36,10 +36,12 @@
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/config.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
@@ -128,7 +130,7 @@ namespace {
                 if (limits.rlim_cur > STACK_SIZE) {
                     size_t stackSizeToSet = STACK_SIZE;
 #if !__has_feature(address_sanitizer)
-                    if (DEBUG_BUILD)
+                    if (kDebugBuild)
                         stackSizeToSet /= 2;
 #endif
                     pthread_attr_setstacksize(&attrs, stackSizeToSet);
@@ -203,6 +205,7 @@ namespace {
             portWithHandler->psock->setLogLevel(logger::LogSeverity::Debug(1));
 
             Message m;
+            int64_t counter = 0;
             try {
                 LastError * le = new LastError();
                 lastError.reset( le ); // lastError now has ownership
@@ -227,6 +230,11 @@ namespace {
                     handler->process(m, portWithHandler.get(), le);
                     networkCounter.hit(portWithHandler->psock->getBytesIn(),
                                        portWithHandler->psock->getBytesOut());
+
+                    // Occasionally we want to see if we're using too much memory.
+                    if ((counter++ & 0xf) == 0) {
+                        markThreadIdle();
+                    }
                 }
             }
             catch ( AssertionException& e ) {
@@ -247,7 +255,7 @@ namespace {
             }
 
             // Normal disconnect path.
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
             SSLManagerInterface* manager = getSSLManager();
             if (manager)
                 manager->cleanupThreadLocals();

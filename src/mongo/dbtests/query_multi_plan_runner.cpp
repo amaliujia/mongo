@@ -30,6 +30,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
@@ -74,12 +75,12 @@ namespace QueryMultiPlanRunner {
     class MultiPlanRunnerBase {
     public:
         MultiPlanRunnerBase() : _client(&_txn) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
         virtual ~MultiPlanRunnerBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
@@ -88,12 +89,12 @@ namespace QueryMultiPlanRunner {
         }
 
         void insert(const BSONObj& obj) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.insert(ns(), obj);
         }
 
         void remove(const BSONObj& obj) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.remove(ns(), obj);
         }
 
@@ -158,9 +159,9 @@ namespace QueryMultiPlanRunner {
             mps->addPlan(createQuerySolution(), firstRoot.release(), sharedWs.get());
             mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
-            // Plan 0 aka the first plan aka the index scan should be the best. NULL means that
-            // 'mps' will not yield during plan selection.
-            mps->pickBestPlan(NULL);
+            // Plan 0 aka the first plan aka the index scan should be the best.
+            PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+            mps->pickBestPlan(&yieldPolicy);
             ASSERT(mps->bestPlanChosen());
             ASSERT_EQUALS(0, mps->bestPlanIdx());
 
@@ -238,8 +239,9 @@ namespace QueryMultiPlanRunner {
                 mps->addPlan(solutions[i], root, ws.get());
             }
 
-            // This sets a backup plan. NULL means that 'mps' will not yield.
-            mps->pickBestPlan(NULL);
+            // This sets a backup plan.
+            PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+            mps->pickBestPlan(&yieldPolicy);
             ASSERT(mps->bestPlanChosen());
             ASSERT(mps->hasBackupPlan());
 
@@ -263,7 +265,7 @@ namespace QueryMultiPlanRunner {
             // Check the document returned by the query.
             ASSERT(member->hasObj());
             BSONObj expectedDoc = BSON("_id" << 1 << "a" << 1 << "b" << 1);
-            ASSERT(expectedDoc.woCompare(member->obj) == 0);
+            ASSERT(expectedDoc.woCompare(member->obj.value()) == 0);
 
             // The blocking plan became unblocked, so we should no longer have a backup plan,
             // and the winning plan should still be the index intersection one.

@@ -27,26 +27,52 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "synchronization.h"
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+#include "mongo/util/log.h"
+
 namespace mongo {
 
-    Notification::Notification() : _mutex ( "Notification" ){ 
+namespace {
+    ThreadIdleCallback threadIdleCallback;
+} // namespace
+
+    void registerThreadIdleCallback(ThreadIdleCallback callback) {
+        invariant(!threadIdleCallback);
+        threadIdleCallback = callback;
+    }
+
+    void markThreadIdle() {
+        if (!threadIdleCallback) {
+            return;
+        }
+        try {
+            threadIdleCallback();
+        }
+        catch (...) {
+            severe() << "Exception escaped from threadIdleCallback";
+            fassertFailedNoTrace(28603);
+        }
+    }
+
+    Notification::Notification() {
         lookFor = 1;
         cur = 0;
     }
 
     void Notification::waitToBeNotified() {
-        scoped_lock lock( _mutex );
+        boost::unique_lock<boost::mutex> lock( _mutex );
         while ( lookFor != cur )
-            _condition.wait( lock.boost() );
+            _condition.wait(lock);
         lookFor++;
     }
 
     void Notification::notifyOne() {
-        scoped_lock lock( _mutex );
+        boost::lock_guard<boost::mutex> lock( _mutex );
         verify( cur != lookFor );
         cur++;
         _condition.notify_one();
@@ -54,36 +80,36 @@ namespace mongo {
 
     /* --- NotifyAll --- */
 
-    NotifyAll::NotifyAll() : _mutex("NotifyAll") { 
+    NotifyAll::NotifyAll() {
         _lastDone = 0;
         _lastReturned = 0;
         _nWaiting = 0;
     }
 
     NotifyAll::When NotifyAll::now() { 
-        scoped_lock lock( _mutex );
+        boost::lock_guard<boost::mutex> lock( _mutex );
         return ++_lastReturned;
     }
 
     void NotifyAll::waitFor(When e) {
-        scoped_lock lock( _mutex );
+        boost::unique_lock<boost::mutex> lock( _mutex );
         ++_nWaiting;
         while( _lastDone < e ) {
-            _condition.wait( lock.boost() );
+            _condition.wait(lock);
         }
     }
 
     void NotifyAll::awaitBeyondNow() { 
-        scoped_lock lock( _mutex );
+        boost::unique_lock<boost::mutex> lock( _mutex );
         ++_nWaiting;
         When e = ++_lastReturned;
         while( _lastDone <= e ) {
-            _condition.wait( lock.boost() );
+            _condition.wait(lock);
         }
     }
 
     void NotifyAll::notifyAll(When e) {
-        scoped_lock lock( _mutex );
+        boost::unique_lock<boost::mutex> lock( _mutex );
         _lastDone = e;
         _nWaiting = 0;
         _condition.notify_all();

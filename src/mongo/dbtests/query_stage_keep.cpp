@@ -33,7 +33,9 @@
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/eof.h"
@@ -43,7 +45,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_registry.h"
@@ -108,8 +109,8 @@ namespace QueryStageKeep {
     class KeepStageBasic : public QueryStageKeepBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
@@ -129,7 +130,7 @@ namespace QueryStageKeep {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* member = ws.get(id);
                 member->state = WorkingSetMember::OWNED_OBJ;
-                member->obj = BSON("x" << 2);
+                member->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << 2));
                 ws.flagForReview(id);
             }
 
@@ -150,7 +151,7 @@ namespace QueryStageKeep {
                 WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT_FALSE(ws.isFlagged(id));
-                ASSERT_EQUALS(member->obj["x"].numberInt(), 1);
+                ASSERT_EQUALS(member->obj.value()["x"].numberInt(), 1);
             }
 
             ASSERT(cs->isEOF());
@@ -160,7 +161,7 @@ namespace QueryStageKeep {
                 WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT(ws.isFlagged(id));
-                ASSERT_EQUALS(member->obj["x"].numberInt(), 2);
+                ASSERT_EQUALS(member->obj.value()["x"].numberInt(), 2);
             }
         }
     };
@@ -172,9 +173,9 @@ namespace QueryStageKeep {
     class KeepStageFlagAdditionalAfterStreamingStarts : public QueryStageKeepBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
-            Database* db = ctx.ctx().db();
+            Database* db = ctx.db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
@@ -195,7 +196,7 @@ namespace QueryStageKeep {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* member = ws.get(id);
                 member->state = WorkingSetMember::OWNED_OBJ;
-                member->obj = BSON("x" << 1);
+                member->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << 1));
                 ws.flagForReview(id);
                 expectedResultIds.insert(id);
             }
@@ -220,7 +221,7 @@ namespace QueryStageKeep {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* member = ws.get(id);
                 member->state = WorkingSetMember::OWNED_OBJ;
-                member->obj = BSON("x" << 1);
+                member->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("x" << 1));
                 ws.flagForReview(id);
             }
             while ((id = getNextResult(keep.get())) != WorkingSet::INVALID_ID) {

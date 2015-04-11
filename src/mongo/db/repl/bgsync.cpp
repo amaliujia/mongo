@@ -127,9 +127,11 @@ namespace {
         // Clear the buffer in case the producerThread is waiting in push() due to a full queue.
         invariant(inShutdown());
         _buffer.clear();
+        _pause = true;
 
         // Wake up producerThread so it notices that we're in shutdown
-        _condvar.notify_all();
+        _appliedBufferCondition.notify_all();
+        _pausedCondition.notify_all();
     }
 
     void BackgroundSync::notify(OperationContext* txn) {
@@ -138,8 +140,7 @@ namespace {
         // If all ops in the buffer have been applied, unblock waitForRepl (if it's waiting)
         if (_buffer.empty()) {
             _appliedBuffer = true;
-            _replCoord->signalDrainComplete(txn);
-            _condvar.notify_all();
+            _appliedBufferCondition.notify_all();
         }
     }
 
@@ -214,7 +215,7 @@ namespace {
 
             // Wait until we've applied the ops we have before we choose a sync target
             while (!_appliedBuffer && !inShutdownStrict()) {
-                _condvar.wait(lock);
+                _appliedBufferCondition.wait(lock);
             }
             if (inShutdownStrict()) {
                 return;
@@ -227,7 +228,7 @@ namespace {
 
 
         // find a target to sync from the last optime fetched
-        OpTime lastOpTimeFetched;
+        Timestamp lastOpTimeFetched;
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
             lastOpTimeFetched = _lastOpTimeFetched;
@@ -250,7 +251,7 @@ namespace {
             _replCoord->signalUpstreamUpdater();
         }
 
-        _syncSourceReader.tailingQueryGTE(rsoplog, lastOpTimeFetched);
+        _syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched);
 
         // if target cut connections between connecting and querying (for
         // example, because it stepped down) we might not have a cursor
@@ -353,8 +354,8 @@ namespace {
             {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _lastFetchedHash = o["h"].numberLong();
-                _lastOpTimeFetched = o["ts"]._opTime();
-                LOG(3) << "replSet lastOpTimeFetched: " << _lastOpTimeFetched.toStringPretty();
+                _lastOpTimeFetched = o["ts"].timestamp();
+                LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched.toStringPretty();
             }
         }
     }
@@ -395,35 +396,35 @@ namespace {
 
         if (!r.more()) {
             try {
-                BSONObj theirLastOp = r.getLastOp(rsoplog);
+                BSONObj theirLastOp = r.getLastOp(rsOplogName.c_str());
                 if (theirLastOp.isEmpty()) {
-                    log() << "replSet error empty query result from " << hn << " oplog";
+                    error() << "empty query result from " << hn << " oplog";
                     sleepsecs(2);
                     return true;
                 }
-                OpTime theirTS = theirLastOp["ts"]._opTime();
+                Timestamp theirTS = theirLastOp["ts"].timestamp();
                 if (theirTS < _lastOpTimeFetched) {
-                    log() << "replSet we are ahead of the sync source, will try to roll back";
+                    log() << "we are ahead of the sync source, will try to roll back";
                     syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
                     return true;
                 }
                 /* we're not ahead?  maybe our new query got fresher data.  best to come back and try again */
-                log() << "replSet syncTail condition 1";
+                log() << "syncTail condition 1";
                 sleepsecs(1);
             }
             catch(DBException& e) {
-                log() << "replSet error querying " << hn << ' ' << e.toString();
+                error() << "querying " << hn << ' ' << e.toString();
                 sleepsecs(2);
             }
             return true;
         }
 
         BSONObj o = r.nextSafe();
-        OpTime ts = o["ts"]._opTime();
+        Timestamp ts = o["ts"].timestamp();
         long long hash = o["h"].numberLong();
         if( ts != _lastOpTimeFetched || hash != _lastFetchedHash ) {
-            log() << "replSet our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
-            log() << "replset source's GTE: " << ts.toStringPretty();
+            log() << "our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
+            log() << "source's GTE: " << ts.toStringPretty();
             syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
             return true;
         }
@@ -442,13 +443,14 @@ namespace {
     }
 
     void BackgroundSync::stop() {
-        boost::unique_lock<boost::mutex> lock(_mutex);
+        boost::lock_guard<boost::mutex> lock(_mutex);
 
         _pause = true;
         _syncSourceHost = HostAndPort();
-        _lastOpTimeFetched = OpTime(0,0);
+        _lastOpTimeFetched = Timestamp(0,0);
         _lastFetchedHash = 0;
-        _condvar.notify_all();
+        _appliedBufferCondition.notify_all();
+        _pausedCondition.notify_all();
     }
 
     void BackgroundSync::start(OperationContext* txn) {
@@ -463,8 +465,15 @@ namespace {
         _lastOpTimeFetched = _replCoord->getMyLastOptime();
         _lastFetchedHash = _lastAppliedHash;
 
-        LOG(1) << "replset bgsync fetch queue set to: " << _lastOpTimeFetched << 
+        LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched <<
             " " << _lastFetchedHash;
+    }
+
+    void BackgroundSync::waitUntilPaused() {
+        boost::unique_lock<boost::mutex> lock(_mutex);
+        while (!_pause) {
+            _pausedCondition.wait(lock);
+        }
     }
 
     long long BackgroundSync::getLastAppliedHash() const {
@@ -488,7 +497,7 @@ namespace {
         try {
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), "local", MODE_X);
-            bool success = Helpers::getLast(txn, rsoplog, oplogEntry);
+            bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
             if (!success) {
                 // This can happen when we are to do an initial sync.  lastHash will be set
                 // after the initial sync is complete.
@@ -496,18 +505,18 @@ namespace {
             }
         }
         catch (const DBException& ex) {
-            severe() << "Problem reading " << rsoplog << ": " << ex.toStatus();
+            severe() << "Problem reading " << rsOplogName << ": " << ex.toStatus();
             fassertFailed(18904);
         }
         BSONElement hashElement = oplogEntry[hashFieldName];
         if (hashElement.eoo()) {
-            severe() << "Most recent entry in " << rsoplog << " missing \"" << hashFieldName <<
+            severe() << "Most recent entry in " << rsOplogName << " missing \"" << hashFieldName <<
                 "\" field";
             fassertFailed(18902);
         }
         if (hashElement.type() != NumberLong) {
             severe() << "Expected type of \"" << hashFieldName << "\" in most recent " << 
-                rsoplog << " entry to have type NumberLong, but found " << 
+                rsOplogName << " entry to have type NumberLong, but found " << 
                 typeName(hashElement.type());
             fassertFailed(18903);
         }

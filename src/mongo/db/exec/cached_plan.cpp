@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -37,7 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/db/query/qlog.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -62,23 +64,35 @@ namespace mongo {
           _usingBackupChild(false),
           _alreadyProduced(false),
           _updatedCache(false),
+          _killed(false),
           _commonStats(kStageType) {}
 
     CachedPlanStage::~CachedPlanStage() {
-        // We may have produced all necessary results without hitting EOF.
-        // In this case, we still want to update the cache with feedback.
-        if (!_updatedCache) {
+        // We may have produced all necessary results without hitting EOF. In this case, we still
+        // want to update the cache with feedback.
+        //
+        // We can't touch the plan cache if we've been killed.
+        if (!_updatedCache && !_killed) {
             updateCache();
         }
     }
 
-    bool CachedPlanStage::isEOF() { return getActiveChild()->isEOF(); }
+    bool CachedPlanStage::isEOF() {
+        if (_killed) {
+            return true;
+        }
+
+        return getActiveChild()->isEOF();
+    }
 
     PlanStage::StageState CachedPlanStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
         // Adds the amount of time taken by work() to executionTimeMillis.
         ScopedTimer timer(&_commonStats.executionTimeMillis);
+
+        // We shouldn't be trying to work a dead plan.
+        invariant(!_killed);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -102,8 +116,8 @@ namespace mongo {
             _commonStats.needTime++;
             return PlanStage::NEED_TIME;
         }
-        else if (PlanStage::NEED_FETCH == childStatus) {
-            _commonStats.needFetch++;
+        else if (PlanStage::NEED_YIELD == childStatus) {
+            _commonStats.needYield++;
         }
         else if (PlanStage::NEED_TIME == childStatus) {
             _commonStats.needTime++;
@@ -188,7 +202,7 @@ namespace mongo {
         Status fbs = cache->feedback(*_canonicalQuery, feedback.release());
 
         if (!fbs.isOK()) {
-            QLOG() << _canonicalQuery->ns() << ": Failed to update cache with feedback: "
+            LOG(5) << _canonicalQuery->ns() << ": Failed to update cache with feedback: "
                    << fbs.toString() << " - "
                    << "(query: " << _canonicalQuery->getQueryObj()
                    << "; sort: " << _canonicalQuery->getParsed().getSort()
@@ -199,6 +213,10 @@ namespace mongo {
 
     PlanStage* CachedPlanStage::getActiveChild() const {
         return _usingBackupChild ? _backupChildPlan.get() : _mainChildPlan.get();
+    }
+
+    void CachedPlanStage::kill() {
+        _killed = true;
     }
 
 }  // namespace mongo

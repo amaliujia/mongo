@@ -29,6 +29,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
@@ -68,7 +69,7 @@ namespace mongo {
                 // Remove _id range [_min, _max).
                 ScopedTransaction transaction(&txn, MODE_IX);
                 Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_X);
-                Client::Context ctx(&txn,  ns );
+                OldClientContext ctx(&txn,  ns );
 
                 KeyRange range( ns,
                                 BSON( "_id" << _min ),
@@ -167,7 +168,7 @@ namespace mongo {
 
             // Make sure all the disklocs actually correspond to the right info
             for ( set<RecordId>::const_iterator it = locs.begin(); it != locs.end(); ++it ) {
-                const BSONObj obj = collection->docFor(&txn, *it);
+                const BSONObj obj = collection->docFor(&txn, *it).value();
                 ASSERT_EQUALS(obj["tag"].OID(), tag);
             }
         }

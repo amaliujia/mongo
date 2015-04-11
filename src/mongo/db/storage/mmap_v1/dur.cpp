@@ -116,9 +116,15 @@ namespace {
     boost::mutex flushMutex;
     boost::condition_variable flushRequested;
 
-    // for getlasterror fsync:true acknowledgements
-    NotifyAll::When commitNumber(0);
+    // This is waited on for getlasterror acknowledgements. It means that data has been written to
+    // the journal, but not necessarily applied to the shared view, so it is all right to
+    // acknowledge the user operation, but NOT all right to delete the journal files for example.
     NotifyAll commitNotify;
+
+    // This is waited on for complete flush. It means that data has been both written to journal
+    // and applied to the shared view, so it is allowed to delete the journal files. Used for
+    // fsync:true, close DB, shutdown acknowledgements.
+    NotifyAll applyToDataFilesNotify;
 
     // When set, the flush thread will exit
     AtomicUInt32 shutdownRequested(0);
@@ -319,7 +325,7 @@ namespace {
         // See SERVER-5723 for performance improvement.
         // See SERVER-5680 to see why this code is necessary on Windows.
         // See SERVER-8795 to see why this code is necessary on Solaris.
-#if defined(_WIN32) || defined(__sunos__)
+#if defined(_WIN32) || defined(__sun)
         LockMongoFilesExclusive lk;
 #else
         LockMongoFilesShared lk;
@@ -507,7 +513,11 @@ namespace {
 
         // There is always just one waiting anyways
         flushRequested.notify_one();
-        commitNotify.waitFor(when);
+
+        // commitNotify.waitFor ensures that whatever was scheduled for journaling before this
+        // call has been persisted to the journal file. This does not mean that this data has been
+        // applied to the shared view yet though, that's why we wait for applyToDataFilesNotify.
+        applyToDataFilesNotify.waitFor(when);
 
         return true;
     }
@@ -555,9 +565,15 @@ namespace {
     void DurableImpl::syncDataAndTruncateJournal(OperationContext* txn) {
         invariant(txn->lockState()->isW());
 
+        // Once this returns, all the outstanding journal has been applied to the data files and
+        // so it's safe to do the flushAll/journalCleanup below.
         commitNow(txn);
+
+        // Flush the shared view to disk.
         MongoFile::flushAll(true);
-        journalCleanup();
+
+        // Once the shared view has been flushed, we do not need the journal files anymore.
+        journalCleanup(true);
 
         // Double check post-conditions
         invariant(!haveJournalFiles());
@@ -577,13 +593,25 @@ namespace {
 
         // There is always just one waiting anyways
         flushRequested.notify_one();
-        commitNotify.waitFor(when);
+
+        // commitNotify.waitFor ensures that whatever was scheduled for journaling before this
+        // call has been persisted to the journal file. This does not mean that this data has been
+        // applied to the shared view yet though, that's why we wait for applyToDataFilesNotify.
+        applyToDataFilesNotify.waitFor(when);
+
+        // Flush the shared view to disk.
+        MongoFile::flushAll(true);
+
+        // Once the shared view has been flushed, we do not need the journal files anymore.
+        journalCleanup(true);
+
+        // Double check post-conditions
+        invariant(!haveJournalFiles());
 
         shutdownRequested.store(1);
 
         // Wait for the durability thread to terminate
         log() << "Terminating durability thread ...";
-
         _durThreadHandle.join();
     }
 
@@ -658,7 +686,7 @@ namespace {
         }
 
         // Spawn the journal writer thread
-        JournalWriter journalWriter(&commitNotify, NumAsyncJournalWrites);
+        JournalWriter journalWriter(&commitNotify, &applyToDataFilesNotify, NumAsyncJournalWrites);
         journalWriter.start();
 
         // Used as an estimate of how much / how fast to remap
@@ -681,7 +709,7 @@ namespace {
             }
 
             try {
-                boost::mutex::scoped_lock lock(flushMutex);
+                boost::unique_lock<boost::mutex> lock(flushMutex);
 
                 for (unsigned i = 0; i <= 2; i++) {
                     if (flushRequested.timed_wait(lock, Milliseconds(oneThird))) {
@@ -710,7 +738,7 @@ namespace {
 
                 // We need to snapshot the commitNumber after the flush lock has been obtained,
                 // because at this point we know that we have a stable snapshot of the data.
-                commitNumber = commitNotify.now();
+                const NotifyAll::When commitNumber(commitNotify.now());
 
                 LOG(4) << "Processing commit number " << commitNumber;
 
@@ -741,10 +769,20 @@ namespace {
                     // would wipe out their changes without ever being committed.
                     commitJob.committingReset();
 
+                    double systemMemoryPressurePercentage =
+                        ProcessInfo::getSystemMemoryPressurePercentage();
+
                     // Now that the in-memory modifications have been collected, we can potentially
                     // release the flush lock if remap is not necessary.
+                    // When we remap due to memory pressure, we look at two criteria
+                    // 1. If the amount of 4k pages touched exceeds 512 MB,
+                    //    a reasonable estimate of memory pressure on Linux.
+                    // 2. Check if the amount of free memory on the machine is running low,
+                    //    since #1 is underestimates the memory pressure on Windows since
+                    //    commits in 64MB chunks.
                     const bool shouldRemap =
                         (estimatedPrivateMapSize >= UncommittedBytesLimit) ||
+                        (systemMemoryPressurePercentage > 0.0) ||
                         (commitCounter % NumCommitsBeforeRemap == 0) ||
                         (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalAlwaysRemap);
 
@@ -766,11 +804,12 @@ namespace {
                         }
                         else {
                             // We don't want to get close to the UncommittedBytesLimit
-                            const double f =
+                            const double remapMemFraction =
                                 estimatedPrivateMapSize / ((double)UncommittedBytesLimit);
-                            if (f > remapFraction) {
-                                remapFraction = f;
-                            }
+
+                            remapFraction = std::max(remapMemFraction, remapFraction);
+
+                            remapFraction = std::max(systemMemoryPressurePercentage, remapFraction);
                         }
                     }
                     else {

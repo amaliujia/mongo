@@ -43,9 +43,9 @@
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
@@ -72,6 +72,22 @@ namespace mongo {
         MultiIndexBlock* const _indexer;
     };
 
+    /**
+     * On rollback in init(), cleans up _indexes so that ~MultiIndexBlock doesn't try to clean
+     * up _indexes manually (since the changes were already rolled back).
+     * Due to this, it is thus legal to call init() again after it fails.
+     */
+    class MultiIndexBlock::CleanupIndexesVectorOnRollback : public RecoveryUnit::Change {
+    public:
+        explicit CleanupIndexesVectorOnRollback(MultiIndexBlock* indexer) : _indexer(indexer) {}
+
+        virtual void commit() {}
+        virtual void rollback() { _indexer->_indexes.clear(); }
+
+    private:
+        MultiIndexBlock* const _indexer;
+    };
+
     MultiIndexBlock::MultiIndexBlock(OperationContext* txn, Collection* collection)
         : _collection(collection),
           _txn(txn),
@@ -84,24 +100,30 @@ namespace mongo {
     MultiIndexBlock::~MultiIndexBlock() {
         if (!_needToCleanup || _indexes.empty())
             return;
-
-        try {
-            WriteUnitOfWork wunit(_txn);
-            // This cleans up all index builds. Because that may need to write, it is done inside
-            // of a WUOW. Nothing inside this block can fail, and it is made fatal if it does.
-            for (size_t i = 0; i < _indexes.size(); i++) {
-                _indexes[i].block->fail();
+        while (true) {
+            try {
+                WriteUnitOfWork wunit(_txn);
+                // This cleans up all index builds. 
+                // Because that may need to write, it is done inside
+                // of a WUOW. Nothing inside this block can fail, and it is made fatal if it does.
+                for (size_t i = 0; i < _indexes.size(); i++) {
+                    _indexes[i].block->fail();
+                }
+                wunit.commit();
+                return;
             }
-            wunit.commit();
-            return;
+            catch (const WriteConflictException& e) {
+                continue;
+            }
+            catch (const std::exception& e) {
+                error() << "Caught exception while cleaning up partially built indexes: "
+                        << e.what();
+            }
+            catch (...) {
+                error() << "Caught unknown exception while cleaning up partially built indexes.";
+            }
+            fassertFailed(18644);
         }
-        catch (const std::exception& e) {
-            error() << "Caught exception while cleaning up partially built indexes: " << e.what();
-        }
-        catch (...) {
-            error() << "Caught unknown exception while cleaning up partially built indexes.";
-        }
-        fassertFailed(18644);
     }
 
     void MultiIndexBlock::removeExistingIndexes(std::vector<BSONObj>* specs) const {
@@ -118,6 +140,10 @@ namespace mongo {
 
     Status MultiIndexBlock::init(const std::vector<BSONObj>& indexSpecs) {
         WriteUnitOfWork wunit(_txn);
+
+        invariant(_indexes.empty());
+        _txn->recoveryUnit()->registerChange(new CleanupIndexesVectorOnRollback(this));
+
         const string& ns = _collection->ns().ns();
 
         Status status = _collection->getIndexCatalog()->checkUnfinished();
@@ -149,9 +175,7 @@ namespace mongo {
             info = statusWithInfo.getValue();
 
             IndexToBuild index;
-            index.block = boost::make_shared<IndexCatalog::IndexBuildBlock>(_txn,
-                                                                            _collection,
-                                                                            info);
+            index.block.reset(new IndexCatalog::IndexBuildBlock(_txn, _collection, info));
             status = index.block->init();
             if ( !status.isOK() )
                 return status;
@@ -164,7 +188,7 @@ namespace mongo {
             if (!_buildInBackground) {
                 // Bulk build process requires foreground building as it assumes nothing is changing
                 // under it.
-                index.bulk.reset(index.real->initiateBulk(_txn));
+                index.bulk = index.real->initiateBulk();
             }
 
             const IndexDescriptor* descriptor = index.block->getEntry()->descriptor();
@@ -179,10 +203,12 @@ namespace mongo {
             if (index.bulk)
                 log() << "\t building index using bulk method";
 
+            index.filterExpression = index.block->getEntry()->getFilterExpression();
+
             // TODO SERVER-14888 Suppress this in cases we don't want to audit.
             audit::logCreateIndex(_txn->getClient(), &info, descriptor->indexName(), ns);
 
-            _indexes.push_back( index );
+            _indexes.push_back(std::move(index));
         }
 
         // this is so that operations examining the list of indexes know there are more keys to look
@@ -227,41 +253,72 @@ namespace mongo {
             invariant(_allowInterruption);
             exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
         }
+        else {
+            exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY);
+        }
 
-        BSONObj objToIndex;
+        Snapshotted<BSONObj> objToIndex;
         RecordId loc;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&objToIndex, &loc))) {
-            {
+        int retries = 0; // non-zero when retrying our last document.
+        while (retries
+                || (PlanExecutor::ADVANCED == (state = exec->getNextSnapshotted(&objToIndex,
+                                                                                &loc)))) {
+            try {
                 if (_allowInterruption)
                     _txn->checkForInterrupt();
 
-                bool shouldCommitWUnit = true;
-                WriteUnitOfWork wunit(_txn);
-                Status ret = insert(objToIndex, loc);
-                if (!ret.isOK()) {
-                    if (dupsOut && ret.code() == ErrorCodes::DuplicateKey) {
-                        // If dupsOut is non-null, we should only fail the specific insert that
-                        // led to a DuplicateKey rather than the whole index build.
-                        dupsOut->insert(loc);
-                        shouldCommitWUnit = false;
-                    }
-                    else {
-                        return ret;
-                    }
+                // Make sure we are working with the latest version of the document.
+                if (objToIndex.snapshotId() != _txn->recoveryUnit()->getSnapshotId()
+                        && !_collection->findDoc(_txn, loc, &objToIndex)) {
+                    // doc was deleted so don't index it.
+                    retries = 0;
+                    continue;
                 }
 
-                if (shouldCommitWUnit)
+                // Done before insert so we can retry document if it WCEs.
+                progress->setTotalWhileRunning( _collection->numRecords(_txn) );
+
+                WriteUnitOfWork wunit(_txn);
+                Status ret = insert(objToIndex.value(), loc);
+                if (ret.isOK()) {
                     wunit.commit();
+                }
+                else if (dupsOut && ret.code() == ErrorCodes::DuplicateKey) {
+                    // If dupsOut is non-null, we should only fail the specific insert that
+                    // led to a DuplicateKey rather than the whole index build.
+                    dupsOut->insert(loc);
+                }
+                else {
+                    // Fail the index build hard.
+                    return ret;
+                }
+
+                // Go to the next document
+                progress->hit();
+                n++;
+                retries = 0;
             }
+            catch (const WriteConflictException& wce) {
+                _txn->getCurOp()->debug().writeConflicts++;
+                retries++; // logAndBackoff expects this to be 1 on first call.
+                wce.logAndBackoff(retries, "index creation", _collection->ns().ns());
 
-            n++;
-            progress->hit();
-
-            progress->setTotalWhileRunning( _collection->numRecords(_txn) );
+                // Can't use WRITE_CONFLICT_RETRY_LOOP macros since we need to save/restore exec
+                // around call to commitAndRestart.
+                exec->saveState();
+                _txn->recoveryUnit()->commitAndRestart();
+                exec->restoreState(_txn); // Handles any WCEs internally.
+            }
         }
 
         if (state != PlanExecutor::IS_EOF) {
+            // If the plan executor was killed, this means the DB/collection was dropped and so it
+            // is not safe to cleanup the in-progress indexes.
+            if (state == PlanExecutor::DEAD) {
+                abortWithoutCleanup();
+            }
+
             uasserted(28550, 
                       "Unable to complete index build as the collection is no longer readable");
         }
@@ -280,12 +337,21 @@ namespace mongo {
 
     Status MultiIndexBlock::insert(const BSONObj& doc, const RecordId& loc) {
         for ( size_t i = 0; i < _indexes.size(); i++ ) {
+
+            if ( _indexes[i].filterExpression &&
+                 !_indexes[i].filterExpression->matchesBSON(doc) ) {
+                continue;
+            }
+
             int64_t unused;
-            Status idxStatus = _indexes[i].forInsert()->insert( _txn,
-                                                               doc,
-                                                               loc,
-                                                               _indexes[i].options,
-                                                               &unused );
+            Status idxStatus(ErrorCodes::InternalError, "");
+            if (_indexes[i].bulk) {
+                idxStatus = _indexes[i].bulk->insert(_txn, doc, loc, _indexes[i].options, &unused);
+            }
+            else {
+                idxStatus = _indexes[i].real->insert(_txn, doc, loc, _indexes[i].options, &unused);
+            }
+
             if ( !idxStatus.isOK() )
                 return idxStatus;
         }
@@ -298,7 +364,8 @@ namespace mongo {
                 continue;
             LOG(1) << "\t bulk commit starting for index: "
                    << _indexes[i].block->getEntry()->descriptor()->indexName();
-            Status status = _indexes[i].real->commitBulk( _indexes[i].bulk.get(),
+            Status status = _indexes[i].real->commitBulk( _txn,
+                                                          std::move(_indexes[i].bulk),
                                                           _allowInterruption,
                                                           _indexes[i].options.dupsAllowed,
                                                           dupsOut );
@@ -311,9 +378,6 @@ namespace mongo {
     }
 
     void MultiIndexBlock::abortWithoutCleanup() {
-        for ( size_t i = 0; i < _indexes.size(); i++ ) {
-            _indexes[i].block->abortWithoutCleanup();
-        }
         _indexes.clear();
         _needToCleanup = false;
     }

@@ -32,6 +32,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -80,7 +81,7 @@ namespace repl {
 
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
             const OperationContext* txn,
-            const OpTime& ts,
+            const Timestamp& ts,
             const WriteConcernOptions& writeConcern) {
         // TODO
         return StatusAndDuration(Status::OK(), Milliseconds(0));
@@ -105,7 +106,7 @@ namespace repl {
         return true;
     }
 
-    bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(const StringData& dbName) {
+    bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(StringData dbName) {
         // TODO
         return true;
     }
@@ -122,7 +123,7 @@ namespace repl {
         return false;
     }
 
-    Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const OpTime& ts) {
+    Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const Timestamp& ts) {
         return Status::OK();
     }
     
@@ -130,11 +131,13 @@ namespace repl {
         // TODO
     }
 
-    void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& ts) {}
+    void ReplicationCoordinatorMock::setMyLastOptime(const Timestamp& ts) {}
 
-    OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
+    void ReplicationCoordinatorMock::resetMyLastOptime() {}
+
+    Timestamp ReplicationCoordinatorMock::getMyLastOptime() const {
         // TODO
-        return OpTime();
+        return Timestamp();
     }
 
 
@@ -163,11 +166,14 @@ namespace repl {
 
     void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
 
-    void ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
-            BSONObjBuilder* cmdBuilder) {}
+    bool ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
+            BSONObjBuilder* cmdBuilder) {
+        return true;
+    }
 
-    void ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommandHandshakes(
-            std::vector<BSONObj>* handshakes) {}
+    ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
+        return ReplicaSetConfig();
+    }
 
     void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
         // TODO
@@ -235,12 +241,12 @@ namespace repl {
     }
 
     Status ReplicationCoordinatorMock::processReplSetUpdatePosition(
-            const UpdatePositionArgs& updates) {
+            const UpdatePositionArgs& updates, long long* configVersion) {
         // TODO
         return Status::OK();
     }
 
-    Status ReplicationCoordinatorMock::processHandshake(OperationContext* txn,
+    Status ReplicationCoordinatorMock::processHandshake(OperationContext* txn,  
                                                         const HandshakeArgs& handshake) {
         return Status::OK();
     }
@@ -250,7 +256,7 @@ namespace repl {
         return true;
     }
 
-    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op) {
+    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const Timestamp& op) {
         return std::vector<HostAndPort>();
     }
 
@@ -287,6 +293,10 @@ namespace repl {
 
     bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource) {
         invariant(false);
+    }
+
+    Timestamp ReplicationCoordinatorMock::getLastCommittedOpTime() const {
+        return Timestamp();
     }
 
 } // namespace repl

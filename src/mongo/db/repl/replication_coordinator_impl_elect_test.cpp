@@ -99,7 +99,7 @@ namespace {
                 net->scheduleResponse(noi, net->now(), makeResponseStatus(
                                               BSON("ok" << 1 <<
                                                    "fresher" << false <<
-                                                   "opTime" << Date_t(OpTime(0, 0).asDate()) <<
+                                                   "opTime" << Date_t(Timestamp(0, 0).asULL()) <<
                                                    "veto" << false)));
             }
             else {
@@ -127,6 +127,52 @@ namespace {
         simulateEnoughHeartbeatsForElectability();
         stopCapturingLogMessages();
         ASSERT_EQUALS(1, countLogLinesContaining("node has no applied oplog entries"));
+    }
+
+    /**
+     * This test checks that an election can happen when only one node is up, and it has the
+     * vote(s) to win.
+     */
+    TEST_F(ReplCoordElectTest, ElectTwoNodesWithOneZeroVoter) {
+        OperationContextReplMock txn;
+        assertStartSuccess(
+            BSON("_id" << "mySet" <<
+                 "version" << 1 <<
+                 "members" << BSON_ARRAY(BSON("_id" << 1 << "host" << "node1:12345") <<
+                                         BSON("_id" << 2 << "host" << "node2:12345" <<
+                                              "votes" << 0 << "hidden" << true <<
+                                              "priority" << 0))),
+            HostAndPort("node1", 12345));
+
+        getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY);
+
+        ASSERT(getReplCoord()->getMemberState().secondary()) <<
+                                                      getReplCoord()->getMemberState().toString();
+
+        getReplCoord()->setMyLastOptime(Timestamp(10,0));
+
+        NetworkInterfaceMock* net = getNet();
+        net->enterNetwork();
+        const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
+        net->scheduleResponse(noi,
+                              net->now(),
+                              ResponseStatus(ErrorCodes::OperationFailed, "timeout"));
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        ASSERT(getReplCoord()->getMemberState().primary()) <<
+                                                      getReplCoord()->getMemberState().toString();
+        ASSERT(getReplCoord()->isWaitingForApplierToDrain());
+
+        // Since we're still in drain mode, expect that we report ismaster: false, issecondary:true.
+        IsMasterResponse imResponse;
+        getReplCoord()->fillIsMasterForReplSet(&imResponse);
+        ASSERT_FALSE(imResponse.isMaster()) << imResponse.toBSON().toString();
+        ASSERT_TRUE(imResponse.isSecondary()) << imResponse.toBSON().toString();
+        getReplCoord()->signalDrainComplete(&txn);
+        getReplCoord()->fillIsMasterForReplSet(&imResponse);
+        ASSERT_TRUE(imResponse.isMaster()) << imResponse.toBSON().toString();
+        ASSERT_FALSE(imResponse.isSecondary()) << imResponse.toBSON().toString();
     }
 
     TEST_F(ReplCoordElectTest, Elect1NodeSuccess) {
@@ -164,7 +210,7 @@ namespace {
                                 ));
         assertStartSuccess(configObj, HostAndPort("node1", 12345));
         OperationContextNoop txn;
-        getReplCoord()->setMyLastOptime(OpTime (100, 1));
+        getReplCoord()->setMyLastOptime(Timestamp (100, 1));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
         startCapturingLogMessages();
         simulateSuccessfulElection();
@@ -185,7 +231,7 @@ namespace {
         ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
         OperationContextNoop txn;
-        OpTime time1(100, 1);
+        Timestamp time1(100, 1);
         getReplCoord()->setMyLastOptime(time1);
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
@@ -216,7 +262,7 @@ namespace {
         net->exitNetwork();
         stopCapturingLogMessages();
         ASSERT_EQUALS(1,
-                countLogLinesContaining("replSet couldn't elect self, only received -9999 votes"));
+                countLogLinesContaining("couldn't elect self, only received -9999 votes"));
     }
 
     TEST_F(ReplCoordElectTest, ElectWrongTypeForVote) {
@@ -232,7 +278,7 @@ namespace {
         ReplicaSetConfig config = assertMakeRSConfig(configObj);
 
         OperationContextNoop txn;
-        OpTime time1(100, 1);
+        Timestamp time1(100, 1);
         getReplCoord()->setMyLastOptime(time1);
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
@@ -280,7 +326,7 @@ namespace {
                                          BSON("_id" << 5 << "host" << "node5:12345") )),
             HostAndPort("node1", 12345));
         ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        getReplCoord()->setMyLastOptime(OpTime(100,0));
+        getReplCoord()->setMyLastOptime(Timestamp(100,0));
 
         // set hbreconfig to hang while in progress
         getExternalState()->setStoreLocalConfigDocumentToHang(true);

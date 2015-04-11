@@ -38,13 +38,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
@@ -101,46 +102,57 @@ namespace mongo {
                     continue;
                 }
 
-                // Count it as active from the moment the TTL thread wakes up
-                OperationContextImpl txn;
+                try {
+                    doTTLPass();
+                }
+                catch ( const WriteConflictException& e ) {
+                    LOG(1) << "Got WriteConflictException in TTL thread";
+                }
 
-                // if part of replSet but not in a readable state (e.g. during initial sync), skip.
-                if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                        repl::ReplicationCoordinator::modeReplSet &&
-                        !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
-                    continue;
+            }
+        }
 
-                set<string> dbs;
-                dbHolder().getAllShortNames( dbs );
+    private:
 
-                ttlPasses.increment();
+        void doTTLPass() {
+            // Count it as active from the moment the TTL thread wakes up
+            OperationContextImpl txn;
 
-                for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
-                    string db = *i;
+            // if part of replSet but not in a readable state (e.g. during initial sync), skip.
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet &&
+                !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
+                return;
 
-                    vector<BSONObj> indexes;
-                    getTTLIndexesForDB(&txn, db, &indexes);
+            set<string> dbs;
+            dbHolder().getAllShortNames( dbs );
 
-                    for ( vector<BSONObj>::const_iterator it = indexes.begin();
-                          it != indexes.end(); ++it ) {
+            ttlPasses.increment();
 
-                        BSONObj idx = *it;
-                        try {
-                            if ( !doTTLForIndex( &txn, db, idx ) ) {
-                                break;  // stop processing TTL indexes on this database
-                            }
-                        } catch (const DBException& dbex) {
-                            error() << "Error processing ttl index: " << idx
-                                    << " -- " << dbex.toString();
-                            // continue on to the next index
-                            continue;
+            for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
+                string db = *i;
+
+                vector<BSONObj> indexes;
+                getTTLIndexesForDB(&txn, db, &indexes);
+
+                for ( vector<BSONObj>::const_iterator it = indexes.begin();
+                      it != indexes.end(); ++it ) {
+
+                    BSONObj idx = *it;
+                    try {
+                        if ( !doTTLForIndex( &txn, db, idx ) ) {
+                            break;  // stop processing TTL indexes on this database
                         }
+                    } catch (const DBException& dbex) {
+                        error() << "Error processing ttl index: " << idx
+                                << " -- " << dbex.toString();
+                        // continue on to the next index
+                        continue;
                     }
                 }
             }
         }
 
-    private:
         /**
          * Acquire an IS-mode lock on the specified database and for each
          * collection in the database, append the specification of all
@@ -258,8 +270,7 @@ namespace mongo {
                                                ns,
                                                query,
                                                PlanExecutor::YIELD_AUTO,
-                                               false,
-                                               true);
+                                               false);
                     break;
                 }
                 catch (const WriteConflictException& dle) {

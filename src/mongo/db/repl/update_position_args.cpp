@@ -40,7 +40,7 @@ namespace repl {
 
 
     UpdatePositionArgs::UpdateInfo::UpdateInfo(
-            const OID& anRid, const OpTime& aTs, long long aCfgver, long long aMemberId)
+            const OID& anRid, const Timestamp& aTs, long long aCfgver, long long aMemberId)
         : rid(anRid), ts(aTs), cfgver(aCfgver), memberId(aMemberId) {}
 
 namespace {
@@ -93,12 +93,12 @@ namespace {
             if (!status.isOK())
                 return status;
 
-            OpTime ts;
-            status = bsonExtractOpTimeField(entry, kOpTimeFieldName, &ts);
+            Timestamp ts;
+            status = bsonExtractTimestampField(entry, kOpTimeFieldName, &ts);
             if (!status.isOK())
                 return status;
 
-            // TODO(spencer): The following three fields are optional in 2.8, but should be made
+            // TODO(spencer): The following three fields are optional in 3.0, but should be made
             // required or ignored in 3.0
             long long cfgver;
             status = bsonExtractIntegerFieldWithDefault(entry, kConfigVersionFieldName, -1, &cfgver);

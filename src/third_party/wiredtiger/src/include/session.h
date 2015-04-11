@@ -42,7 +42,7 @@ struct __wt_hazard {
  * WT_SESSION_IMPL --
  *	Implementation of WT_SESSION.
  */
-struct __wt_session_impl {
+struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	WT_SESSION iface;
 
 	void	*lang_private;		/* Language specific private storage */
@@ -68,8 +68,6 @@ struct __wt_session_impl {
 	 */
 					/* Session handle reference list */
 	SLIST_HEAD(__dhandles, __wt_data_handle_cache) dhandles;
-#define	WT_DHANDLE_SWEEP_WAIT	30	/* Idle wait before discarding */
-#define	WT_DHANDLE_SWEEP_PERIOD	10	/* Sweep interim */
 	time_t last_sweep;		/* Last sweep for dead handles */
 
 	WT_CURSOR *cursor;		/* Current cursor */
@@ -111,13 +109,11 @@ struct __wt_session_impl {
 	} *scratch_track;
 #endif
 
+	WT_ITEM err;			/* Error buffer */
+
 	WT_TXN_ISOLATION isolation;
 	WT_TXN	txn;			/* Transaction state */
 	u_int	ncursors;		/* Count of active file cursors. */
-
-	WT_REF **excl;			/* Eviction exclusive list */
-	u_int	 excl_next;		/* Next empty slot */
-	size_t	 excl_allocated;	/* Bytes allocated */
 
 	void	*block_manager;		/* Block-manager support */
 	int	(*block_manager_cleanup)(WT_SESSION_IMPL *);
@@ -190,4 +186,4 @@ struct __wt_session_impl {
 	uint32_t   hazard_size;		/* Allocated slots in hazard array. */
 	uint32_t   nhazard;		/* Count of active hazard pointers */
 	WT_HAZARD *hazard;		/* Hazard pointer array */
-} WT_GCC_ATTRIBUTE((aligned(WT_CACHE_LINE_ALIGNMENT)));
+};

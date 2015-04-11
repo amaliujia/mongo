@@ -87,7 +87,7 @@ namespace mongo {
          * @return null if cannot find
          */
         IndexDescriptor* findIndexByName( OperationContext* txn,
-                                          const StringData& name,
+                                          StringData name,
                                           bool includeUnfinishedIndexes = false ) const;
 
         /**
@@ -143,7 +143,11 @@ namespace mongo {
             IndexDescriptor* next();
 
             // returns the access method for the last return IndexDescriptor
-            IndexAccessMethod* accessMethod( IndexDescriptor* desc );
+            IndexAccessMethod* accessMethod( const IndexDescriptor* desc );
+
+            // returns the IndexCatalogEntry for the last return IndexDescriptor
+            IndexCatalogEntry* catalogEntry( const IndexDescriptor* desc );
+
         private:
             IndexIterator( OperationContext* txn,
                            const IndexCatalog* cat,
@@ -153,7 +157,7 @@ namespace mongo {
 
             bool _includeUnfinishedIndexes;
 
-            OperationContext* _txn;
+            OperationContext* const _txn;
             const IndexCatalog* _catalog;
             IndexCatalogEntryContainer::const_iterator _iterator;
 
@@ -260,18 +264,12 @@ namespace mongo {
              */
             void fail();
 
-            /**
-             * we're stopping the build
-             * do NOT cleanup, leave meta data as is
-             */
-            void abortWithoutCleanup();
-
             IndexCatalogEntry* getEntry() { return _entry; }
 
         private:
-            Collection* _collection;
-            IndexCatalog* _catalog;
-            std::string _ns;
+            Collection* const _collection;
+            IndexCatalog* const _catalog;
+            const std::string _ns;
 
             BSONObj _spec;
 
@@ -347,8 +345,11 @@ namespace mongo {
                                    const std::string& indexNamespace );
 
         // descriptor ownership passes to _setupInMemoryStructures
+        // initFromDisk: Avoids registering a change to undo this operation when set to true.
+        //               You must set this flag if calling this function outside of a UnitOfWork.
         IndexCatalogEntry* _setupInMemoryStructures(OperationContext* txn,
-                                                    IndexDescriptor* descriptor );
+                                                    IndexDescriptor* descriptor,
+                                                    bool initFromDisk);
 
         // Apply a set of transformations to the user-provided index object 'spec' to make it
         // conform to the standard for insertion.  This function adds the 'v' field if it didn't
@@ -361,7 +362,8 @@ namespace mongo {
         Status _doesSpecConflictWithExisting( OperationContext* txn, const BSONObj& spec ) const;
 
         int _magic;
-        Collection* _collection;
+        Collection* const _collection;
+        const int _maxNumIndexesAllowed;
 
         IndexCatalogEntryContainer _entries;
 

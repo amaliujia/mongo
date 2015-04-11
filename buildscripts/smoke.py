@@ -154,7 +154,7 @@ def buildlogger(cmd, is_global=False):
 
 def clean_dbroot(dbroot="", nokill=False):
     # Clean entire /data/db dir if --with-cleanbb, else clean specific database path.
-    if clean_whole_dbroot and not small_oplog:
+    if clean_whole_dbroot and not (small_oplog or small_oplog_rs):
         dbroot = os.path.normpath(smoke_db_prefix + "/data/db")
     if os.path.exists(dbroot):
         print("clean_dbroot: %s" % dbroot)
@@ -223,7 +223,10 @@ class mongod(NullMongod):
         # SERVER-9137 Added httpinterface parameter to keep previous behavior
         argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
-            argv += ["--master", "--oplogSize", "511"]
+            if self.slave:
+                argv += ['--slave', '--source', 'localhost:' + str(srcport)]
+            else:
+                argv += ["--master", "--oplogSize", "511"]
         if self.kwargs.get('storage_engine'):
             argv += ["--storageEngine", self.kwargs.get('storage_engine')]
         if self.kwargs.get('wiredtiger_engine_config_string'):
@@ -237,8 +240,6 @@ class mongod(NullMongod):
             for p in params.split(','): argv += ['--setParameter', p]
         if self.kwargs.get('small_oplog_rs'):
             argv += ["--replSet", "foo", "--oplogSize", "511"]
-        if self.slave:
-            argv += ['--slave', '--source', 'localhost:' + str(srcport)]
         if self.kwargs.get('no_journal'):
             argv += ['--nojournal']
         if self.kwargs.get('no_preallocj'):
@@ -251,14 +252,11 @@ class mongod(NullMongod):
             self.auth = True
         if self.kwargs.get('keyFile'):
             argv += ['--keyFile', self.kwargs.get('keyFile')]
-        if self.kwargs.get('use_ssl') or self.kwargs.get('use_x509'):
+        if self.kwargs.get('use_ssl'):
             argv += ['--sslMode', "requireSSL",
                      '--sslPEMKeyFile', 'jstests/libs/server.pem',
                      '--sslCAFile', 'jstests/libs/ca.pem',
-                     '--sslWeakCertificateValidation']
-        if self.kwargs.get('use_x509'):
-            argv += ['--clusterAuthMode','x509'];
-            self.auth = True
+                     '--sslAllowConnectionsWithoutCertificates']
         print "running " + " ".join(argv)
         self.proc = self._start(buildlogger(argv, is_global=True))
 
@@ -342,7 +340,9 @@ class mongod(NullMongod):
             raise(Exception('mongod process exited with non-zero code %d' % retcode))
 
     def wait_for_repl(self):
+        print "Awaiting replicated (w:2, wtimeout:5min) insert (port:" + str(self.port) + ")"
         Connection(port=self.port).testing.smokeWait.insert({}, w=2, wtimeout=5*60*1000)
+        print "Replicated write completed -- done wait_for_repl"
 
 class Bug(Exception):
     def __str__(self):
@@ -372,9 +372,7 @@ def check_db_hashes(master, slave):
     if not slave.slave:
         raise(Bug("slave instance doesn't have slave attribute set"))
 
-    print "waiting for slave (%s) to catch up to master (%s)" % (slave.port, master.port)
     master.wait_for_repl()
-    print "caught up!"
 
     # FIXME: maybe make this run dbhash on all databases?
     for mongod in [master, slave]:
@@ -412,8 +410,11 @@ def check_db_hashes(master, slave):
                 stats["error-docs"] = e;
 
             screwy_in_slave[coll] = stats
-            if mhash == "no _id _index":
-                mOplog = mTestDB.connection.local["oplog.$main"];
+            if mhash == "no _id_ index":
+                oplog = "oplog.$main"
+                if small_oplog_rs:
+                    oplog = "oplog.rs"
+                mOplog = mTestDB.connection.local[oplog];
                 oplog_entries = list(mOplog.find({"$or": [{"ns":mTestDB[coll].full_name}, \
                                                           {"op":"c"}]}).sort("$natural", 1))
                 print "oplog for %s" % mTestDB[coll].full_name
@@ -436,9 +437,11 @@ def skipTest(path):
     basename = os.path.basename(path)
     parentPath = os.path.dirname(path)
     parentDir = os.path.basename(parentPath)
-    if small_oplog: # For tests running in parallel
+    if small_oplog or small_oplog_rs: # For tests running in parallel
         if basename in ["cursor8.js", "indexh.js", "dropdb.js", "dropdb_race.js", 
-                        "connections_opened.js", "opcounters_write_cmd.js", "dbadmin.js"]:
+                        "connections_opened.js", "opcounters_write_cmd.js", "dbadmin.js",
+                        ## Capped tests
+                        "capped_max1.js", "capped_convertToCapped1.js", "rename.js"]:
             return True
     if use_ssl:
         # Skip tests using mongobridge since it does not support SSL
@@ -450,7 +453,7 @@ def skipTest(path):
         if basename in ["fastsync.js", "index_retry.js", "ttl_repl_maintenance.js", 
                         "unix_socket1.js"]:
             return True;
-    if auth or keyFile or use_x509: # For tests running with auth
+    if auth or keyFile: # For tests running with auth
         # Skip any tests that run with auth explicitly
         if parentDir.lower() == "auth" or "auth" in basename.lower():
             return True
@@ -582,9 +585,7 @@ def runTest(test, result):
                      'TestData.keyFile = ' + ternary( keyFile , '"' + str(keyFile) + '"' , 'null' ) + ";" + \
                      'TestData.keyFileData = ' + ternary( keyFile , '"' + str(keyFileData) + '"' , 'null' ) + ";" + \
                      'TestData.authMechanism = ' + ternary( authMechanism,
-                                               '"' + str(authMechanism) + '"', 'null') + ";" + \
-                     'TestData.useSSL = ' + ternary( use_ssl ) + ";" + \
-                     'TestData.useX509 = ' + ternary( use_x509 ) + ";"
+                                               '"' + str(authMechanism) + '"', 'null') + ";"
         # this updates the default data directory for mongod processes started through shell (src/mongo/shell/servers.js)
         evalString += 'MongoRunner.dataDir = "' + os.path.abspath(smoke_db_prefix + '/data/db') + '";'
         evalString += 'MongoRunner.dataPath = MongoRunner.dataDir + "/";'
@@ -696,12 +697,13 @@ def run_tests(tests):
                             auth=auth,
                             authMechanism=authMechanism,
                             keyFile=keyFile,
-                            use_ssl=use_ssl,
-                            use_x509=use_x509)
+                            use_ssl=use_ssl)
             master.start()
 
         if small_oplog:
             slave = mongod(slave=True,
+                           small_oplog=True,
+                           small_oplog_rs=False,
                            storage_engine=storage_engine,
                            wiredtiger_engine_config_string=wiredtiger_engine_config_string,
                            wiredtiger_collection_config_string=wiredtiger_collection_config_string,
@@ -710,8 +712,8 @@ def run_tests(tests):
             slave.start()
         elif small_oplog_rs:
             slave = mongod(slave=True,
-                           small_oplog_rs=small_oplog_rs,
-                           small_oplog=small_oplog,
+                           small_oplog_rs=True,
+                           small_oplog=False,
                            no_journal=no_journal,
                            storage_engine=storage_engine,
                            wiredtiger_engine_config_string=wiredtiger_engine_config_string,
@@ -722,8 +724,7 @@ def run_tests(tests):
                            auth=auth,
                            authMechanism=authMechanism,
                            keyFile=keyFile,
-                           use_ssl=use_ssl,
-                           use_x509=use_x509)
+                           use_ssl=use_ssl)
             slave.start()
             primary = Connection(port=master.port, slave_okay=True);
 
@@ -731,11 +732,23 @@ def run_tests(tests):
                             {'_id': 0, 'host':'localhost:%s' % master.port},
                             {'_id': 1, 'host':'localhost:%s' % slave.port,'priority':0}]}})
 
+            # Wait for primary and secondary to finish initial sync and election
             ismaster = False
             while not ismaster:
                 result = primary.admin.command("ismaster");
                 ismaster = result["ismaster"]
-                time.sleep(1)
+                if not ismaster:
+                    print "waiting for primary to be available ..."
+                    time.sleep(.2)
+            
+            secondaryUp = False
+            sConn = Connection(port=slave.port, slave_okay=True);
+            while not secondaryUp:
+                result = sConn.admin.command("ismaster");
+                secondaryUp = result["secondary"]
+                if not secondaryUp:
+                    print "waiting for secondary to be available ..."
+                    time.sleep(.2)
 
         if small_oplog or small_oplog_rs:
             master.wait_for_repl()
@@ -792,8 +805,7 @@ def run_tests(tests):
                                         auth=auth,
                                         authMechanism=authMechanism,
                                         keyFile=keyFile,
-                                        use_ssl=use_ssl,
-                                        use_x509=use_x509)
+                                        use_ssl=use_ssl)
                         master.start()
 
             except TestFailure, f:
@@ -832,8 +844,7 @@ at the end of testing:""" % (src, dst)
     missing(lost_in_slave, "master", "slave")
     missing(lost_in_master, "slave", "master")
     if screwy_in_slave:
-        print """The following collections has different hashes in master and slave
-at the end of testing:"""
+        print """The following collections have different hashes in the master and slave:"""
         for coll in screwy_in_slave.keys():
             stats = screwy_in_slave[coll]
             # Counts are "approx" because they are collected after the dbhash runs and may not
@@ -841,8 +852,8 @@ at the end of testing:"""
             # possibility is that a test exited with writes still in-flight.
             print "collection: %s\t (master/slave) hashes: %s/%s counts (approx): %i/%i" % (coll, stats['hashes']['master'], stats['hashes']['slave'], stats['counts']['master'], stats['counts']['slave'])
             if "docs" in stats:
-                if (("master" in stats["docs"] and len(stats["docs"]["master"]) != 0) or
-                    ("slave" in stats["docs"] and len(stats["docs"]["slave"]) != 0)):
+                if (("master" in stats["docs"] and len(stats["docs"]["master"]) == 0) and
+                    ("slave" in stats["docs"] and len(stats["docs"]["slave"]) == 0)):
                     print "All docs matched!"
                 else:
                     print "Different Docs"
@@ -1076,7 +1087,7 @@ def set_globals(options, tests):
     global small_oplog, small_oplog_rs
     global no_journal, set_parameters, set_parameters_mongos, no_preallocj, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
     global auth, authMechanism, keyFile, keyFileData, smoke_db_prefix, test_path, start_mongod
-    global use_ssl, use_x509
+    global use_ssl
     global file_of_commands_mode
     global report_file, shell_write_mode, use_write_commands
     global temp_path
@@ -1086,9 +1097,6 @@ def set_globals(options, tests):
     start_mongod = options.start_mongod
     if hasattr(options, 'use_ssl'):
         use_ssl = options.use_ssl
-    if hasattr(options, 'use_x509'):
-        use_x509 = options.use_x509
-        use_ssl = use_ssl or use_x509
     #Careful, this can be called multiple times
     test_path = options.test_path
 
@@ -1279,9 +1287,6 @@ def main():
     parser.add_option('--auth', dest='auth', default=False,
                       action="store_true",
                       help='Run standalone mongods in tests with authentication enabled')
-    parser.add_option('--use-x509', dest='use_x509', default=False,
-                      action="store_true",
-                      help='Use x509 auth for internal cluster authentication')
     parser.add_option('--authMechanism', dest='authMechanism', default='SCRAM-SHA-1',
                       help='Use the given authentication mechanism, when --auth is used.')
     parser.add_option('--keyFile', dest='keyFile', default=None,
