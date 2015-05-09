@@ -41,7 +41,7 @@
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
 
@@ -67,7 +67,7 @@ namespace {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::splitChunk)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -96,8 +96,7 @@ namespace {
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
-                  BSONObjBuilder& result,
-                  bool ) {
+                  BSONObjBuilder& result) {
 
             vector<BSONObj> bounds;
             if ( !FieldParser::extract( cmdObj, boundsField, &bounds, &errmsg ) ) {

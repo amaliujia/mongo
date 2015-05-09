@@ -97,14 +97,14 @@ namespace mongo {
                                           const std::string& dbname,
                                           const BSONObj& cmdObj ) {
 
-        Status status( auth::checkAuthForWriteCommand( client->getAuthorizationSession(),
+        Status status( auth::checkAuthForWriteCommand( AuthorizationSession::get(client),
                 _writeType,
                 NamespaceString( parseNs( dbname, cmdObj ) ),
                 cmdObj ));
 
         // TODO: Remove this when we standardize GLE reporting from commands
         if ( !status.isOK() ) {
-            setLastError( status.code(), status.reason().c_str() );
+            LastError::get(client).setLastError(status.code(), status.reason());
         }
 
         return status;
@@ -118,12 +118,9 @@ namespace mongo {
                        BSONObj& cmdObj,
                        int options,
                        string& errMsg,
-                       BSONObjBuilder& result,
-                       bool fromRepl) {
-        invariant(!fromRepl == txn->writesAreReplicated());
-
-        // Can't be run on secondaries (logTheOp() == false, slaveOk() == false).
-        dassert( !fromRepl );
+                       BSONObjBuilder& result) {
+        // Can't be run on secondaries.
+        dassert(txn->writesAreReplicated());
         BatchedCommandRequest request( _writeType );
         BatchedCommandResponse response;
 
@@ -148,7 +145,7 @@ namespace mongo {
 
         WriteBatchExecutor writeBatchExecutor(txn,
                                               &globalOpCounters,
-                                              lastError.get());
+                                              &LastError::get(txn->getClient()));
 
         writeBatchExecutor.executeBatch( request, &response );
 

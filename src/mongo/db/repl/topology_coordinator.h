@@ -40,7 +40,6 @@
 
 namespace mongo {
 
-    class OperationContext;
     class Timestamp;
 
 namespace repl {
@@ -49,6 +48,7 @@ namespace repl {
     class ReplSetHeartbeatArgs;
     class ReplicaSetConfig;
     class TagSubgroup;
+    class LastVote;
     struct MemberState;
 
     /**
@@ -354,6 +354,42 @@ namespace repl {
          * Set the outgoing heartbeat message from self
          */
         virtual void setMyHeartbeatMessage(const Date_t now, const std::string& s) = 0;
+
+        /**
+         * Prepares a BSONObj describing the current term, primary, and lastOp information.
+         */
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
+                                               const Timestamp& lastCommittedOpTime) const = 0;
+
+        /**
+         * Writes into 'output' all the information needed to generate a summary of the current
+         * replication state for use by the web interface.
+         */
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
+
+        /**
+         * Prepares a ReplSetRequestVotesResponse.
+         */
+        virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                ReplSetRequestVotesResponse* response,
+                                                const OpTime& lastAppliedOpTime) = 0;
+
+        /**
+         * Determines whether or not the newly elected primary is valid from our perspective.
+         * If it is, sets the _currentPrimaryIndex and term to the received values.
+         * If it is not, return ErrorCode::BadValue and the current term from our perspective.
+         * Populate responseTerm with the current term from our perspective.
+         */
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                long long* responseTerm) = 0;
+
+        /**
+         * Loads an initial LastVote document, which was read from local storage.
+         *
+         * Called only during replication startup. All other updates are done internally.
+         */
+        virtual void loadLastVote(const LastVote& lastVote) = 0;
 
     protected:
         TopologyCoordinator() {}

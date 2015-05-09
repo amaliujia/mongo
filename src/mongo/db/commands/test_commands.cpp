@@ -35,6 +35,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/db/catalog/capped_utils.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
@@ -66,7 +67,12 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "internal. for testing only.";
         }
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             string coll = cmdObj[ "godinsert" ].valuestrsafe();
             log() << "test only command godinsert invoked coll:" << coll << endl;
             uassert( 13049, "godinsert must specify a collection", !coll.empty() );
@@ -112,7 +118,12 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
         CmdSleep() : Command("sleep") { }
-        bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& ns,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             log() << "test only command sleep invoked" << endl;
             long long millis = 10 * 1000;
 
@@ -154,7 +165,12 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             string coll = cmdObj[ "captrunc" ].valuestrsafe();
             uassert( 13416, "captrunc must specify a collection", !coll.empty() );
             NamespaceString nss( dbname, coll );
@@ -190,7 +206,6 @@ namespace mongo {
         EmptyCapped() : Command( "emptycapped" ) {}
         virtual bool slaveOk() const { return false; }
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool logTheOp() { return true; }
         // No auth needed because it only works when enabled via command line.
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -201,8 +216,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
             const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
             return appendCommandStatus(result, emptyCapped(txn, NamespaceString(ns)));

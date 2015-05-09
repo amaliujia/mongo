@@ -31,13 +31,14 @@
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclient_rs.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 
     class ChunkManager;
+    class CollectionType;
     class ConfigServer;
     class DatabaseType;
     class DBConfig;
@@ -45,6 +46,48 @@ namespace mongo {
     typedef boost::shared_ptr<DBConfig> DBConfigPtr;
 
     extern ConfigServer& configServer;
+
+
+    struct CollectionInfo {
+
+        CollectionInfo() {
+            _dirty = false;
+            _dropped = false;
+        }
+
+        CollectionInfo(const CollectionType& in);
+        ~CollectionInfo();
+
+        bool isSharded() const {
+            return _cm.get();
+        }
+
+        boost::shared_ptr<ChunkManager> getCM() const {
+            return _cm;
+        }
+
+        void resetCM(ChunkManager * cm);
+
+        void shard(ChunkManager* cm);
+        void unshard();
+
+        bool isDirty() const { return _dirty; }
+        bool wasDropped() const { return _dropped; }
+
+        void save(const std::string& ns);
+
+        void useChunkManager(boost::shared_ptr<ChunkManager> manager);
+
+        bool unique() const { return _unique; }
+        BSONObj key() const { return _key; }
+
+    private:
+        BSONObj _key;
+        bool _unique;
+        boost::shared_ptr<ChunkManager> _cm;
+        bool _dirty;
+        bool _dropped;
+    };
 
     /**
      * top level configuration for a database
@@ -69,20 +112,6 @@ namespace mongo {
         const Shard& getPrimary() const { return _primary; }
 
         void enableSharding( bool save = true );
-
-        /* Makes all the configuration changes necessary to shard a new collection.
-         * Optionally, chunks will be created based on a set of specified initial split points, and
-         * distributed in a round-robin fashion onto a set of initial shards.  If no initial shards
-         * are specified, only the primary will be used.
-         *
-         * WARNING: It's not safe to place initial chunks onto non-primary shards using this method.
-         * The initShards parameter allows legacy behavior expected by map-reduce.
-         */
-        boost::shared_ptr<ChunkManager> shardCollection(const std::string& ns,
-                                                        const ShardKeyPattern& fieldsAndOrder,
-                                                        bool unique,
-                                                        std::vector<BSONObj>* initPoints,
-                                                        std::vector<Shard>* initShards = NULL);
 
         /**
            @return true if there was sharding info to remove
@@ -119,45 +148,6 @@ namespace mongo {
         void getAllShardedCollections(std::set<std::string>& namespaces);
 
     protected:
-        struct CollectionInfo {
-            CollectionInfo() {
-                _dirty = false;
-                _dropped = false;
-            }
-
-            CollectionInfo(const BSONObj& in);
-            ~CollectionInfo();
-
-            bool isSharded() const {
-                return _cm.get();
-            }
-
-            boost::shared_ptr<ChunkManager> getCM() const {
-                return _cm;
-            }
-
-            void resetCM(ChunkManager * cm);
-
-            void shard(ChunkManager* cm);
-            void unshard();
-
-            bool isDirty() const { return _dirty; }
-            bool wasDropped() const { return _dropped; }
-
-            void save(const std::string& ns);
-
-            bool unique() const { return _unqiue; }
-            BSONObj key() const { return _key; }
-
-
-        private:
-            BSONObj _key;
-            bool _unqiue;
-            boost::shared_ptr<ChunkManager> _cm;
-            bool _dirty;
-            bool _dropped;
-        };
-
         typedef std::map<std::string, CollectionInfo> CollectionInfoMap;
 
 
@@ -205,9 +195,7 @@ namespace mongo {
         /**
            call at startup, this will initiate connection to the grid db
         */
-        bool init( std::vector<std::string> configHosts );
-
-        bool init( const std::string& s );
+        bool init( const ConnectionString& configCS );
 
         /**
          * Check hosts are unique. Returns true if all configHosts
@@ -215,17 +203,6 @@ namespace mongo {
          * and fill errmsg with message containing the offending server.
          */
         bool checkHostsAreUnique( const std::vector<std::string>& configHosts, std::string* errmsg );
-
-        /**
-         * Checks if all config servers are up.
-         *
-         * If localCheckOnly is true, only check if the socket is still open with no errors.
-         * Otherwise, also send a getLastError command with recv timeout.
-         *
-         * TODO: fix this - SERVER-15811
-         */
-        bool allUp(bool localCheckOnly);
-        bool allUp(bool localCheckOnly, std::string& errmsg);
 
         int dbConfigVersion();
         int dbConfigVersion( DBClientBase& conn );
@@ -237,13 +214,6 @@ namespace mongo {
         void replicaSetChange(const std::string& setName, const std::string& newConnectionString);
 
         static int VERSION;
-
-
-        /**
-         * check to see if all config servers have the same state
-         * will try tries time to make sure not catching in a bad state
-         */
-        bool checkConfigServersConsistent( std::string& errmsg , int tries = 4 ) const;
 
     private:
         std::string getHost( const std::string& name , bool withPort );

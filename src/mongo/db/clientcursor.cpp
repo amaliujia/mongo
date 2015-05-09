@@ -160,7 +160,7 @@ namespace mongo {
 
     void ClientCursor::kill() {
         if ( _exec.get() )
-            _exec->kill();
+            _exec->kill("cursor killed");
 
         _cursorManager = NULL;
     }
@@ -290,7 +290,6 @@ namespace mongo {
 
         void run() {
             Client::initThread("clientcursormon");
-            Client& client = cc();
             Timer t;
             const int Secs = 4;
             while (!inShutdown()) {
@@ -299,7 +298,6 @@ namespace mongo {
                     CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
                 sleepsecs(Secs);
             }
-            client.shutdown();
         }
     };
 
@@ -339,8 +337,12 @@ namespace mongo {
             actions.addAction(ActionType::cursorInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             _appendCursorStats( result );
             return true;
         }

@@ -30,13 +30,13 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/s/client_info.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
@@ -58,22 +58,14 @@ namespace {
 
     const string TARGET_HOST = "$dummy:27017";
 
-    MONGO_INITIALIZER(SCFTestGlobalServiceContext)(InitializerContext*) {
-        invariant(!hasGlobalServiceContext());
-        mongo::setGlobalAuthorizationManager(new mongo::AuthorizationManager(
-                                                     new mongo::AuthzManagerExternalStateMock()));
-        setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
-        return Status::OK();
-    }
-
     /**
      * Warning: cannot run in parallel
      */
     class ShardConnFixture: public mongo::unittest::Test {
     public:
         void setUp() {
-            if (!ClientInfo::exists()) {
-                ClientInfo::create(getGlobalServiceContext(), NULL);
+            if (!haveClient()) {
+                Client::initThread("ShardConnFixture", getGlobalServiceContext(), NULL);
             }
             _maxPoolSizePerHost = mongo::shardConnectionPool.getMaxPoolSize();
 

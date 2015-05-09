@@ -74,7 +74,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forDatabaseName(
                                                                         parseNs(dbname, cmdObj)),
                                                         ActionType::enableSharding)) {
@@ -97,8 +97,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             const std::string dbname = parseNs("", cmdObj);
 

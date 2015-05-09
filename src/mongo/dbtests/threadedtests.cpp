@@ -46,6 +46,7 @@
 #include "mongo/platform/bits.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/mvar.h"
+#include "mongo/util/concurrency/rwlock.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/concurrency/synchronization.h"
@@ -246,7 +247,6 @@ namespace ThreadedTests {
                 }
                 pm.hit();
             }
-            cc().shutdown();
         }
 
         virtual void validate() {
@@ -568,8 +568,6 @@ namespace ThreadedTests {
             default:
                 ASSERT(false);
             }
-
-            cc().shutdown();
         }
     };
 
@@ -736,7 +734,6 @@ namespace ThreadedTests {
                 LOG(Z) << t.millis() << endl;
                 ASSERT( t.millis() > 50 );
             }
-            cc().shutdown();
         }
     };
 
@@ -800,9 +797,6 @@ namespace ThreadedTests {
                     mongo::unittest::log() << "checked in " << i << " times..." << endl;
 
             }
-
-            cc().shutdown();
-
         }
 
         virtual void validate() {

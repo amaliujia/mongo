@@ -37,6 +37,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
@@ -146,7 +147,7 @@ namespace {
 
     void BackgroundSync::producerThread() {
         Client::initThread("rsBackgroundSync");
-        cc().getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
 
         while (!inShutdown()) {
             try {
@@ -162,8 +163,6 @@ namespace {
                 fassertFailed(28546);
             }
         }
-
-        cc().shutdown();
     }
 
     void BackgroundSync::_producerThread() {
@@ -481,6 +480,10 @@ namespace {
         return _lastAppliedHash;
     }
 
+    void BackgroundSync::clearBuffer() {
+        _buffer.clear();
+    }
+
     void BackgroundSync::setLastAppliedHash(long long newHash) {
         boost::lock_guard<boost::mutex> lck(_mutex);
         _lastAppliedHash = newHash;
@@ -495,14 +498,16 @@ namespace {
     long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
         BSONObj oplogEntry;
         try {
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock lk(txn->lockState(), "local", MODE_X);
-            bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
-            if (!success) {
-                // This can happen when we are to do an initial sync.  lastHash will be set
-                // after the initial sync is complete.
-                return 0;
-            }
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock lk(txn->lockState(), "local", MODE_X);
+                bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
+                if (!success) {
+                    // This can happen when we are to do an initial sync.  lastHash will be set
+                    // after the initial sync is complete.
+                    return 0;
+                }
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "readLastAppliedHash", rsOplogName);
         }
         catch (const DBException& ex) {
             severe() << "Problem reading " << rsOplogName << ": " << ex.toStatus();
@@ -531,6 +536,11 @@ namespace {
     void BackgroundSync::setInitialSyncRequestedFlag(bool value) {
         boost::lock_guard<boost::mutex> lock(_initialSyncMutex);
         _initialSyncRequestedFlag = value;
+    }
+
+    void BackgroundSync::pushTestOpToBuffer(const BSONObj& op) {
+        boost::lock_guard<boost::mutex> lock(_mutex);
+        _buffer.push(op);
     }
 
 

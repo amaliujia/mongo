@@ -37,6 +37,7 @@
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -186,6 +187,17 @@ namespace repl {
         virtual bool stepDown(Date_t until, bool force, Timestamp lastOpApplied);
         virtual bool stepDownIfPending();
         virtual Date_t getStepDownTime() const;
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
+                                               const Timestamp& lastCommitttedOpTime) const;
+        Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
+                                                   long long* responseTerm);
+        virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                ReplSetRequestVotesResponse* response,
+                                                const OpTime& lastAppliedOpTime);
+
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
+
+        virtual void loadLastVote(const LastVote& lastVote);
 
         ////////////////////////////////////////////////////////////
         //
@@ -327,6 +339,10 @@ namespace repl {
         // The time at which the current PRIMARY was elected.
         Timestamp _electionTime;
 
+        // This node's election term.  The term is used as part of the consensus algorithm to elect
+        // and maintain one primary (leader) node in the cluster.
+        long long _term = -1;
+
         // the index of the member we currently believe is primary, if one exists, otherwise -1
         int _currentPrimaryIndex;
 
@@ -383,15 +399,18 @@ namespace repl {
         PingMap _pings;
 
         // Last vote info from the election
-        struct LastVote {
+        struct VoteLease {
 
             static const Seconds leaseTime;
 
-            LastVote() : when(0), whoId(-1) { }
+            VoteLease() : when(0), whoId(-1) { }
             Date_t when;
             int whoId;
             HostAndPort whoHostAndPort;
-        } _lastVote;
+        } _voteLease;
+
+        // V1 last vote info for elections
+        LastVote _lastVote;
 
     };
 

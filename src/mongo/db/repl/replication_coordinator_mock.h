@@ -99,6 +99,8 @@ namespace repl {
 
         virtual void setMyHeartbeatMessage(const std::string& msg);
 
+        virtual OpTime getMyLastOptimeV1() const;
+
         virtual Timestamp getMyLastOptime() const;
 
         virtual OID getElectionId();
@@ -181,6 +183,24 @@ namespace repl {
         virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
 
         virtual Timestamp getLastCommittedOpTime() const;
+
+        virtual Status processReplSetRequestVotes(OperationContext* txn,
+                                                  const ReplSetRequestVotesArgs& args,
+                                                  ReplSetRequestVotesResponse* response);
+
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                long long* responseTerm);
+
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
+
+        virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                          ReplSetHeartbeatResponseV1* response);
+
+        virtual bool isV1ElectionProtocol();
+
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
+
     private:
 
         const ReplSettings _settings;

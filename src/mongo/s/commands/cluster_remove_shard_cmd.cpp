@@ -38,11 +38,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/cluster_write.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard.h"
-#include "mongo/s/type_database.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -86,8 +83,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             const string target = cmdObj.firstElement().valuestrsafe();
 

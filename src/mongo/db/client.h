@@ -40,9 +40,9 @@
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/client_basic.h"
-#include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/threadlocal.h"
@@ -52,49 +52,29 @@ namespace mongo {
     class Collection;
     class AbstractMessagingPort;
 
-    TSP_DECLARE(Client, currentClient)
-
     typedef long long ConnectionId;
-
-    typedef unordered_set<Client*> ClientSet;
 
     /** the database's concept of an outside "client" */
     class Client : public ClientBasic {
     public:
-        // A set of currently active clients along with a mutex to protect the list
-        static boost::mutex clientsMutex;
-        static ClientSet clients;
-
-        ~Client();
-
         /** each thread which does db operations has a Client object in TLS.
          *  call this when your thread starts.
         */
         static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
+        static void initThread(const char* desc,
+                               ServiceContext* serviceContext,
+                               AbstractMessagingPort* mp);
 
         /**
          * Inits a thread if that thread has not already been init'd, setting the thread name to
          * "desc".
          */
-        static void initThreadIfNotAlready(const char* desc) {
-            if (currentClient.get())
-                return;
-            initThread(desc);
-        }
+        static void initThreadIfNotAlready(const char* desc);
 
         /**
          * Inits a thread if that thread has not already been init'd, using the existing thread name
          */
-        static void initThreadIfNotAlready() {
-            if (currentClient.get())
-                return;
-            initThread(getThreadName().c_str());
-        }
-
-        /** this has to be called as the client goes away, but before thread termination
-         *  @return true if anything was done
-         */
-        bool shutdown();
+        static void initThreadIfNotAlready();
 
         std::string clientAddress(bool includePort = false) const;
         const std::string& desc() const { return _desc; }
@@ -120,7 +100,8 @@ namespace mongo {
         bool isFromUserConnection() const { return _connectionId > 0; }
 
     private:
-        Client(const std::string& desc,
+        friend class ServiceContext;
+        Client(std::string desc,
                ServiceContext* serviceContext,
                AbstractMessagingPort *p = 0);
 
@@ -138,19 +119,15 @@ namespace mongo {
         mutable SpinLock _lock;
 
         // Whether this client is running as DBDirectClient
-        bool _inDirectClient;
+        bool _inDirectClient = false;
 
         // If != NULL, then contains the currently active OperationContext
-        OperationContext* _txn;
+        OperationContext* _txn = nullptr;
     };
 
     /** get the Client object for this thread. */
-    inline Client& cc() {
-        Client * c = currentClient.get();
-        verify( c );
-        return *c;
-    }
+    Client& cc();
 
-    inline bool haveClient() { return currentClient.get() != NULL; }
+    bool haveClient();
 
 };

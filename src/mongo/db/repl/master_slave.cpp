@@ -51,6 +51,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
@@ -374,8 +375,7 @@ namespace repl {
                          BSONObj& cmdObj,
                          int options,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             HandshakeArgs handshake;
             Status status = handshake.initialize(cmdObj);
@@ -477,7 +477,6 @@ namespace repl {
             int errCode = 0;
             CloneOptions cloneOptions;
             cloneOptions.fromDB = db;
-            cloneOptions.logForRepl = false;
             cloneOptions.slaveOk = true;
             cloneOptions.useReplAuth = true;
             cloneOptions.snapshot = true;
@@ -621,6 +620,27 @@ namespace repl {
         return true;
     }
 
+    void ReplSource::applyCommand(OperationContext* txn, const BSONObj& op) {
+        try {
+            Status status = applyCommand_inlock(txn, op);
+            if (!status.isOK()) {
+                Sync sync(hostName);
+                if (sync.shouldRetry(txn, op)) {
+                    uassert(28639,
+                            "Failure retrying initial sync update",
+                            applyCommand_inlock(txn, op).isOK());
+                }
+            }
+        }
+        catch ( UserException& e ) {
+            log() << "sync: caught user assertion " << e << " while applying op: " << op << endl;;
+        }
+        catch ( DBException& e ) {
+            log() << "sync: caught db exception " << e << " while applying op: " << op << endl;;
+        }
+
+    }
+
     void ReplSource::applyOperation(OperationContext* txn, Database* db, const BSONObj& op) {
         try {
             Status status = applyOperation_inlock( txn, db, op );
@@ -728,6 +748,12 @@ namespace repl {
             return;   
         }
 
+        // special case apply for commands to avoid implicit database creation
+        if (*op.getStringField("op") == 'c') {
+            applyCommand(txn, op);
+            return;
+        }
+
         // This code executes on the slaves only, so it doesn't need to be sharding-aware since
         // mongos will not send requests there. That's why the last argument is false (do not do
         // version checking).
@@ -738,13 +764,6 @@ namespace repl {
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;
 
         LOG(6) << "ns: " << ns << ", justCreated: " << ctx.justCreated() << ", empty: " << empty << ", incompleteClone: " << incompleteClone << endl;
-
-        // always apply admin command command
-        // this is a bit hacky -- the semantics of replication/commands aren't well specified
-        if ( strcmp( clientName, "admin" ) == 0 && *op.getStringField( "op" ) == 'c' ) {
-            applyOperation(txn, ctx.db(), op);
-            return;
-        }
 
         if ( ctx.justCreated() || empty || incompleteClone ) {
             // we must add to incomplete list now that setClient has been called
@@ -1281,7 +1300,7 @@ namespace repl {
             // printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date even
             // when things are idle.
             OperationContextImpl txn;
-            txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
+            AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
 
             Lock::GlobalWrite globalWrite(txn.lockState(), 1);
             if (globalWrite.isLocked()) {
@@ -1308,7 +1327,8 @@ namespace repl {
         Client::initThread("replslave");
 
         OperationContextImpl txn;
-        txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
+        DisableDocumentValidation validationDisabler(&txn);
 
         while ( 1 ) {
             try {
@@ -1338,7 +1358,7 @@ namespace repl {
         if( !replSettings.slave && !replSettings.master )
             return;
 
-        txn->getClient()->getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(txn->getClient())->grantInternalAuthorization();
 
         {
             ReplSource temp(txn); // Ensures local.me is populated
@@ -1364,11 +1384,7 @@ namespace repl {
     int _dummy_z;
 
     void pretouchN(vector<BSONObj>& v, unsigned a, unsigned b) {
-        Client *c = currentClient.get();
-        if( c == 0 ) {
-            Client::initThread("pretouchN");
-            c = &cc();
-        }
+        Client::initThreadIfNotAlready("pretouchN");
 
         OperationContextImpl txn; // XXX
         ScopedTransaction transaction(&txn, MODE_S);

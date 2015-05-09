@@ -197,6 +197,7 @@ namespace mongo {
         // Fill out basic curop query exec properties.
         curop->debug().nreturned = numResults;
         curop->debug().cursorid = (0 == cursorId ? -1 : cursorId);
+        curop->debug().cursorExhausted = (0 == cursorId);
 
         // Fill out curop based on explain summary statistics.
         PlanSummaryStats summaryStats;
@@ -432,11 +433,11 @@ namespace mongo {
                 }
             }
 
-            // If we are operating on an aggregation cursor, then we dropped our collection lock
-            // earlier and need to reacquire it in order to clean up our ClientCursorPin.
-            //
-            // TODO: We need to ensure that this relock happens if we release the pin above in
-            // response to PlanExecutor::getNext() throwing an exception.
+            const bool shouldSaveCursor =
+                    shouldSaveCursorGetMore(state, exec, isCursorTailable(cc));
+
+            // In order to deregister a cursor, we need to be holding the DB + collection lock and
+            // if the cursor is aggregation, we release these locks.
             if (cc->isAggCursor()) {
                 invariant(NULL == ctx.get());
                 unpinDBLock.reset(new Lock::DBLock(txn->lockState(), nss.db(), MODE_IS));
@@ -449,12 +450,15 @@ namespace mongo {
             //    this case, the pin's destructor will be invoked, which will call release() on the
             //    pin.  Because our ClientCursorPin is declared after our lock is declared, this
             //    will happen under the lock.
-            if (!shouldSaveCursorGetMore(state, exec, isCursorTailable(cc))) {
+            if (!shouldSaveCursor) {
                 ruSwapper.reset();
                 ccPin.deleteUnderlying();
+
                 // cc is now invalid, as is the executor
                 cursorid = 0;
                 cc = NULL;
+                curop.debug().cursorExhausted = true;
+
                 LOG(5) << "getMore NOT saving client cursor, ended with state "
                        << PlanExecutor::statestr(state)
                        << endl;
@@ -678,7 +682,6 @@ namespace mongo {
         // Fill out curop based on query results. If we have a cursorid, we will fill out curop with
         // this cursorid later.
         long long ccId = 0;
-        endQueryOp(exec.get(), dbProfilingLevel, numResults, ccId, &curop);
 
         if (shouldSaveCursor(txn, collection, state, exec.get())) {
             // We won't use the executor until it's getMore'd.
@@ -727,9 +730,12 @@ namespace mongo {
             // If the query had a time limit, remaining time is "rolled over" to the cursor (for
             // use by future getmore ops).
             cc->setLeftoverMaxTimeMicros(curop.getRemainingMaxTimeMicros());
+
+            endQueryOp(cc->getExecutor(), dbProfilingLevel, numResults, ccId, &curop);
         }
         else {
             LOG(5) << "Not caching executor but returning " << numResults << " results.\n";
+            endQueryOp(exec.get(), dbProfilingLevel, numResults, ccId, &curop);
         }
 
         // Add the results from the query into the output buffer.
@@ -739,7 +745,6 @@ namespace mongo {
         // Fill out the output buffer's header.
         QueryResult::View qr = result.header().view2ptr();
         qr.setCursorId(ccId);
-        curop.debug().cursorid = (0 == ccId ? -1 : ccId);
         qr.setResultFlagsToOk();
         qr.msgdata().setOperation(opReply);
         qr.setStartingFrom(0);

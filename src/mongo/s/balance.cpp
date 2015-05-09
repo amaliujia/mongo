@@ -35,26 +35,27 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_actionlog.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
-#include "mongo/s/config_server_checker_service.h"
-#include "mongo/s/distlock.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/server.h"
-#include "mongo/s/shard.h"
-#include "mongo/s/type_actionlog.h"
-#include "mongo/s/type_collection.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/type_mongos.h"
-#include "mongo/s/type_settings.h"
 #include "mongo/s/type_tags.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
@@ -97,18 +98,17 @@ namespace mongo {
 
             // If the balancer was disabled since we started this round, don't start new
             // chunks moves.
-            SettingsType balancerConfig;
-            std::string errMsg;
-
-            if (!grid.getBalancerSettings(&balancerConfig, &errMsg)) {
-                warning() << errMsg;
-                // No point in continuing the round if the config servers are unreachable.
+            auto balSettingsResult =
+                grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
+            const bool isBalSettingsAbsent = balSettingsResult.getStatus() == ErrorCodes::NoSuchKey;
+            if (!balSettingsResult.isOK() && !isBalSettingsAbsent) {
+                warning() << balSettingsResult.getStatus();
                 return movedCount;
             }
+            const SettingsType& balancerConfig = balSettingsResult.getValue();
 
-            if ((balancerConfig.isKeySet() && // balancer config doc exists
-                    !grid.shouldBalance(balancerConfig)) ||
-                    MONGO_FAIL_POINT(skipBalanceRound)) {
+            if ((!isBalSettingsAbsent && !grid.shouldBalance(balancerConfig)) ||
+                 MONGO_FAIL_POINT(skipBalanceRound)) {
                 LOG(1) << "Stopping balancing round early as balancing was disabled";
                 return movedCount;
             }
@@ -241,56 +241,6 @@ namespace mongo {
         return builder.obj();
     }
 
-    /**
-     * Reports the result of the balancer round into config.actionlog
-     *
-     * @param actionLog, which contains the balancer round information to be logged
-     *
-     */
-
-    static void _reportRound( ActionLogType& actionLog) {
-        try {
-            ScopedDbConnection conn( configServer.getConnectionString(), 30 );
-
-            // send a copy of the message to the log in case it doesn't reach config.actionlog
-            actionLog.setTime(jsTime());
-
-            LOG(1) << "about to log balancer result: " << actionLog;
-
-            // The following method is not thread safe. However, there is only one balancer
-            // thread per mongos process. The create collection is a a no-op when the collection
-            // already exists
-            static bool createActionlog = false;
-            if ( ! createActionlog ) {
-                try {
-                    static const int actionLogSizeBytes = 1024 * 1024 * 2;
-                    conn->createCollection( ActionLogType::ConfigNS , actionLogSizeBytes , true );
-                }
-                catch ( const DBException& ex ) {
-                    LOG(1) << "config.actionlog could not be created, another mongos process "
-                           << "may have done so" << causedBy(ex);
-
-                }
-                createActionlog = true;
-            }
-
-            Status result = grid.catalogManager()->insert(ActionLogType::ConfigNS,
-                                                          actionLog.toBSON(),
-                                                          NULL);
-            if ( !result.isOK() ) {
-                log() << "Error encountered while logging action from balancer "
-                      << result.reason();
-            }
-
-            conn.done();
-        }
-        catch ( const DBException& ex ) {
-            // if we got here, it means the config change is only in the log;
-            // the change didn't make it to config.actionlog
-            warning() << "could not log balancer result" << causedBy(ex);
-        }
-    }
-
     bool Balancer::_checkOIDs() {
         vector<Shard> all;
         Shard::getAllShards( all );
@@ -342,55 +292,29 @@ namespace mongo {
         }        
     }
 
-    void Balancer::_doBalanceRound( DBClientBase& conn, vector<CandidateChunkPtr>* candidateChunks ) {
-        verify( candidateChunks );
+    void Balancer::_doBalanceRound(DBClientBase& conn, vector<CandidateChunkPtr>* candidateChunks) {
+        invariant(candidateChunks);
 
-        //
-        // 1. Check whether there is any sharded collection to be balanced by querying
-        // the ShardsNS::collections collection
-        //
-
-        auto_ptr<DBClientCursor> cursor = conn.query(CollectionType::ConfigNS, BSONObj());
-
-        if ( NULL == cursor.get() ) {
-            warning() << "could not query " << CollectionType::ConfigNS
-                      << " while trying to balance" << endl;
+        vector<CollectionType> collections;
+        Status collsStatus = grid.catalogManager()->getCollections(nullptr, &collections);
+        if (!collsStatus.isOK()) {
+            warning() << "Failed to retrieve the set of collections during balancing round "
+                      << collsStatus;
             return;
         }
 
-        vector< string > collections;
-        while ( cursor->more() ) {
-            BSONObj col = cursor->nextSafe();
-
-            // sharded collections will have a shard "key".
-            if ( ! col[CollectionType::keyPattern()].eoo() &&
-                 ! col[CollectionType::noBalance()].trueValue() ){
-                collections.push_back( col[CollectionType::ns()].String() );
-            }
-            else if( col[CollectionType::noBalance()].trueValue() ){
-                LOG(1) << "not balancing collection " << col[CollectionType::ns()].String()
-                       << ", explicitly disabled" << endl;
-            }
-
-        }
-        cursor.reset();
-
-        if ( collections.empty() ) {
-            LOG(1) << "no collections to balance" << endl;
+        if (collections.empty()) {
+            LOG(1) << "no collections to balance";
             return;
         }
 
-        //
-        // 2. Get a list of all the shards that are participating in this balance round
-        // along with any maximum allowed quotas and current utilization. We get the
-        // latter by issuing db.serverStatus() (mem.mapped) to all shards.
+        // Get a list of all the shards that are participating in this balance round along with any
+        // maximum allowed quotas and current utilization. We get the latter by issuing
+        // db.serverStatus() (mem.mapped) to all shards.
         //
         // TODO: skip unresponsive shards and mark information as stale.
-        //
-
         ShardInfoMap shardInfo;
         Status loadStatus = DistributionStatus::populateShardInfoMap(&shardInfo);
-
         if (!loadStatus.isOK()) {
             warning() << "failed to load shard metadata" << causedBy(loadStatus);
             return;
@@ -403,16 +327,20 @@ namespace mongo {
         
         OCCASIONALLY warnOnMultiVersion( shardInfo );
 
-        //
-        // 3. For each collection, check if the balancing policy recommends moving anything around.
-        //
+        // For each collection, check if the balancing policy recommends moving anything around.
+        for (const auto& coll : collections) {
+            // Skip collections for which balancing is disabled
+            const string& ns = coll.getNs();
 
-        for (vector<string>::const_iterator it = collections.begin(); it != collections.end(); ++it ) {
-            const string& ns = *it;
+            if (!coll.getAllowBalance()) {
+                LOG(1) << "Not balancing collection " << ns << "; explicitly disabled.";
+                continue;
+            }
 
             OwnedPointerMap<string, OwnedPointerVector<ChunkType> > shardToChunksMap;
-            cursor = conn.query(ChunkType::ConfigNS,
-                                QUERY(ChunkType::ns(ns)).sort(ChunkType::min()));
+            auto_ptr<DBClientCursor> cursor =
+                                    conn.query(ChunkType::ConfigNS,
+                                               QUERY(ChunkType::ns(ns)).sort(ChunkType::min()));
 
             set<BSONObj> allChunkMinimums;
 
@@ -425,8 +353,8 @@ namespace mongo {
                             << ": " << chunkRes.getStatus().reason();
                     return;
                 }
-                auto_ptr<ChunkType> chunk(new ChunkType());
-                chunkRes.getValue().cloneTo(chunk.get());
+
+                auto_ptr<ChunkType> chunk(new ChunkType(chunkRes.getValue()));
 
                 allChunkMinimums.insert(chunk->getMin().getOwned());
                 OwnedPointerVector<ChunkType>*& chunkList =
@@ -523,13 +451,15 @@ namespace mongo {
                 break;
             }
 
-            if ( didAnySplits ) {
+            if (didAnySplits) {
                 // state change, just wait till next round
                 continue;
             }
 
-            CandidateChunk* p = _policy->balance( ns, status, _balancedLastTime );
-            if ( p ) candidateChunks->push_back( CandidateChunkPtr( p ) );
+            CandidateChunk* p = _policy->balance(ns, status, _balancedLastTime);
+            if (p) {
+                candidateChunks->push_back(CandidateChunkPtr(p));
+            }
         }
     }
 
@@ -566,6 +496,7 @@ namespace mongo {
 
     void Balancer::run() {
 
+        Client::initThread("Balancer");
         // this is the body of a BackgroundJob so if we throw here we're basically ending the balancer thread prematurely
         while ( ! inShutdown() ) {
 
@@ -607,18 +538,19 @@ namespace mongo {
                 // refresh chunk size (even though another balancer might be active)
                 Chunk::refreshChunkSize();
 
-                SettingsType balancerConfig;
-                string errMsg;
-
-                if (!grid.getBalancerSettings(&balancerConfig, &errMsg)) {
-                    warning() << errMsg;
-                    return ;
+                auto balSettingsResult =
+                    grid.catalogManager()->getGlobalSettings(SettingsType::BalancerDocKey);
+                const bool isBalSettingsAbsent =
+                    balSettingsResult.getStatus() == ErrorCodes::NoSuchKey;
+                if (!balSettingsResult.isOK() && !isBalSettingsAbsent) {
+                    warning() << balSettingsResult.getStatus();
+                    return;
                 }
+                const SettingsType& balancerConfig = balSettingsResult.getValue();
 
                 // now make sure we should even be running
-                if ((balancerConfig.isKeySet() && // balancer config doc exists
-                        !grid.shouldBalance(balancerConfig)) ||
-                        MONGO_FAIL_POINT(skipBalanceRound)) {
+                if ((!isBalSettingsAbsent && !grid.shouldBalance(balancerConfig)) ||
+                    MONGO_FAIL_POINT(skipBalanceRound)) {
 
                     LOG(1) << "skipping balancing round because balancing is disabled" << endl;
 
@@ -634,12 +566,12 @@ namespace mongo {
                 uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
 
                 {
-                    ScopedDistributedLock balancerLock(config, "balancer");
-                    balancerLock.setLockMessage("doing balance round");
+                    auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                            "balancer", "doing balance round");
 
-                    Status lockStatus = balancerLock.tryAcquire();
-                    if (!lockStatus.isOK()) {
-                        LOG(1) << "skipping balancing round" << causedBy(lockStatus);
+                    if (!scopedDistLock.isOK()) {
+                        LOG(1) << "skipping balancing round"
+                               << causedBy(scopedDistLock.getStatus());
 
                         // Ping again so scripts can determine if we're active without waiting
                         _ping( true );
@@ -650,27 +582,12 @@ namespace mongo {
                         continue;
                     }
 
-                    if ( !isConfigServerConsistent() ) {
-                        conn.done();
-                        warning() << "Skipping balancing round because data inconsistency"
-                                  << " was detected amongst the config servers." << endl;
-                        sleepsecs( sleepTime );
-                        continue;
-                    }
-
                     const bool waitForDelete = (balancerConfig.isWaitForDeleteSet() ?
                             balancerConfig.getWaitForDelete() : false);
 
-                    scoped_ptr<WriteConcernOptions> writeConcern;
+                    std::unique_ptr<WriteConcernOptions> writeConcern;
                     if (balancerConfig.isKeySet()) { // if balancer doc exists.
-                        StatusWith<WriteConcernOptions*> extractStatus =
-                                balancerConfig.extractWriteConcern();
-                        if (extractStatus.isOK()) {
-                            writeConcern.reset(extractStatus.getValue());
-                        }
-                        else {
-                            warning() << extractStatus.getStatus().toString();
-                        }
+                        writeConcern = std::move(balancerConfig.getWriteConcern());
                     }
 
                     LOG(1) << "*** start balancing round. "
@@ -693,8 +610,9 @@ namespace mongo {
 
                     actionLog.setDetails( _buildDetails( false, balanceRoundTimer.millis(),
                         static_cast<int>(candidateChunks.size()), _balancedLastTime, "") );
+                    actionLog.setTime(jsTime());
 
-                    _reportRound( actionLog );
+                    grid.catalogManager()->logAction(actionLog);
 
                     LOG(1) << "*** end of balancing round" << endl;
                 }
@@ -715,8 +633,9 @@ namespace mongo {
                 // This round failed, tell the world!
                 actionLog.setDetails( _buildDetails( true, balanceRoundTimer.millis(),
                     0, 0, e.what()) );
+                actionLog.setTime(jsTime());
 
-                _reportRound( actionLog );
+                grid.catalogManager()->logAction(actionLog);
 
                 sleepsecs( sleepTime ); // sleep a fair amount b/c of error
                 continue;

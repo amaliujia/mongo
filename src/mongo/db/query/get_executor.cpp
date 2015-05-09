@@ -51,6 +51,7 @@
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
 #include "mongo/db/index_names.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/canonical_query.h"
@@ -70,9 +71,11 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/db/storage/oplog_hack.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -150,16 +153,19 @@ namespace mongo {
                                                         desc->isSparse(),
                                                         desc->unique(),
                                                         desc->indexName(),
+                                                        ice->getFilterExpression(),
                                                         desc->infoObj()));
         }
 
         // If query supports index filters, filter params.indices by indices in query settings.
         QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
         AllowedIndices* allowedIndicesRaw;
+        PlanCacheKey planCacheKey =
+            collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
 
         // Filter index catalog if index filters are specified for query.
         // Also, signal to planner that application hint should be ignored.
-        if (querySettings->getAllowedIndices(*canonicalQuery, &allowedIndicesRaw)) {
+        if (querySettings->getAllowedIndices(planCacheKey, &allowedIndicesRaw)) {
             boost::scoped_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
             filterAllowedIndexEntries(*allowedIndices, &plannerParams->indices);
             plannerParams->indexFiltersApplied = true;
@@ -314,13 +320,11 @@ namespace mongo {
                 collection->infoCache()->getPlanCache()->get(*canonicalQuery, &rawCS).isOK()) {
                 // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
                 boost::scoped_ptr<CachedSolution> cs(rawCS);
-                QuerySolution *qs, *backupQs;
+                QuerySolution *qs;
                 Status status = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs,
-                                                            &qs, &backupQs);
+                                                            &qs);
 
                 if (status.isOK()) {
-                    PlanStage *backupRoot = NULL;
-                    // The working set is shared by the root and backupRoot plans.
                     verify(StageBuilder::build(opCtx, collection, *qs, ws, rootOut));
                     if ((plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT)
                         && turnIxscanIntoCount(qs)) {
@@ -328,15 +332,21 @@ namespace mongo {
                         LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
                                << ", planSummary: " << Explain::getPlanSummary(*rootOut);
                     }
-                    else if (NULL != backupQs) {
-                        verify(StageBuilder::build(opCtx, collection, *backupQs, ws, &backupRoot));
-                    }
 
-                    // Add a CachedPlanStage on top of the previous root. Takes ownership of
-                    // '*rootOut', 'backupRoot', 'qs', and 'backupQs'.
-                    *rootOut = new CachedPlanStage(collection, canonicalQuery,
-                                                   *rootOut, qs,
-                                                   backupRoot, backupQs);
+                    // Add a CachedPlanStage on top of the previous root.
+                    //
+                    // 'decisionWorks' is used to determine whether the existing cache entry should
+                    // be evicted, and the query replanned.
+                    //
+                    // Takes ownership of '*rootOut'.
+                    *rootOut = new CachedPlanStage(opCtx,
+                                                   collection,
+                                                   ws,
+                                                   canonicalQuery,
+                                                   plannerParams,
+                                                   cs->decisionWorks,
+                                                   *rootOut);
+                    *querySolutionOut = qs;
                     return Status::OK();
                 }
             }
@@ -631,6 +641,47 @@ namespace {
         return getExecutor(txn, collection, cq.release(), PlanExecutor::YIELD_AUTO, out, options);
     }
 
+namespace {
+
+    /**
+     * Wrap the specified 'root' plan stage in a ProjectionStage. Does not take ownership of any
+     * arguments other than root.
+     *
+     * If the projection was valid, then return Status::OK() with a pointer to the newly created
+     * ProjectionStage. Otherwise, return a status indicating the error reason.
+     */
+    StatusWith<std::unique_ptr<PlanStage>> applyProjection(OperationContext* txn,
+                                                           const NamespaceString& nsString,
+                                                           CanonicalQuery* cq,
+                                                           const BSONObj& proj,
+                                                           bool allowPositional,
+                                                           WorkingSet* ws,
+                                                           std::unique_ptr<PlanStage> root) {
+        invariant(!proj.isEmpty());
+
+        ParsedProjection* rawParsedProj;
+        Status ppStatus = ParsedProjection::make(proj.getOwned(), cq->root(), &rawParsedProj);
+        if (!ppStatus.isOK()) {
+            return ppStatus;
+        }
+        std::unique_ptr<ParsedProjection> pp(rawParsedProj);
+
+        // ProjectionExec requires the MatchDetails from the query expression when the projection
+        // uses the positional operator. Since the query may no longer match the newly-updated
+        // document, we forbid this case.
+        if (!allowPositional && pp->requiresMatchDetails()) {
+            return {ErrorCodes::BadValue,
+                    "cannot use a positional projection and return the new document"};
+        }
+
+        ProjectionStageParams params(WhereCallbackReal(txn, nsString.db()));
+        params.projObj = proj;
+        params.fullExpression = cq->root();
+        return {stdx::make_unique<ProjectionStage>(params, ws, root.release())};
+    }
+
+}  // namespace
+
     //
     // Delete
     //
@@ -671,6 +722,7 @@ namespace {
         deleteStageParams.isMulti = request->isMulti();
         deleteStageParams.fromMigrate = request->isFromMigrate();
         deleteStageParams.isExplain = request->isExplain();
+        deleteStageParams.returnDeleted = request->shouldReturnDeleted();
 
         auto_ptr<WorkingSet> ws(new WorkingSet());
         PlanExecutor::YieldPolicy policy = parsedDelete->canYield() ? PlanExecutor::YIELD_AUTO :
@@ -694,8 +746,9 @@ namespace {
 
             }
 
-            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
-                collection->getIndexCatalog()->findIdIndex(txn)) {
+            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery)
+                    && collection->getIndexCatalog()->findIdIndex(txn)
+                    && request->getProj().isEmpty()) {
                 LOG(2) << "Using idhack: " << unparsedQuery.toString();
 
                 PlanStage* idHackStage = new IDHackStage(txn,
@@ -718,22 +771,48 @@ namespace {
         // This is the regular path for when we have a CanonicalQuery.
         std::auto_ptr<CanonicalQuery> cq(parsedDelete->releaseParsedQuery());
 
-        PlanStage* root;
-        QuerySolution* querySolution;
+        PlanStage* rawRoot;
+        QuerySolution* rawQuerySolution;
         const size_t defaultPlannerOptions = 0;
         Status status = prepareExecution(txn, collection, ws.get(), cq.get(),
-                                         defaultPlannerOptions, &root, &querySolution);
+                                         defaultPlannerOptions, &rawRoot, &rawQuerySolution);
         if (!status.isOK()) {
             return status;
         }
-        invariant(root);
+        invariant(rawRoot);
+        std::unique_ptr<QuerySolution> querySolution(rawQuerySolution);
         deleteStageParams.canonicalQuery = cq.get();
 
-        root = new DeleteStage(txn, deleteStageParams, ws.get(), collection, root);
+        rawRoot = new DeleteStage(txn, deleteStageParams, ws.get(), collection, rawRoot);
+        std::unique_ptr<PlanStage> root(rawRoot);
+
+        if (!request->getProj().isEmpty()) {
+            invariant(request->shouldReturnDeleted());
+
+            const bool allowPositional = true;
+            StatusWith<std::unique_ptr<PlanStage>> projStatus = applyProjection(txn,
+                                                                                nss,
+                                                                                cq.get(),
+                                                                                request->getProj(),
+                                                                                allowPositional,
+                                                                                ws.get(),
+                                                                                std::move(root));
+            if (!projStatus.isOK()) {
+                return projStatus.getStatus();
+            }
+            root = std::move(projStatus.getValue());
+        }
+
         // We must have a tree of stages in order to have a valid plan executor, but the query
         // solution may be null.
-        return PlanExecutor::make(txn, ws.release(), root, querySolution, cq.release(),
-                                  collection, policy, execOut);
+        return PlanExecutor::make(txn,
+                                  ws.release(),
+                                  root.release(),
+                                  querySolution.release(),
+                                  cq.release(),
+                                  collection,
+                                  policy,
+                                  execOut);
     }
 
     //
@@ -823,8 +902,9 @@ namespace {
                                           policy, execOut);
             }
 
-            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
-                collection->getIndexCatalog()->findIdIndex(txn)) {
+            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery)
+                    && collection->getIndexCatalog()->findIdIndex(txn)
+                    && request->getProj().isEmpty()) {
 
                 LOG(2) << "Using idhack: " << unparsedQuery.toString();
 
@@ -848,24 +928,47 @@ namespace {
         // This is the regular path for when we have a CanonicalQuery.
         std::auto_ptr<CanonicalQuery> cq(parsedUpdate->releaseParsedQuery());
 
-        PlanStage* root;
-        QuerySolution* querySolution;
+        PlanStage* rawRoot;
+        QuerySolution* rawQuerySolution;
         const size_t defaultPlannerOptions = 0;
         Status status = prepareExecution(txn, collection, ws.get(), cq.get(),
-                                         defaultPlannerOptions, &root, &querySolution);
+                                         defaultPlannerOptions, &rawRoot, &rawQuerySolution);
         if (!status.isOK()) {
             return status;
         }
-        invariant(root);
+        invariant(rawRoot);
+        std::unique_ptr<QuerySolution> querySolution(rawQuerySolution);
         updateStageParams.canonicalQuery = cq.get();
 
-        root = new UpdateStage(txn, updateStageParams, ws.get(), collection, root);
+        rawRoot = new UpdateStage(txn, updateStageParams, ws.get(), collection, rawRoot);
+        std::unique_ptr<PlanStage> root(rawRoot);
+
+        if (!request->getProj().isEmpty()) {
+            invariant(request->shouldReturnAnyDocs());
+
+            // If the plan stage is to return the newly-updated version of the documents, then it
+            // is invalid to use a positional projection because the query expression need not
+            // match the array element after the update has been applied.
+            const bool allowPositional = request->shouldReturnOldDocs();
+            StatusWith<std::unique_ptr<PlanStage>> projStatus = applyProjection(txn,
+                                                                                nsString,
+                                                                                cq.get(),
+                                                                                request->getProj(),
+                                                                                allowPositional,
+                                                                                ws.get(),
+                                                                                std::move(root));
+            if (!projStatus.isOK()) {
+                return projStatus.getStatus();
+            }
+            root = std::move(projStatus.getValue());
+        }
+
         // We must have a tree of stages in order to have a valid plan executor, but the query
         // solution may be null. Takes ownership of all args other than 'collection' and 'txn'
         return PlanExecutor::make(txn,
                                   ws.release(),
-                                  root,
-                                  querySolution,
+                                  root.release(),
+                                  querySolution.release(),
                                   cq.release(),
                                   collection,
                                   policy,
@@ -1263,6 +1366,7 @@ namespace {
         QueryPlannerParams plannerParams;
         plannerParams.options = QueryPlannerParams::NO_TABLE_SCAN;
 
+        // TODO Need to check if query is compatible with any partial indexes.  SERVER-17854.
         IndexCatalog::IndexIterator ii = collection->getIndexCatalog()->getIndexIterator(txn,false);
         while (ii.more()) {
             const IndexDescriptor* desc = ii.next();
@@ -1275,6 +1379,7 @@ namespace {
                                                            desc->isSparse(),
                                                            desc->unique(),
                                                            desc->indexName(),
+                                                           NULL,
                                                            desc->infoObj()));
             }
         }

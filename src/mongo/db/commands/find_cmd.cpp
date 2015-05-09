@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
@@ -85,7 +86,7 @@ namespace mongo {
         Status checkAuthForCommand(ClientBasic* client,
                                    const std::string& dbname,
                                    const BSONObj& cmdObj) override {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
             if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::find)) {
@@ -174,8 +175,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) override {
+                 BSONObjBuilder& result) override {
             const std::string fullns = parseNs(dbname, cmdObj);
             const NamespaceString nss(fullns);
 
@@ -264,7 +264,7 @@ namespace mongo {
                 const CursorId cursorId = 0;
                 endQueryOp(execHolder.get(), dbProfilingLevel, numResults, cursorId,
                            txn->getCurOp());
-                Command::appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
+                appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
                 return true;
             }
 
@@ -347,7 +347,7 @@ namespace mongo {
             endQueryOp(exec, dbProfilingLevel, numResults, cursorId, txn->getCurOp());
 
             // 7) Generate the response object to send to the client.
-            Command::appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);
+            appendCursorResponseObject(cursorId, nss.ns(), firstBatch.arr(), &result);
             if (cursorId) {
                 cursorFreer.Dismiss();
             }

@@ -38,9 +38,6 @@
 
 namespace mongo {
 
-    class AuthenticationInfo;
-    class AuthenticationSession;
-    class AuthorizationSession;
     class ServiceContext;
 
     /**
@@ -53,15 +50,6 @@ namespace mongo {
     class ClientBasic : public Decorable<ClientBasic> {
         MONGO_DISALLOW_COPYING(ClientBasic);
     public:
-        virtual ~ClientBasic();
-        AuthenticationSession* getAuthenticationSession();
-        void resetAuthenticationSession(AuthenticationSession* newSession);
-        void swapAuthenticationSession(boost::scoped_ptr<AuthenticationSession>& other);
-
-        bool hasAuthorizationSession() const;
-        AuthorizationSession* getAuthorizationSession() const;
-        void setAuthorizationSession(std::unique_ptr<AuthorizationSession> authorizationSession);
-
         bool getIsLocalHostConnection() {
             if (!hasRemote()) {
                 return false;
@@ -69,8 +57,8 @@ namespace mongo {
             return getRemote().isLocalHost();
         }
 
-        virtual bool hasRemote() const { return _messagingPort; }
-        virtual HostAndPort getRemote() const {
+        bool hasRemote() const { return _messagingPort; }
+        HostAndPort getRemote() const {
             verify( _messagingPort );
             return _messagingPort->remote();
         }
@@ -89,10 +77,9 @@ namespace mongo {
 
     protected:
         ClientBasic(ServiceContext* serviceContext, AbstractMessagingPort* messagingPort);
+        ~ClientBasic();
 
     private:
-        boost::scoped_ptr<AuthenticationSession> _authenticationSession;
-        std::unique_ptr<AuthorizationSession> _authorizationSession;
         ServiceContext* const _serviceContext;
         AbstractMessagingPort* const _messagingPort;
     };

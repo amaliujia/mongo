@@ -171,8 +171,6 @@ namespace mongo {
                 break;
 
             case IndexBoundsChecker::DONE:
-                // This seems weird but it's the old definition of nscanned.
-                --_specificStats.keysExamined;
                 kv = boost::none;
                 break;
 
@@ -308,11 +306,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* IndexScan::getCommonStats() {
+    const CommonStats* IndexScan::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* IndexScan::getSpecificStats() {
+    const SpecificStats* IndexScan::getSpecificStats() const {
         return &_specificStats;
     }
 

@@ -31,13 +31,15 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/s/balancer_policy.h"
+
 #include <algorithm>
 
 #include "mongo/client/connpool.h"
-#include "mongo/s/balancer_policy.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/config.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/type_tags.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
@@ -243,19 +245,13 @@ namespace mongo {
 
     Status DistributionStatus::populateShardInfoMap(ShardInfoMap* shardInfo) {
         try {
-            ScopedDbConnection conn(configServer.getPrimary().getConnString(), 30);
+            vector<ShardType> shards;
+            Status status = grid.catalogManager()->getAllShards(&shards);
+            if (!status.isOK()) {
+                return status;
+            }
 
-            auto_ptr<DBClientCursor> cursor(conn->query(ShardType::ConfigNS , Query()));
-            uassert(28597, "Failed to load shard config", cursor.get() != NULL);
-
-            while (cursor->more()) {
-                StatusWith<ShardType> shardRes = ShardType::fromBSON(cursor->next());
-
-                if (!shardRes.isOK()) {
-                    return shardRes.getStatus();
-                }
-                ShardType shard = shardRes.getValue();
-
+            for (const ShardType& shard : shards) {
                 std::set<std::string> dummy;
                 ShardInfo newShardEntry(shard.getMaxSize(),
                                         Shard::getShardDataSizeBytes(shard.getHost()) /
@@ -273,8 +269,6 @@ namespace mongo {
 
                 shardInfo->insert(make_pair(shard.getName(), newShardEntry));
             }
-
-            conn.done();
         }
         catch (const DBException& ex) {
             return ex.toStatus();
@@ -378,7 +372,7 @@ namespace mongo {
                 // since we have to move all chunks, lets just do in order
                 for ( unsigned i=0; i<chunks.size(); i++ ) {
                     const ChunkType& chunkToMove = *chunks[i];
-                    if (chunkToMove.isJumboSet() && chunkToMove.getJumbo()) {
+                    if (chunkToMove.getJumbo()) {
                         numJumboChunks++;
                         continue;
                     }
@@ -430,7 +424,7 @@ namespace mongo {
                           << " is not on a shard with the right tag: "
                           << tag << endl;
 
-                    if (chunk.isJumboSet() && chunk.getJumbo()) {
+                    if (chunk.getJumbo()) {
                         warning() << "chunk " << chunk << " is jumbo, so cannot be moved" << endl;
                         continue;
                     }
@@ -503,7 +497,7 @@ namespace mongo {
                 if (distribution.getTagForChunk(chunk) != tag)
                     continue;
 
-                if (chunk.isJumboSet() && chunk.getJumbo()) {
+                if (chunk.getJumbo()) {
                     numJumboChunks++;
                     continue;
                 }

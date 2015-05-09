@@ -35,9 +35,10 @@
 #include "mongo/s/request.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/s/client_info.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
@@ -51,7 +52,7 @@ namespace mongo {
     using std::string;
 
     Request::Request(Message& m, AbstractMessagingPort* p)
-        : _clientInfo(ClientInfo::get()),
+        : _clientInfo(&cc()),
           _m(m),
           _d(m),
           _p(p),
@@ -67,6 +68,7 @@ namespace mongo {
         }
 
         _m.header().setId(_id);
+        LastError::get(_clientInfo).startRequest();
         ClusterLastErrorInfo::get(_clientInfo).clearRequestInfo();
 
         if (_d.messageShouldHaveNs()) {
@@ -81,7 +83,7 @@ namespace mongo {
                     nss.isValid());
         }
 
-        _clientInfo->getAuthorizationSession()->startRequest(NULL);
+        AuthorizationSession::get(_clientInfo)->startRequest(NULL);
         _didInit = true;
     }
 

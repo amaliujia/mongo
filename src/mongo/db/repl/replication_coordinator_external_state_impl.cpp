@@ -42,6 +42,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/jsobj.h"
@@ -53,6 +54,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/s/d_state.h"
 #include "mongo/stdx/functional.h"
@@ -68,6 +70,8 @@ namespace repl {
 namespace {
     const char configCollectionName[] = "local.system.replset";
     const char configDatabaseName[] = "local";
+    const char lastVoteCollectionName[] = "local.replset.election";
+    const char lastVoteDatabaseName[] = "local";
     const char meCollectionName[] = "local.me";
     const char meDatabaseName[] = "local";
     const char tsFieldName[] = "ts";
@@ -113,12 +117,14 @@ namespace {
     void ReplicationCoordinatorExternalStateImpl::initiateOplog(OperationContext* txn) {
         createOplog(txn);
 
-        ScopedTransaction scopedXact(txn, MODE_X);
-        Lock::GlobalWrite globalWrite(txn->lockState());
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            ScopedTransaction scopedXact(txn, MODE_X);
+            Lock::GlobalWrite globalWrite(txn->lockState());
 
-        WriteUnitOfWork wuow(txn);
-        getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSON("msg" << "initiating set"));
-        wuow.commit();
+            WriteUnitOfWork wuow(txn);
+            getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSON("msg" << "initiating set"));
+            wuow.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "initiate oplog entry", "local.oplog.rs");
     }
 
     void ReplicationCoordinatorExternalStateImpl::forwardSlaveProgress() {
@@ -134,6 +140,7 @@ namespace {
 
             BSONObj me;
             // local.me is an identifier for a server for getLastError w:2+
+            // TODO: handle WriteConflictExceptions below
             if (!Helpers::getSingleton(txn, meCollectionName, me) ||
                     !me.hasField("host") ||
                     me["host"].String() != myname) {
@@ -158,14 +165,18 @@ namespace {
     StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocument(
             OperationContext* txn) {
         try {
-            BSONObj config;
-            if (!Helpers::getSingleton(txn, configCollectionName, config)) {
-                return StatusWith<BSONObj>(
-                        ErrorCodes::NoMatchingDocument,
-                        str::stream() << "Did not find replica set configuration document in " <<
-                        configCollectionName);
-            }
-            return StatusWith<BSONObj>(config);
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                BSONObj config;
+                if (!Helpers::getSingleton(txn, configCollectionName, config)) {
+                    return StatusWith<BSONObj>(
+                            ErrorCodes::NoMatchingDocument,
+                            str::stream() << "Did not find replica set configuration document in "
+                                          << configCollectionName);
+                }
+                return StatusWith<BSONObj>(config);
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "load replica set config",
+                                                  configCollectionName);
         }
         catch (const DBException& ex) {
             return StatusWith<BSONObj>(ex.toStatus());
@@ -176,14 +187,62 @@ namespace {
             OperationContext* txn,
             const BSONObj& config) {
         try {
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock dbWriteLock(txn->lockState(), configDatabaseName, MODE_X);
-            Helpers::putSingleton(txn, configCollectionName, config);
-            return Status::OK();
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock dbWriteLock(txn->lockState(), configDatabaseName, MODE_X);
+                Helpers::putSingleton(txn, configCollectionName, config);
+                return Status::OK();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "save replica set config",
+                                                  configCollectionName);
         }
         catch (const DBException& ex) {
             return ex.toStatus();
         }
+
+    }
+
+    StatusWith<LastVote> ReplicationCoordinatorExternalStateImpl::loadLocalLastVoteDocument(
+            OperationContext* txn) {
+        try {
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                BSONObj lastVoteObj;
+                if (!Helpers::getSingleton(txn, lastVoteCollectionName, lastVoteObj)) {
+                    return StatusWith<LastVote>(
+                            ErrorCodes::NoMatchingDocument,
+                            str::stream() << "Did not find replica set lastVote document in "
+                                          << lastVoteCollectionName);
+                }
+                LastVote lastVote;
+                lastVote.initialize(lastVoteObj);
+                return StatusWith<LastVote>(lastVote);
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "load replica set lastVote",
+                                                  lastVoteCollectionName);
+        }
+        catch (const DBException& ex) {
+            return StatusWith<LastVote>(ex.toStatus());
+        }
+    }
+
+    Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
+            OperationContext* txn,
+            const LastVote& lastVote) {
+        BSONObj lastVoteObj = lastVote.toBSON();
+        try {
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock dbWriteLock(txn->lockState(), lastVoteDatabaseName, MODE_X);
+                Helpers::putSingleton(txn, lastVoteCollectionName, lastVoteObj);
+                return Status::OK();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                  "save replica set lastVote",
+                                                  lastVoteCollectionName);
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
     }
 
     void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(const Timestamp& newTime) {
@@ -193,6 +252,7 @@ namespace {
     StatusWith<Timestamp> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
             OperationContext* txn) {
 
+        // TODO: handle WriteConflictExceptions below
         try {
             BSONObj oplogEntry;
             if (!Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry)) {

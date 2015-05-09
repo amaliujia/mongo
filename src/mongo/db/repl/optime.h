@@ -36,6 +36,12 @@
 namespace mongo {
 namespace repl {
 
+    /**
+     * OpTime encompasses a Timestamp (which itself is composed of two 32-bit integers, which can
+     * represent a time_t and a counter), and a 64-bit Term number.  OpTime can be used to
+     * label every op in an oplog with a unique identifier.
+     */
+
     class OpTime {
     public:
         OpTime() = default;
@@ -49,35 +55,35 @@ namespace repl {
             return _term;
         }
 
+        inline bool operator==(const OpTime& rhs) {
+            return std::tie(_term, _timestamp) == std::tie(rhs._term, rhs._timestamp);
+        }
+
+        inline bool operator<(const OpTime& rhs) {
+            // Compare term first, then the opTimes.
+            return std::tie(_term, _timestamp) < std::tie(rhs._term, rhs._timestamp);
+        }
+
+        inline bool operator!=(const OpTime& rhs) {
+            return !(*this == rhs);
+        }
+
+        inline bool operator<=(const OpTime& rhs) {
+            return *this < rhs || *this == rhs;
+        }
+
+        inline bool operator>(const OpTime& rhs) {
+            return !(*this <= rhs);
+        }
+
+        inline bool operator>=(const OpTime& rhs) {
+            return !(*this < rhs);
+        }
+
     private:
         Timestamp _timestamp;
         long long _term = -1;
     };
-
-    inline bool operator==(const OpTime& lhs, const OpTime& rhs) {
-        return std::tie(lhs.opTime, lhs.term) == std::tie(rhs.opTime, rhs.term);
-    }
-
-    inline bool operator<(const OpTime& lhs, const OpTime& rhs) {
-        // Compare term first, then the opTimes.
-        return std::tie(lhs.term, lhs.opTime) < std::tie(rhs.term, rhs.opTime);
-    }
-
-    inline bool operator!=(const OpTime& lhs, const OpTime& rhs) {
-        return !(lhs == rhs);
-    }
-
-    inline bool operator<=(const OpTime& lhs, const OpTime& rhs) {
-        return lhs < rhs || lhs == rhs;
-    }
-
-    inline bool operator>(const OpTime& lhs, const OpTime& rhs) {
-        return !(lhs <= rhs);
-    }
-
-    inline bool operator>=(const OpTime& lhs, const OpTime& rhs) {
-        return !(lhs < rhs);
-    }
 
 } // namespace repl
 } // namespace mongo

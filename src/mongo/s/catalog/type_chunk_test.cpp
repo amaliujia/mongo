@@ -32,7 +32,6 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/time_support.h"
 
@@ -42,7 +41,7 @@ namespace {
 
     using std::string;
 
-    TEST(Validity, MissingRequiredFields) {
+    TEST(ChunkType, MissingRequiredFields) {
         ChunkType chunk;
         BSONArray version = BSON_ARRAY(Date_t(1) << OID::gen());
 
@@ -78,7 +77,7 @@ namespace {
         ASSERT_FALSE(chunkRes.isOK());
     }
 
-    TEST(MinMaxValidity, DifferentNumberOfColumns) {
+    TEST(ChunkType, DifferentNumberOfColumns) {
         BSONArray version = BSON_ARRAY(Date_t(1) << OID::gen());
         BSONObj obj = BSON(ChunkType::name("test.mycol-a_MinKey") <<
                            ChunkType::ns("test.mycol") <<
@@ -91,7 +90,7 @@ namespace {
         ASSERT_FALSE(chunkRes.getValue().validate().isOK());
     }
 
-    TEST(MinMaxValidity, DifferentColumns) {
+    TEST(ChunkType, DifferentColumns) {
         BSONArray version = BSON_ARRAY(Date_t(1) << OID::gen());
         BSONObj obj = BSON(ChunkType::name("test.mycol-a_MinKey") <<
                            ChunkType::ns("test.mycol") <<
@@ -104,7 +103,7 @@ namespace {
         ASSERT_FALSE(chunkRes.getValue().validate().isOK());
     }
 
-    TEST(MinMaxValidity, NotAscending) {
+    TEST(ChunkType, NotAscending) {
         BSONArray version = BSON_ARRAY(Date_t(1) << OID::gen());
         BSONObj obj = BSON(ChunkType::name("test.mycol-a_MinKey") <<
                            ChunkType::ns("test.mycol") <<
@@ -117,7 +116,7 @@ namespace {
         ASSERT_FALSE(chunkRes.getValue().validate().isOK());
     }
 
-    TEST(Compatibility, NewFormatVersion) {
+    TEST(ChunkType, NewFormatVersion) {
         ChunkType chunk;
         OID epoch = OID::gen();
         BSONArray version = BSON_ARRAY(Date_t(1) << epoch);
@@ -142,7 +141,7 @@ namespace {
         ASSERT_TRUE(chunk.validate().isOK());
     }
 
-    TEST(Compatibility, OldFormatVersion) {
+    TEST(ChunkType, OldFormatVersion) {
         ChunkType chunk;
         OID epoch = OID::gen();
         BSONObj obj = BSON(ChunkType::name("test.mycol-a_MinKey") <<
@@ -167,7 +166,7 @@ namespace {
         ASSERT_TRUE(chunk.validate().isOK());
     }
 
-    TEST(Validity, BadType) {
+    TEST(ChunkType, BadType) {
         BSONObj obj = BSON(ChunkType::name() << 0);
         StatusWith<ChunkType> chunkRes = ChunkType::fromBSON(obj);
         ASSERT_FALSE(chunkRes.isOK());

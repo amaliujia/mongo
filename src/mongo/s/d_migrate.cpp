@@ -53,6 +53,7 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -81,9 +82,9 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/distlock.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
@@ -491,9 +492,9 @@ namespace mongo {
             // Therefore, any multi-key index prefixed by shard key cannot be multikey over
             // the shard key fields.
             IndexDescriptor *idx =
-                collection->getIndexCatalog()->findIndexByPrefix(txn,
-                                                                 _shardKeyPattern ,
-                                                                 false);  /* allow multi key */
+                collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn,
+                                                                         _shardKeyPattern ,
+                                                                         false); // requireSingleKey
 
             if (idx == NULL) {
                 errmsg = str::stream() << "can't find index with prefix " << _shardKeyPattern
@@ -815,11 +816,11 @@ namespace mongo {
                 invariant( false );
                 return NULL;
             }
-            virtual CommonStats* getCommonStats() {
+            virtual CommonStats* getCommonStats() const {
                 invariant( false );
                 return NULL;
             }
-            virtual SpecificStats* getSpecificStats() {
+            virtual SpecificStats* getSpecificStats() const {
                 invariant( false );
                 return NULL;
             }
@@ -931,7 +932,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             return migrateFromStatus.transferMods(txn, errmsg, result);
         }
     } transferModsCommand;
@@ -948,7 +954,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             return migrateFromStatus.clone(txn, errmsg, result);
         }
     } initialCloneCommand;
@@ -977,7 +988,6 @@ namespace mongo {
      *   min: {},
      *   max: {},
      *   maxChunkBytes: numeric,
-     *   shardId: "_id of chunk document in config.chunks",
      *   configdb: "hostAndPort",
      *
      *   // optional
@@ -998,7 +1008,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::moveChunk)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -1009,7 +1019,12 @@ namespace mongo {
             return parseNsFullyQualified(dbname, cmdObj);
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             // 1. Parse options
             // 2. Make sure my view is complete and lock the distributed lock to ensure shard
             //    metadata stability.
@@ -1089,7 +1104,6 @@ namespace mongo {
 
             BSONObj min  = cmdObj["min"].Obj();
             BSONObj max  = cmdObj["max"].Obj();
-            BSONElement shardId = cmdObj["shardId"];
             BSONElement maxSizeElem = cmdObj["maxChunkSizeBytes"];
 
             if ( ns.empty() ) {
@@ -1113,11 +1127,6 @@ namespace mongo {
 
             if ( max.isEmpty() ) {
                 errmsg = "need to specify a max";
-                return false;
-            }
-
-            if ( shardId.eoo() ) {
-                errmsg = "need shardId";
                 return false;
             }
 
@@ -1176,15 +1185,15 @@ namespace mongo {
             // Get the distributed lock
             //
 
-            ScopedDistributedLock collLock(configLoc, ns);
-            collLock.setLockMessage(str::stream() << "migrating chunk [" << minKey << ", " << maxKey
-                                                  << ") in " << ns);
+            string whyMessage(str::stream() << "migrating chunk [" << minKey << ", " << maxKey
+                                            << ") in " << ns);
+            auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                    ns, whyMessage);
 
-            Status acquisitionStatus = collLock.tryAcquire();
-            if (!acquisitionStatus.isOK()) {
+            if (!scopedDistLock.isOK()) {
                 errmsg = stream() << "could not acquire collection lock for " << ns
                                   << " to migrate chunk [" << minKey << "," << maxKey << ")"
-                                  << causedBy(acquisitionStatus);
+                                  << causedBy(scopedDistLock.getStatus());
 
                 warning() << errmsg << endl;
                 return false;
@@ -1434,7 +1443,7 @@ namespace mongo {
             }
 
             // Ensure distributed lock still held
-            Status lockStatus = collLock.checkStatus();
+            Status lockStatus = scopedDistLock.getValue().checkStatus();
             if (!lockStatus.isOK()) {
                 errmsg = str::stream() << "not entering migrate critical section because "
                                        << lockStatus.toString();
@@ -1524,9 +1533,7 @@ namespace mongo {
                 // we use the 'applyOps' mechanism to group the two updates and make them safer
                 // TODO pull config update code to a module
 
-                BSONObjBuilder cmdBuilder;
-
-                BSONArrayBuilder updates( cmdBuilder.subarrayStart( "applyOps" ) );
+                BSONArrayBuilder updates;
                 {
                     // update for the chunk being moved
                     BSONObjBuilder op;
@@ -1600,9 +1607,7 @@ namespace mongo {
                     log() << "moveChunk moved last chunk out for collection '" << ns << "'" << migrateLog;
                 }
 
-                updates.done();
-
-                BSONArrayBuilder preCond( cmdBuilder.subarrayStart( "preCondition" ) );
+                BSONArrayBuilder preCond;
                 {
                     BSONObjBuilder b;
                     b.append("ns", ChunkType::ConfigNS);
@@ -1617,14 +1622,8 @@ namespace mongo {
                     preCond.append( b.obj() );
                 }
 
-                preCond.done();
-
-                BSONObj cmd = cmdBuilder.obj();
-                LOG(7) << "moveChunk update: " << cmd << migrateLog;
-
                 int exceptionCode = OkCode;
                 ok = false;
-                BSONObj cmdResult;
                 try {
                     
                     // For testing migration failures
@@ -1633,24 +1632,20 @@ namespace mongo {
                                            PrepareConfigsFailedCode );
                     }
 
-                    ScopedDbConnection conn(shardingState.getConfigServer(), 10.0);
-                    ok = conn->runCommand( "config" , cmd , cmdResult );
+                    Status status = grid.catalogManager()->applyChunkOpsDeprecated(updates.arr(),
+                                                                                   preCond.arr());
+                    ok = status.isOK();
+                    exceptionCode = status.code();
 
                     if (MONGO_FAIL_POINT(failMigrationApplyOps)) {
                         throw SocketException(SocketException::RECV_ERROR,
                                               shardingState.getConfigServer());
                     }
-
-                    conn.done();
                 }
-                catch ( DBException& e ) {
+                catch (const DBException& e) {
                     warning() << e << migrateLog;
                     ok = false;
                     exceptionCode = e.getCode();
-                    BSONObjBuilder b;
-                    e.getInfo().append( b );
-                    cmdResult = b.obj();
-                    errmsg = cmdResult.toString();
                 }
 
                 if ( exceptionCode == PrepareConfigsFailedCode ) {
@@ -1689,7 +1684,7 @@ namespace mongo {
                     // if the commit did not make it, currently the only way to fix this state is to bounce the mongod so
                     // that the old state (before migrating) be brought in
 
-                    warning() << "moveChunk commit outcome ongoing: " << cmd << " for command :" << cmdResult << migrateLog;
+                    warning() << "moveChunk commit outcome ongoing" << migrateLog;
                     sleepsecs( 10 );
 
                     try {
@@ -1942,6 +1937,8 @@ namespace mongo {
             verify( getState() == READY );
             verify( ! min.isEmpty() );
             verify( ! max.isEmpty() );
+
+            DisableDocumentValidation validationDisabler(txn);
 
             log() << "starting receiving-end of migration of chunk " << min << " -> " << max <<
                     " for collection " << ns << " from " << fromShard
@@ -2514,7 +2511,7 @@ namespace mongo {
                                 const WriteConcernOptions& writeConcern) {
             WriteConcernOptions majorityWriteConcern;
             majorityWriteConcern.wTimeout = -1;
-            majorityWriteConcern.wMode = "majority";
+            majorityWriteConcern.wMode = WriteConcernOptions::kMajority;
             Status majorityStatus = repl::getGlobalReplicationCoordinator()->awaitReplication(
                     txn, lastOpApplied, majorityWriteConcern).status;
 
@@ -2653,14 +2650,13 @@ namespace mongo {
         OperationContextImpl txn;
         if (getGlobalAuthorizationManager()->isAuthEnabled()) {
             ShardedConnectionInfo::addHook();
-            txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
+            AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
         }
 
         // Make curop active so this will show up in currOp.
         txn.getCurOp()->reset();
 
         migrateStatus.go(&txn, ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
-        cc().shutdown();
     }
 
     /**
@@ -2695,7 +2691,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             // Active state of TO-side migrations (MigrateStatus) is serialized by distributed
             // collection lock.
@@ -2850,7 +2851,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             migrateStatus.status( result );
             return 1;
         }
@@ -2868,7 +2874,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             bool ok = migrateStatus.startCommit();
             migrateStatus.status( result );
             return ok;
@@ -2887,7 +2898,12 @@ namespace mongo {
             actions.addAction(ActionType::internal);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             migrateStatus.abort();
             migrateStatus.status( result );
             return true;

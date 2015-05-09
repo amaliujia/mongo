@@ -37,7 +37,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/version_manager.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -107,8 +107,7 @@ namespace {
                          mongo::BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         mongo::BSONObjBuilder& result,
-                         bool fromRepl) {
+                         mongo::BSONObjBuilder& result) {
 
             // Base pool info
             shardConnectionPool.appendInfo(result);
@@ -283,7 +282,7 @@ namespace {
             Shard::getAllShards( all );
 
             // Don't report exceptions here as errors in GetLastError
-            LastError::Disabled ignoreForGLE(lastError.get(false));
+            LastError::Disabled ignoreForGLE(&LastError::get(cc()));
 
             // Now only check top-level shard connections
             for ( unsigned i=0; i<all.size(); i++ ) {
@@ -411,22 +410,6 @@ namespace {
     void usingAShardConnection(const string& addr);
 
 
-    ShardConnection::ShardConnection(const Shard * s, const string& ns, ChunkManagerPtr manager)
-        : _addr(s->getConnString()),
-          _ns(ns),
-          _manager(manager) {
-
-        _init();
-    }
-
-    ShardConnection::ShardConnection(const Shard& s, const string& ns, ChunkManagerPtr manager)
-        : _addr(s.getConnString()),
-          _ns(ns),
-          _manager( manager ) {
-
-        _init();
-    }
-
     ShardConnection::ShardConnection(const string& addr, const string& ns, ChunkManagerPtr manager)
         : _addr(addr),
           _ns(ns),
@@ -492,7 +475,9 @@ namespace {
 
     void ShardConnection::kill() {
         if ( _conn ) {
-            if( versionManager.isVersionableCB( _conn ) ) versionManager.resetShardVersionCB( _conn );
+            if (versionManager.isVersionableCB(_conn)) {
+                versionManager.resetShardVersionCB(_conn);
+            }
 
             if (_conn->isFailed()) {
                 // Let the pool know about the bad connection and also delegate disposal to it.

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
 #include <memory>
@@ -54,6 +53,7 @@ namespace mongo {
     class AuthorizationSession;
     class AuthzManagerExternalState;
     class OperationContext;
+    class ServiceContext;
     class UserDocumentParser;
 
     /**
@@ -70,9 +70,13 @@ namespace mongo {
     class AuthorizationManager {
         MONGO_DISALLOW_COPYING(AuthorizationManager);
     public:
+        static AuthorizationManager* get(ServiceContext* service);
+        static AuthorizationManager* get(ServiceContext& service);
+        static void set(ServiceContext* service,
+                        std::unique_ptr<AuthorizationManager> authzManager);
 
         // The newly constructed AuthorizationManager takes ownership of "externalState"
-        explicit AuthorizationManager(AuthzManagerExternalState* externalState);
+        explicit AuthorizationManager(std::unique_ptr<AuthzManagerExternalState> externalState);
 
         ~AuthorizationManager();
 
@@ -497,7 +501,7 @@ namespace mongo {
         // Protects _privilegeDocsExist
         mutable boost::mutex _privilegeDocsExistMutex;
 
-        boost::scoped_ptr<AuthzManagerExternalState> _externalState;
+        std::unique_ptr<AuthzManagerExternalState> _externalState;
 
         /**
          * Cached value of the authorization schema version.

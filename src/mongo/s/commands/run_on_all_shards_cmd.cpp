@@ -39,7 +39,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/client/parallel.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -51,7 +51,7 @@ namespace mongo {
         , _useShardConn(useShardConn)
     {}
 
-    void RunOnAllShardsCommand::aggregateResults(const std::vector<BSONObj>& results,
+    void RunOnAllShardsCommand::aggregateResults(const std::vector<ShardAndReply>& results,
                                                  BSONObjBuilder& output)
     {}
 
@@ -75,15 +75,13 @@ namespace mongo {
                                     BSONObj& cmdObj,
                                     int options,
                                     std::string& errmsg,
-                                    BSONObjBuilder& output,
-                                    bool fromRepl) {
+                                    BSONObjBuilder& output) {
 
         LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
         std::set<Shard> shards;
         getShards(dbName, cmdObj, shards);
 
         // TODO: Future is deprecated, replace with commandOp()
-
         std::list< boost::shared_ptr<Future::CommandResult> > futures;
         for (std::set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++) {
             futures.push_back( Future::spawnCommand( i->getConnString(),
@@ -94,20 +92,25 @@ namespace mongo {
                                                      _useShardConn ));
         }
 
-        std::vector<BSONObj> results;
+        std::vector<ShardAndReply> results;
         BSONObjBuilder subobj (output.subobjStart("raw"));
         BSONObjBuilder errors;
         int commonErrCode = -1;
 
-        for ( std::list< boost::shared_ptr<Future::CommandResult> >::iterator i=futures.begin();
-              i!=futures.end(); i++ ) {
+        std::list< boost::shared_ptr<Future::CommandResult> >::iterator futuresit;
+        std::set<Shard>::const_iterator shardsit;
+        // We iterate over the set of shards and their corresponding futures in parallel.
+        // TODO: replace with zip iterator if we ever decide to use one from Boost or elsewhere
+        for (futuresit = futures.begin(), shardsit = shards.cbegin();
+              futuresit != futures.end() && shardsit != shards.end();
+              ++futuresit, ++shardsit ) {
 
-            boost::shared_ptr<Future::CommandResult> res = *i;
+            boost::shared_ptr<Future::CommandResult> res = *futuresit;
 
             if ( res->join() ) {
                 // success :)
                 BSONObj result = res->result();
-                results.push_back( result );
+                results.emplace_back( shardsit->getName(), result );
                 subobj.append( res->getServer(), result );
                 continue;
             }
@@ -121,7 +124,7 @@ namespace mongo {
                 BSONElement errmsg = result["errmsg"];
                 if ( errmsg.eoo() || errmsg.String().empty() ) {
                     // it was fixed!
-                    results.push_back( result );
+                    results.emplace_back( shardsit->getName(), result );
                     subobj.append( res->getServer(), result );
                     continue;
                 }
@@ -145,8 +148,7 @@ namespace mongo {
             else if ( commonErrCode != errCode ) {
                 commonErrCode = 0;
             }
-
-            results.push_back( result );
+            results.emplace_back( shardsit->getName(), result );
             subobj.append( res->getServer(), result );
         }
 

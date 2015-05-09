@@ -43,6 +43,7 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/mongos_options.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
@@ -112,7 +113,12 @@ namespace mongo {
         connectionShardStatus.reset( conn );
     }
 
-    bool VersionManager::isVersionableCB( DBClientBase* conn ){
+    bool VersionManager::isVersionableCB(DBClientBase* conn) {
+        // We do not version shard connections when issued from mongod
+        if (!isMongos()) {
+            return false;
+        }
+
         return conn->type() == ConnectionString::MASTER || conn->type() == ConnectionString::SET;
     }
 
@@ -296,24 +302,26 @@ namespace mongo {
 
         conf->getChunkManagerOrPrimary(ns, manager, primary);
 
-        if (manager)
+        if (manager) {
             officialSequenceNumber = manager->getSequenceNumber();
+        }
 
         // Check this manager against the reference manager
-        if( manager ){
+        if (manager) {
+            const Shard shard = Shard::make(conn->getServerAddress());
 
-            Shard shard = Shard::make( conn->getServerAddress() );
             if (refManager && !refManager->compatibleWith(*manager, shard.getName())) {
                 const ChunkVersion refVersion(refManager->getVersion(shard.getName()));
                 const ChunkVersion currentVersion(manager->getVersion(shard.getName()));
+
                 string msg(str::stream() << "manager ("
-                        << currentVersion.toString()
-                        << " : " << manager->getSequenceNumber() << ") "
-                        << "not compatible with reference manager ("
-                        << refVersion.toString()
-                        << " : " << refManager->getSequenceNumber() << ") "
-                        << "on shard " << shard.getName()
-                        << " (" << shard.getAddress().toString() << ")");
+                                         << currentVersion.toString()
+                                         << " : " << manager->getSequenceNumber() << ") "
+                                         << "not compatible with reference manager ("
+                                         << refVersion.toString()
+                                         << " : " << refManager->getSequenceNumber() << ") "
+                                         << "on shard " << shard.getName()
+                                         << " (" << shard.getAddress().toString() << ")");
 
                 throw SendStaleConfigException(ns,
                                                msg,
@@ -321,9 +329,9 @@ namespace mongo {
                                                currentVersion);
             }
         }
-        else if( refManager ){
+        else if (refManager) {
+            const Shard shard = Shard::make(conn->getServerAddress());
 
-            Shard shard = Shard::make(conn->getServerAddress());
             string msg( str::stream() << "not sharded ("
                         << ( (manager.get() == 0) ? string( "<none>" ) :
                                 str::stream() << manager->getSequenceNumber() )
@@ -354,12 +362,12 @@ namespace mongo {
             }
         }
 
-        // Now that we're sure we're sending SSV and not to a single config server, get the shard
-        Shard shard = Shard::make(conn->getServerAddress());
+        const Shard shard = Shard::make(conn->getServerAddress());
 
         ChunkVersion version = ChunkVersion(0, 0, OID());
-        if (manager)
+        if (manager) {
             version = manager->getVersion(shard.getName());
+        }
 
         LOG(1) << "setting shard version of " << version << " for " << ns << " on shard "
                << shard.toString();

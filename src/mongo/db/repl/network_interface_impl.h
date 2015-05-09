@@ -40,6 +40,9 @@
 #include "mongo/stdx/list.h"
 
 namespace mongo {
+
+    class ConnectionPool;
+
 namespace repl {
 
     /**
@@ -82,14 +85,11 @@ namespace repl {
                 const ReplicationExecutor::RemoteCommandRequest& request,
                 const RemoteCommandCompletionFn& onFinish);
         virtual void cancelCommand(const ReplicationExecutor::CallbackHandle& cbHandle);
-        virtual void runCallbackWithGlobalExclusiveLock(
-                const stdx::function<void (OperationContext*)>& callback);
+        OperationContext* createOperationContext() override;
 
         std::string getNextCallbackWithGlobalLockThreadName();
 
     private:
-        class ConnectionPool;
-
         /**
          * Information describing an in-flight command.
          */

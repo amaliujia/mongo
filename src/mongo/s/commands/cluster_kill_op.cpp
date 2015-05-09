@@ -41,7 +41,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -62,7 +62,7 @@ namespace {
                                    const std::string& dbname,
                                    const BSONObj& cmdObj) final {
 
-            bool isAuthorized = client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                     ResourcePattern::forClusterResource(),
                                     ActionType::killop);
             return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -73,8 +73,7 @@ namespace {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) final {
+                 BSONObjBuilder& result) final {
 
             // The format of op is shardid:opid
             // This is different than the format passed to the mongod killOp command.

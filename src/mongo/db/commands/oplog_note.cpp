@@ -57,7 +57,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), ActionType::appendOplogNote)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -67,8 +67,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
             if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
                 return appendCommandStatus(result, Status(
                         ErrorCodes::NoReplicationEnabled,

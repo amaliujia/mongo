@@ -57,7 +57,6 @@
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 
 
 namespace mongo {
@@ -76,7 +75,6 @@ namespace {
         ss << mongodVersion() << '\n';
         ss << "git hash: " << gitVersion() << '\n';
         ss << openSSLVersion("OpenSSL version: ", "\n");
-        ss << "sys info: " << sysInfo() << '\n';
         ss << "uptime: " << time(0) - serverGlobalParams.started << " seconds\n";
         ss << "</pre>";
     }
@@ -166,7 +164,7 @@ namespace {
                 string errmsg;
 
                 BSONObjBuilder sub;
-                if (!c->run(txn, "admin.$cmd", co, 0, errmsg, sub, false))
+                if (!c->run(txn, "admin.$cmd", co, 0, errmsg, sub))
                     buf.append(cmd, errmsg);
                 else
                     buf.append(cmd, sub.obj());
@@ -253,7 +251,7 @@ namespace {
             BSONObj cmdObj = BSON(cmd << 1);
 
             BSONObjBuilder result;
-            Command::execCommand(txn, c, 0, "admin.", cmdObj, result, false);
+            Command::execCommand(txn, c, 0, "admin.", cmdObj, result);
 
             responseCode = 200;
 
@@ -376,7 +374,8 @@ namespace {
         }
 
         ss << start(dbname) << h2(dbname);
-        ss << "<p><a href=\"/_commands\">List all commands</a></p>\n";
+        ss << "<p><a href=\"/_commands\">List all commands</a> | \n";
+        ss << "<a href=\"/_replSet\">Replica set status</a></p>\n";
 
         {
             const Command::CommandMap* m = Command::webCommands();
@@ -420,7 +419,7 @@ namespace {
                                vector<string>& headers,
                                const SockAddr &from) {
 
-        AuthorizationSession* authSess = cc().getAuthorizationSession();
+        AuthorizationSession* authSess = AuthorizationSession::get(cc());
         if (!authSess->getAuthorizationManager().isAuthEnabled()) {
             return true;
         }
@@ -448,7 +447,7 @@ namespace {
             UserName userName(parms["username"], "admin");
             User* user;
             AuthorizationManager& authzManager =
-                cc().getAuthorizationSession()->getAuthorizationManager();
+                AuthorizationSession::get(cc())->getAuthorizationManager();
             Status status = authzManager.acquireUser(txn, userName, &user);
             if (!status.isOK()) {
                 if (status.code() != ErrorCodes::UserNotFound) {
@@ -591,8 +590,6 @@ namespace {
         Client::initThread("websvr");
 
         dbWebServer->initAndListen();
-
-        cc().shutdown();
     }
 
 } // namespace mongo

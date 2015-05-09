@@ -46,6 +46,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/max_time.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/concurrency/task.h"
@@ -367,6 +368,7 @@ namespace mongo {
     }
 
     void CursorCache::gotKillCursors(Message& m ) {
+        LastError::get(cc()).disable();
         DbMessage dbmessage(m);
         int n = dbmessage.pullInt();
 
@@ -383,9 +385,9 @@ namespace mongo {
         ConstDataCursor cursors(dbmessage.getArray(n));
 
         ClientBasic* client = ClientBasic::getCurrent();
-        AuthorizationSession* authSession = client->getAuthorizationSession();
+        AuthorizationSession* authSession = AuthorizationSession::get(client);
         for ( int i=0; i<n; i++ ) {
-            long long id = cursors.readLEAndAdvance<int64_t>();
+            long long id = cursors.readAndAdvance<LittleEndian<int64_t>>();
             LOG(_myLogLevel) << "CursorCache::gotKillCursors id: " << id << endl;
 
             if ( ! id ) {
@@ -502,7 +504,12 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        bool run(OperationContext* txn, const string&, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             cursorCache.appendInfo( result );
             if ( jsobj["setTimeout"].isNumber() )
                 CursorCache::TIMEOUT = jsobj["setTimeout"].numberLong();

@@ -81,15 +81,19 @@ namespace mongo {
             actions.addAction(ActionType::serverStatus);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             
             _runCalled = true;
 
             long long start = Listener::getElapsedTimeMillis();
             BSONObjBuilder timeBuilder(256);
 
-            const ClientBasic* myClientBasic = ClientBasic::getCurrent();
-            AuthorizationSession* authSession = myClientBasic->getAuthorizationSession();
+            const auto authSession = AuthorizationSession::get(ClientBasic::getCurrent());
             
             // --- basic fields that are global
 

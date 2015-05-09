@@ -36,14 +36,21 @@
 
 namespace mongo {
 
+    class ActionLogType;
     class BatchedCommandRequest;
     class BatchedCommandResponse;
+    struct BSONArray;
     class BSONObj;
     class ChunkType;
+    class CollectionType;
     class ConnectionString;
     class DatabaseType;
+    class DistLockManager;
     class OperationContext;
+    class Query;
+    class SettingsType;
     class Shard;
+    class ShardKeyPattern;
     class ShardType;
     class Status;
     template<typename T> class StatusWith;
@@ -71,6 +78,11 @@ namespace mongo {
         virtual ~CatalogManager() = default;
 
         /**
+         * Performs necessary cleanup when shutting down cleanly.
+         */
+        virtual void shutDown() = 0;
+
+        /**
          * Creates a new database or updates the sharding status for an existing one. Cannot be
          * used for the admin/config/local DBs, which should not be created or sharded manually
          * anyways.
@@ -81,6 +93,26 @@ namespace mongo {
          *  - ShardNotFound - could not find a shard to place the DB on
          */
         virtual Status enableSharding(const std::string& dbName) = 0;
+
+        /**
+         * Shards a collection. Assumes that the database is enabled for sharding.
+         *
+         * @param ns: namespace of collection to shard
+         * @param fieldsAndOrder: shardKey pattern
+         * @param unique: if true, ensure underlying index enforces a unique constraint.
+         * @param initPoints: create chunks based on a set of specified split points.
+         * @param initShards: if nullptr, use primary shard as lone shard for DB.
+         *
+         * WARNING: It's not completely safe to place initial chunks onto non-primary
+         *          shards using this method because a conflict may result if multiple map-reduce
+         *          operations are writing to the same output collection, for instance.
+         *
+         */
+        virtual Status shardCollection(const std::string& ns,
+                                       const ShardKeyPattern& fieldsAndOrder,
+                                       bool unique,
+                                       std::vector<BSONObj>* initPoints,
+                                       std::vector<Shard>* initShards = nullptr) = 0;
 
         /**
          *
@@ -114,8 +146,8 @@ namespace mongo {
          * metadata and sets the specified shard as primary.
          *
          * @param dbName name of the database (case sensitive)
-         * @param shard Optional shard to use as primary. If NULL is specified, one will be picked
-         *      by the system.
+         * @param shard Optional shard to use as primary. If nullptr is specified, one will be
+         *      picked by the system.
          *
          * Returns Status::OK on success or any error code indicating the failure. These are some
          * of the known failures:
@@ -126,8 +158,7 @@ namespace mongo {
         virtual Status createDatabase(const std::string& dbName, const Shard* shard) = 0;
 
         /**
-         * Updates the metadata for a given database. Currently, if the specified DB entry does
-         * not exist, it will be created.
+         * Updates or creates the metadata for a given database.
          */
         virtual Status updateDatabase(const std::string& dbName, const DatabaseType& db) = 0;
 
@@ -143,7 +174,45 @@ namespace mongo {
         virtual StatusWith<DatabaseType> getDatabase(const std::string& dbName) = 0;
 
         /**
+         * Updates or creates the metadata for a given collection.
+         */
+        virtual Status updateCollection(const std::string& collNs, const CollectionType& coll) = 0;
+
+        /**
+         * Retrieves the metadata for a given collection, if it exists.
+         *
+         * @param collectionNs fully qualified name of the collection (case sensitive)
+         *
+         * Returns Status::OK along with the collection information or any error code indicating
+         * the failure. These are some of the known failures:
+         *  - NamespaceNotFound - collection does not exist
+         */
+        virtual StatusWith<CollectionType> getCollection(const std::string& collNs) = 0;
+
+        /**
+         * Retrieves all collections undera specified database (or in the system).
+         *
+         * @param dbName an optional database name. Must be nullptr or non-empty. If nullptr is
+         *      specified, all collections on the system are returned.
+         * @param collections variable to receive the set of collections.
+         *
+         * Returns a !OK status if an error occurs.
+         */
+        virtual Status getCollections(const std::string* dbName,
+                                      std::vector<CollectionType>* collections) = 0;
+
+        /**
+         * Drops the specified collection from the collection metadata store.
+         *
+         * Returns Status::OK if successful or any error code indicating the failure. These are
+         * some of the known failures:
+         *  - NamespaceNotFound - collection does not exist
+         */
+        virtual Status dropCollection(const std::string& collectionNs) = 0;
+
+        /**
          * Retrieves all databases for a shard.
+         *
          * Returns a !OK status if an error occurs.
          */
         virtual void getDatabasesForShard(const std::string& shardName,
@@ -157,10 +226,45 @@ namespace mongo {
                                          std::vector<ChunkType>* chunks) = 0;
 
         /**
+         * Gets all chunks (of type ChunkType) that satisfy a query.
+         * Returns a !OK status if an error occurs.
+         */
+        virtual Status getChunks(const Query& query,
+                                 std::vector<ChunkType>* chunks) = 0;
+
+        /**
          * Retrieves all shards in this sharded cluster.
          * Returns a !OK status if an error occurs.
          */
         virtual Status getAllShards(std::vector<ShardType>* shards) = 0;
+
+        /**
+         * Returns true if host is being used as a shard.
+         * Otherwise, returns false.
+         */
+        virtual bool isShardHost(const ConnectionString& shardConnectionString) = 0;
+
+        /**
+         * Returns true if there are any shards in the sharded cluster.
+         * Otherwise, returns false.
+         */
+        virtual bool doShardsExist() = 0;
+
+        /**
+         * Applies oplog entries to the config servers.
+         * Used by mergeChunk, splitChunk, and moveChunk commands.
+         *
+         * @param updateOps: oplog entries to apply
+         * @param preCondition: preconditions for applying oplog entries
+         */
+        virtual Status applyChunkOpsDeprecated(const BSONArray& updateOps,
+                                               const BSONArray& preCondition) = 0;
+
+        /**
+         * Logs to the actionlog.
+         * Used by the balancer to report the result of a balancing round.
+         */
+        virtual void logAction(const ActionLogType& actionLog) = 0;
 
         /**
          * Logs a diagnostic event locally and on the config server.
@@ -178,6 +282,14 @@ namespace mongo {
                                const BSONObj& detail) = 0;
 
         /**
+         * Returns global settings for a certain key.
+         * @param key: key for SettingsType::ConfigNS document.
+         *
+         * Returns NoSuchKey if no SettingsType::ConfigNS document with such key exists.
+         */
+        virtual StatusWith<SettingsType> getGlobalSettings(const std::string& key) = 0;
+
+        /**
          * Directly sends the specified command to the config server and returns the response.
          *
          * NOTE: Usage of this function is disallowed in new code, which should instead go through
@@ -185,11 +297,12 @@ namespace mongo {
          *       class and externally for writes to the admin/config namespaces.
          *
          * @param request Request to be sent to the config server.
-         * @param response Out parameter to receive the response. Can be NULL.
+         * @param response Out parameter to receive the response. Can be nullptr.
          */
         virtual void writeConfigServerDirect(const BatchedCommandRequest& request,
                                              BatchedCommandResponse* response) = 0;
 
+        virtual DistLockManager* getDistLockManager() = 0;
 
         /**
          * Directly inserts a document in the specified namespace on the config server (only the

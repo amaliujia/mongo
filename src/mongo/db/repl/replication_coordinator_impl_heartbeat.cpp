@@ -43,12 +43,12 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/get_status_from_command_result.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -159,10 +159,13 @@ namespace {
                 targetIndex >= 0 &&
                 hbStatusResponse.getValue().hasState() &&
                 hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY) {
-            boost::lock_guard<boost::mutex> lk(_mutex);
+            boost::unique_lock<boost::mutex> lk(_mutex);
             if (hbStatusResponse.getValue().getVersion() == _rsConfig.getConfigVersion()) {
                 _updateOpTimeFromHeartbeat_inlock(targetIndex,
                                                   hbStatusResponse.getValue().getOpTime());
+                // TODO: Enable with Data Replicator
+                //lk.unlock();
+                //_dr.slavesHaveProgressed();
             }
         }
 
@@ -327,11 +330,11 @@ namespace {
                                newConfig));
             return;
         }
-        invariant(!_heartbeatReconfigThread.get());
-        _heartbeatReconfigThread.reset(
-                new boost::thread(stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigStore,
-                                             this,
-                                             newConfig)));;
+        _replExecutor.scheduleDBWork(stdx::bind(
+            &ReplicationCoordinatorImpl::_heartbeatReconfigStore,
+            this,
+            stdx::placeholders::_1,
+            newConfig));
     }
 
     void ReplicationCoordinatorImpl::_heartbeatReconfigAfterElectionCanceled(
@@ -346,41 +349,24 @@ namespace {
             return;
         }
 
-        invariant(!_heartbeatReconfigThread.get());
-        _heartbeatReconfigThread.reset(
-                new boost::thread(stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigStore,
-                                             this,
-                                             newConfig)));
+        _replExecutor.scheduleDBWork(stdx::bind(
+            &ReplicationCoordinatorImpl::_heartbeatReconfigStore,
+            this,
+            stdx::placeholders::_1,
+            newConfig));
     }
 
-    void ReplicationCoordinatorImpl::_heartbeatReconfigStore(const ReplicaSetConfig& newConfig) {
-        class StoreThreadGuard {
-        public:
-            StoreThreadGuard(boost::unique_lock<boost::mutex>* lk,
-                             boost::scoped_ptr<boost::thread>* thread,
-                             bool* inShutdown) :
-                _lk(lk),
-                _thread(thread),
-                _inShutdown(inShutdown) {}
-            ~StoreThreadGuard() {
-                if (!_lk->owns_lock()) {
-                    _lk->lock();
-                }
-                if (*_inShutdown) {
-                    return;
-                }
-                _thread->get()->detach();
-                _thread->reset(NULL);
-            }
+    void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
+        const ReplicationExecutor::CallbackData& cbd,
+        const ReplicaSetConfig& newConfig) {
 
-        private:
-            boost::unique_lock<boost::mutex>* const _lk;
-            boost::scoped_ptr<boost::thread>* const _thread;
-            bool* const _inShutdown;
-        };
+        if (cbd.status.code() == ErrorCodes::CallbackCanceled) {
+            log() << "The callback to persist the replica set configuration was canceled - "
+                  << "the configuration was not persisted but was used: " << newConfig.toBSON();
+            return;
+        }
 
         boost::unique_lock<boost::mutex> lk(_mutex, boost::defer_lock_t());
-        StoreThreadGuard guard(&lk, &_heartbeatReconfigThread, &_inShutdown);
 
         const StatusWith<int> myIndex = validateConfigForHeartbeatReconfig(
                 _externalState.get(),
@@ -406,9 +392,7 @@ namespace {
                     "it is invalid: "<< myIndex.getStatus();
         }
         else {
-            boost::scoped_ptr<OperationContext> txn(
-                                      _externalState->createOperationContext("WriteReplSetConfig"));
-            Status status = _externalState->storeLocalConfigDocument(txn.get(), newConfig.toBSON());
+            Status status = _externalState->storeLocalConfigDocument(cbd.txn, newConfig.toBSON());
 
             lk.lock();
             if (!status.isOK()) {

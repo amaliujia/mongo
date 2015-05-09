@@ -38,6 +38,8 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/data_replicator.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
@@ -60,9 +62,12 @@ namespace repl {
     class HandshakeArgs;
     class HeartbeatResponseAction;
     class OplogReader;
+    class ReplSetDeclareElectionWinnerArgs;
+    class ReplSetRequestVotesArgs;
     class ReplicaSetConfig;
     class SyncSourceFeedback;
     class TopologyCoordinator;
+    class LastVote;
 
     class ReplicationCoordinatorImpl : public ReplicationCoordinator,
                                        public KillOpListenerInterface {
@@ -75,6 +80,12 @@ namespace repl {
                                    ReplicationCoordinatorExternalState* externalState,
                                    ReplicationExecutor::NetworkInterface* network,
                                    TopologyCoordinator* topoCoord,
+                                   int64_t prngSeed);
+        // Takes ownership of the "externalState" and "topCoord" objects.
+        ReplicationCoordinatorImpl(const ReplSettings& settings,
+                                   ReplicationCoordinatorExternalState* externalState,
+                                   TopologyCoordinator* topoCoord,
+                                   ReplicationExecutor* replExec,
                                    int64_t prngSeed);
         virtual ~ReplicationCoordinatorImpl();
 
@@ -144,6 +155,8 @@ namespace repl {
         virtual void setMyHeartbeatMessage(const std::string& msg);
 
         virtual Timestamp getMyLastOptime() const;
+
+        virtual OpTime getMyLastOptimeV1() const;
 
         virtual OID getElectionId();
 
@@ -228,6 +241,22 @@ namespace repl {
 
         virtual Timestamp getLastCommittedOpTime() const;
 
+        virtual Status processReplSetRequestVotes(OperationContext* txn,
+                                                  const ReplSetRequestVotesArgs& args,
+                                                  ReplSetRequestVotesResponse* response);
+
+        virtual Status processReplSetDeclareElectionWinner(
+                const ReplSetDeclareElectionWinnerArgs& args,
+                long long* responseTerm);
+
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder);
+
+        virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                          ReplSetHeartbeatResponseV1* response);
+
+        virtual bool isV1ElectionProtocol();
+
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* s);
 
         // ================== Test support API ===================
 
@@ -248,7 +277,12 @@ namespace repl {
         Status setLastOptime_forTest(long long cfgVer, long long memberId, const Timestamp& ts);
 
     private:
-
+        ReplicationCoordinatorImpl(const ReplSettings& settings,
+                                   ReplicationCoordinatorExternalState* externalState,
+                                   TopologyCoordinator* topCoord,
+                                   int64_t prngSeed,
+                                   ReplicationExecutor::NetworkInterface* network,
+                                   ReplicationExecutor* replExec);
         /**
          * Configuration states for a replica set node.
          *
@@ -286,7 +320,7 @@ namespace repl {
         enum PostMemberStateUpdateAction {
             kActionNone,
             kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
-            kActionChooseNewSyncSource,
+            kActionFollowerModeStateChange,
             kActionWinElection
         };
 
@@ -415,6 +449,24 @@ namespace repl {
         void _clearSyncSourceBlacklist_finish(const ReplicationExecutor::CallbackData& cbData);
 
         /**
+         * Bottom half of processReplSetDeclareElectionWinner.
+         */
+        void _processReplSetDeclareElectionWinner_finish(
+                const ReplicationExecutor::CallbackData& cbData,
+                const ReplSetDeclareElectionWinnerArgs& args,
+                long long* responseTerm,
+                Status* result);
+
+        /**
+         * Bottom half of processReplSetRequestVotes.
+         */
+        void _processReplSetRequestVotes_finish(
+                const ReplicationExecutor::CallbackData& cbData,
+                const ReplSetRequestVotesArgs& args,
+                ReplSetRequestVotesResponse* response,
+                Status* result);
+
+        /**
          * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
          * need to change as a result of time passing - for instance becoming PRIMARY when a single
          * node replica set member's stepDown period ends.
@@ -481,6 +533,7 @@ namespace repl {
 
         Timestamp _getMyLastOptime_inlock() const;
 
+        OpTime _getMyLastOptimeV1_inlock() const;
 
         /**
          * Bottom half of setFollowerMode.
@@ -569,10 +622,13 @@ namespace repl {
         MemberState _getMemberState_inlock() const;
 
         /**
-         * Returns the current replication mode. This method requires the caller to be holding
-         * "_mutex" to be called safely.
+         * Callback that gives the TopologyCoordinator an initial LastVote document from
+         * local storage.
+         *
+         * Called only during replication startup. All other updates come from the
+         * TopologyCoordinator itself.
          */
-        Mode _getReplicationMode_inlock() const;
+        void _updateLastVote(const LastVote& lastVote);
 
         /**
          * Starts loading the replication configuration from local storage, and if it is valid,
@@ -725,7 +781,8 @@ namespace repl {
         /**
          * Method to write a configuration transmitted via heartbeat message to stable storage.
          */
-        void _heartbeatReconfigStore(const ReplicaSetConfig& newConfig);
+        void _heartbeatReconfigStore(const ReplicationExecutor::CallbackData& cbd,
+                                     const ReplicaSetConfig& newConfig);
 
         /**
          * Conclusion actions of a heartbeat-triggered reconfiguration.
@@ -756,6 +813,9 @@ namespace repl {
          * servers; set _lastCommittedOpTime to this new entry, if greater than the current entry.
          */
         void _updateLastCommittedOpTime_inlock();
+
+        void _summarizeAsHtml_finish(const ReplicationExecutor::CallbackData& cbData,
+                                     ReplSetHtmlSummary* output);
 
         //
         // All member variables are labeled with one of the following codes indicating the
@@ -795,8 +855,11 @@ namespace repl {
         // Pointer to the TopologyCoordinator owned by this ReplicationCoordinator.
         boost::scoped_ptr<TopologyCoordinator> _topCoord;                                 // (X)
 
+        // If the executer is owned then this will be set, but should not be used.
+        // This is only used to clean up and destroy the replExec if owned
+        std::unique_ptr<ReplicationExecutor> _replExecutorIfOwned;                        // (S)
         // Executor that drives the topology coordinator.
-        ReplicationExecutor _replExecutor;                                                // (S)
+        ReplicationExecutor& _replExecutor;                                               // (S)
 
         // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
         boost::scoped_ptr<ReplicationCoordinatorExternalState> _externalState;            // (PS)
@@ -804,10 +867,6 @@ namespace repl {
         // Thread that drives actions in the topology coordinator
         // Set in startReplication() and thereafter accessed in shutdown.
         boost::scoped_ptr<boost::thread> _topCoordDriverThread;                           // (I)
-
-        // Thread that is used to write new configs received via a heartbeat reconfig
-        // to stable storage.  It is an error to change this if _inShutdown is true.
-        boost::scoped_ptr<boost::thread> _heartbeatReconfigThread;                        // (M)
 
         // Our RID, used to identify us to our sync source when sending replication progress
         // updates upstream.  Set once in startReplication() and then never modified again.
@@ -888,7 +947,11 @@ namespace repl {
         AtomicUInt32 _canServeNonLocalReads;                                              // (S)
 
         // OpTime of the latest committed operation. Matches the concurrency level of _slaveInfo.
-        Timestamp _lastCommittedOpTime;                                                          // (M)
+        Timestamp _lastCommittedOpTime;                                                   // (M)
+
+        // Data Replicator used to replicate data
+        DataReplicator _dr;                                                               // (S)
+
     };
 
 } // namespace repl

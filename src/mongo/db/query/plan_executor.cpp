@@ -156,7 +156,6 @@ namespace mongo {
           _qs(qs),
           _root(rt),
           _ns(ns),
-          _killed(false),
           _yieldPolicy(new PlanYieldPolicy(this, YIELD_MANUAL)) {
         // We may still need to initialize _ns from either _collection or _cq.
         if (!_ns.empty()) {
@@ -186,11 +185,19 @@ namespace mongo {
         }
 
         // If we didn't have to do subplanning, we might still have to do regular
-        // multi plan selection.
+        // multi plan selection...
         foundStage = getStageByType(_root.get(), STAGE_MULTI_PLAN);
         if (foundStage) {
             MultiPlanStage* mps = static_cast<MultiPlanStage*>(foundStage);
             return mps->pickBestPlan(_yieldPolicy.get());
+        }
+
+        // ...or, we might have to run a plan from the cache for a trial period, falling back on
+        // regular planning if the cached plan performs poorly.
+        foundStage = getStageByType(_root.get(), STAGE_CACHED_PLAN);
+        if (foundStage) {
+            CachedPlanStage* cachedPlan = static_cast<CachedPlanStage*>(foundStage);
+            return cachedPlan->pickBestPlan(_yieldPolicy.get());
         }
 
         // Either we chose a plan, or no plan selection was required. In both cases,
@@ -242,7 +249,7 @@ namespace mongo {
     }
 
     void PlanExecutor::saveState() {
-        if (!_killed) {
+        if (!killed()) {
             _root->saveState();
         }
 
@@ -281,15 +288,15 @@ namespace mongo {
         // the yield timer in order to prevent from yielding again right away.
         _yieldPolicy->resetTimer();
 
-        if (!_killed) {
+        if (!killed()) {
             _root->restoreState(opCtx);
         }
 
-        return !_killed;
+        return !killed();
     }
 
     void PlanExecutor::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-        if (!_killed) { _root->invalidate(txn, dl, type); }
+        if (!killed()) { _root->invalidate(txn, dl, type); }
     }
 
     PlanExecutor::ExecState PlanExecutor::getNext(BSONObj* objOut, RecordId* dlOut) {
@@ -305,7 +312,15 @@ namespace mongo {
 
     PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* objOut,
                                                              RecordId* dlOut) {
-        if (_killed) { return PlanExecutor::DEAD; }
+        if (killed()) { 
+            if (NULL != objOut) {
+                Status status(ErrorCodes::OperationFailed,
+                              str::stream() << "Operation aborted because: " << *_killReason);
+                *objOut = Snapshotted<BSONObj>(SnapshotId(),
+                                               WorkingSetCommon::buildMemberStatusObject(status));
+            }
+            return PlanExecutor::DEAD; 
+        }
 
         // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
         // to use to pull the record into memory. We take ownership of the RecordFetcher here,
@@ -325,7 +340,15 @@ namespace mongo {
             if (_yieldPolicy->shouldYield()) {
                 _yieldPolicy->yield(fetcher.get());
 
-                if (_killed) {
+                if (killed()) {
+                    if (NULL != objOut) {
+                        Status status(ErrorCodes::OperationFailed, 
+                                      str::stream() << "Operation aborted because: " 
+                                                    << *_killReason);
+                        *objOut = Snapshotted<BSONObj>(
+                            SnapshotId(),
+                            WorkingSetCommon::buildMemberStatusObject(status));
+                    }
                     return PlanExecutor::DEAD;
                 }
             }
@@ -417,6 +440,11 @@ namespace mongo {
                 return PlanExecutor::IS_EOF;
             }
             else if (PlanStage::DEAD == code) {
+                if (NULL != objOut) {
+                    BSONObj statusObj;
+                    WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
+                    *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
+                }
                 return PlanExecutor::DEAD;
             }
             else {
@@ -432,7 +460,7 @@ namespace mongo {
     }
 
     bool PlanExecutor::isEOF() {
-        return _killed || _root->isEOF();
+        return killed() || _root->isEOF();
     }
 
     void PlanExecutor::registerExec() {
@@ -443,8 +471,8 @@ namespace mongo {
         _safety.reset();
     }
 
-    void PlanExecutor::kill() {
-        _killed = true;
+    void PlanExecutor::kill(std::string reason) {
+        _killReason = std::move(reason);
         _collection = NULL;
 
         // XXX: PlanExecutor is designed to wrap a single execution tree. In the case of
@@ -465,14 +493,8 @@ namespace mongo {
                 PipelineProxyStage* proxyStage = static_cast<PipelineProxyStage*>(foundStage);
                 shared_ptr<PlanExecutor> childExec = proxyStage->getChildExecutor();
                 if (childExec) {
-                    childExec->kill();
+                    childExec->kill(*_killReason);
                 }
-            }
-
-            foundStage = getStageByType(_root.get(), STAGE_CACHED_PLAN);
-            if (foundStage) {
-                CachedPlanStage* cacheStage = static_cast<CachedPlanStage*>(foundStage);
-                cacheStage->kill();
             }
         }
     }

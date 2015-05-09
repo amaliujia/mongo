@@ -37,9 +37,11 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/op_observer.h"
@@ -53,6 +55,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -62,6 +65,9 @@ namespace {
 
     using std::list;
     using std::string;
+
+    // Failpoint which fails initial sync and leaves on oplog entry in the buffer.
+    MONGO_FP_DECLARE(failInitSyncWithBufferedEntriesLeft);
 
     /**
      * Truncates the oplog (removes any documents) and resets internal variables that were
@@ -73,6 +79,9 @@ namespace {
     void truncateAndResetOplog(OperationContext* txn,
                                ReplicationCoordinator* replCoord,
                                BackgroundSync* bgsync) {
+        // Clear minvalid
+        setMinValid(txn, Timestamp());
+
         AutoGetDb autoDb(txn, "local", MODE_X);
         massert(28585, "no local database found", autoDb.getDb());
         invariant(txn->lockState()->isCollectionLockedForMode(rsOplogName, MODE_X));
@@ -85,15 +94,20 @@ namespace {
         // because the bgsync thread, while running, may update the blacklist.
         replCoord->resetMyLastOptime();
         bgsync->stop();
+        bgsync->setLastAppliedHash(0);
+        bgsync->clearBuffer();
+
         replCoord->clearSyncSourceBlacklist();
 
         // Truncate the oplog in case there was a prior initial sync that failed.
         Collection* collection = autoDb.getDb()->getCollection(rsOplogName);
         fassert(28565, collection);
-        WriteUnitOfWork wunit(txn);
-        Status status = collection->truncate(txn);
-        fassert(28564, status);
-        wunit.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork wunit(txn);
+            Status status = collection->truncate(txn);
+            fassert(28564, status);
+            wunit.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "truncate", collection->ns().ns());
     }
 
     /**
@@ -169,7 +183,6 @@ namespace {
             int errCode;
             CloneOptions options;
             options.fromDB = db;
-            options.logForRepl = false;
             options.slaveOk = true;
             options.useReplAuth = true;
             options.snapshot = false;
@@ -209,6 +222,15 @@ namespace {
                                  OplogReader* r) {
         const Timestamp startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime();
         BSONObj lastOp;
+
+        // If the fail point is set, exit failing.
+        if (MONGO_FAIL_POINT(failInitSyncWithBufferedEntriesLeft)) {
+            log() << "adding fake oplog entry to buffer.";
+            BackgroundSync::get()->pushTestOpToBuffer(
+                                            BSON("ts" << startOpTime << "v" << 1 << "op" << "n"));
+            return false;
+        }
+
         try {
             // It may have been a long time since we last used this connection to
             // query the oplog, depending on the size of the databases we needed to clone.
@@ -255,10 +277,6 @@ namespace {
         }
         catch (const DBException&) {
             warning() << "initial sync failed during oplog application phase, and will retry";
-
-            getGlobalReplicationCoordinator()->resetMyLastOptime();
-            BackgroundSync::get()->setLastAppliedHash(0);
-
             sleepsecs(5);
             return false;
         }
@@ -329,8 +347,10 @@ namespace {
         BackgroundSync* bgsync(BackgroundSync::get());
         OperationContextImpl txn;
         txn.setReplicatedWrites(false);
+        DisableDocumentValidation validationDisabler(&txn);
         ReplicationCoordinator* replCoord(getGlobalReplicationCoordinator());
 
+        // reset state for initial sync
         truncateAndResetOplog(&txn, replCoord, bgsync);
 
         OplogReader r;
@@ -449,13 +469,11 @@ namespace {
 
             // Initial sync is now complete.  Flag this by setting minValid to the last thing
             // we synced.
-            WriteUnitOfWork wunit(&txn);
             setMinValid(&txn, lastOpTimeWritten);
 
             // Clear the initial sync flag.
             clearInitialSyncFlag(&txn);
             BackgroundSync::get()->setInitialSyncRequestedFlag(false);
-            wunit.commit();
         }
 
         // If we just cloned & there were no ops applied, we still want the primary to know where

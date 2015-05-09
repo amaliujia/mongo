@@ -35,6 +35,7 @@
 #include "mongo/db/repl/oplog.h"
 
 #include <deque>
+#include <set>
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
@@ -43,8 +44,16 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/apply_ops.h"
+#include "mongo/db/catalog/capped_utils.h"
+#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/catalog/drop_database.h"
+#include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -293,12 +302,6 @@ namespace {
             b.appendBool("fromMigrate", true);
         }
 
-        if (txn->getWriteConcern().shouldWaitForOtherNodes()
-            && txn->getWriteConcern().syncMode == WriteConcernOptions::JOURNAL)
-        {
-            b.appendBool("j", true);
-        }
-
         if ( o2 ) {
             b.append("o2", *o2);
         }
@@ -312,10 +315,11 @@ namespace {
 
     Timestamp writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        Timestamp lastOptime = replCoord->getMyLastOptime();
-        invariant(!ops.empty());
 
+        Timestamp lastOptime;
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            lastOptime = replCoord->getMyLastOptime();
+            invariant(!ops.empty());
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), "local", MODE_X);
 
@@ -426,11 +430,13 @@ namespace {
         options.cappedSize = sz;
         options.autoIndexId = CollectionOptions::NO;
 
-        WriteUnitOfWork uow( txn );
-        invariant(ctx.db()->createCollection(txn, _oplogCollectionName, options));
-        if( !rs )
-            getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSONObj());
-        uow.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork uow( txn );
+            invariant(ctx.db()->createCollection(txn, _oplogCollectionName, options));
+            if( !rs )
+                getGlobalServiceContext()->getOpObserver()->onOpMessage(txn, BSONObj());
+            uow.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createCollection", _oplogCollectionName);
 
         /* sync here so we don't get any surprising lag later when we try to sync */
         StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
@@ -440,17 +446,153 @@ namespace {
 
     // -------------------------------------
 
-    // @param fromRepl false if from ApplyOpsCmd
+namespace {
+    NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
+        BSONElement first = cmdObj.firstElement();
+        uassert(28635,
+                "no collection name specified",
+                first.canonicalType() == canonicalizeBSONType(mongo::String)
+                && first.valuestrsize() > 0);
+        std::string coll = first.valuestr();
+        return NamespaceString(NamespaceString(ns).db().toString(), coll);
+    }
+
+    using OpApplyFn = stdx::function<Status (OperationContext*, const char*, BSONObj&)>;
+
+    struct ApplyOpMetadata {
+        OpApplyFn applyFunc;
+        std::set<ErrorCodes::Error> acceptableErrors;
+
+        ApplyOpMetadata(OpApplyFn fun) {
+            applyFunc = fun;
+        }
+
+        ApplyOpMetadata(OpApplyFn fun, std::set<ErrorCodes::Error> theAcceptableErrors) {
+            applyFunc = fun;
+            acceptableErrors = theAcceptableErrors;
+        }
+    };
+
+    std::map<std::string, ApplyOpMetadata> opsMap = {
+        {"create",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return createCollection(txn, NamespaceString(ns).db().toString(), cmd);
+                },
+                {ErrorCodes::NamespaceExists}
+            }
+        },
+        {"collMod",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return collMod(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                }
+            }
+        },
+        {"dropDatabase", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return dropDatabase(txn, NamespaceString(ns).db().toString());
+                }
+            }
+        },
+        {"drop", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropCollection(txn, parseNs(ns, cmd), resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound}
+            }
+        },
+        // deleteIndex(es) is deprecated but still works as of April 10, 2015
+        {"deleteIndex", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"deleteIndexes", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"dropIndex",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"dropIndexes", 
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return dropIndexes(txn, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}
+            }
+        },
+        {"renameCollection",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return renameCollection(txn,
+                                            NamespaceString(cmd.firstElement().valuestrsafe()),
+                                            NamespaceString(cmd["to"].valuestrsafe()),
+                                            cmd["stayTemp"].trueValue(),
+                                            cmd["dropTarget"].trueValue());
+                },
+                {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}
+            }
+        },
+        {"applyOps",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    BSONObjBuilder resultWeDontCareAbout;
+                    return applyOps(txn, ns, cmd, &resultWeDontCareAbout);
+                },
+                {ErrorCodes::UnknownError}
+            }
+        },
+        {"convertToCapped",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return convertToCapped(txn,
+                                           parseNs(ns, cmd),
+                                           cmd["size"].number());
+                }
+            }
+        },
+        {"emptycapped",
+            {
+                [](OperationContext* txn, const char* ns, BSONObj& cmd) -> Status {
+                    return emptyCapped(txn, parseNs(ns, cmd));
+                }
+            }
+        },
+    };
+
+} // namespace
+
     // @return failure status if an update should have happened and the document DNE.
     // See replset initial sync code.
     Status applyOperation_inlock(OperationContext* txn,
                                Database* db,
                                const BSONObj& op,
-                               bool fromRepl,
                                bool convertUpdateToUpsert) {
         LOG(3) << "applying op: " << op << endl;
 
-        OpCounters * opCounters = fromRepl ? &replOpCounters : &globalOpCounters;
+        OpCounters * opCounters = txn->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
 
         const char *names[] = { "o", "ns", "op", "b", "o2" };
         BSONElement fields[5];
@@ -489,6 +631,7 @@ namespace {
 
         // operation type -- see logOp() comments for types
         const char *opType = fieldOp.valuestrsafe();
+        invariant(*opType != 'c'); // commands are processed in applyCommand_inlock()
 
         if ( *opType == 'i' ) {
             opCounters->gotInsert();
@@ -617,50 +760,6 @@ namespace {
             else
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
-        else if ( *opType == 'c' ) {
-            bool done = false;
-            while (!done) {
-                BufBuilder bb;
-                BSONObjBuilder runCommandResult;
-
-                // Applying commands in repl is done under Global W-lock, so it is safe to not
-                // perform the current DB checks after reacquiring the lock.
-                invariant(txn->lockState()->isW());
-
-                _runCommands(txn, ns, o, bb, runCommandResult, true, 0);
-                // _runCommands takes care of adjusting opcounters for command counting.
-                Status status = Command::getStatusFromCommandResult(runCommandResult.done());
-                switch (status.code()) {
-                case ErrorCodes::WriteConflict: {
-                    // Need to throw this up to a higher level where it will be caught and the
-                    // operation retried.
-                    throw WriteConflictException();
-                }
-                case ErrorCodes::BackgroundOperationInProgressForDatabase: {
-                    Lock::TempRelease release(txn->lockState());
-
-                    BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
-                    break;
-                }
-                case ErrorCodes::BackgroundOperationInProgressForNamespace: {
-                    Lock::TempRelease release(txn->lockState());
-
-                    Command* cmd = Command::findCommand(o.firstElement().fieldName());
-                    invariant(cmd);
-                    BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
-                    break;
-                }
-                default:
-                    warning() << "Failed command " << o << " on " <<
-                        nsToDatabaseSubstring(ns) << " with status " << status <<
-                        " during oplog application";
-                    // fallthrough
-                case ErrorCodes::OK:
-                    done = true;
-                    break;
-                }
-            }
-        }
         else if ( *opType == 'n' ) {
             // no op
         }
@@ -677,6 +776,86 @@ namespace {
                 ns,
                 o,
                 fieldO2.isABSONObj() ? &o2 : NULL);
+        wuow.commit();
+
+        return Status::OK();
+    }
+
+    Status applyCommand_inlock(OperationContext* txn, const BSONObj& op) {
+        const char *names[] = { "o", "ns", "op" };
+        BSONElement fields[3];
+        op.getFields(3, names, fields);
+        BSONElement& fieldO = fields[0];
+        BSONElement& fieldNs = fields[1];
+        BSONElement& fieldOp = fields[2];
+
+        const char* opType = fieldOp.valuestrsafe();
+        invariant(*opType == 'c'); // only commands are processed here
+
+        BSONObj o;
+        if (fieldO.isABSONObj()) {
+            o = fieldO.embeddedObject();
+        }
+
+        const char* ns = fieldNs.valuestrsafe();
+
+        // Applying commands in repl is done under Global W-lock, so it is safe to not
+        // perform the current DB checks after reacquiring the lock.
+        invariant(txn->lockState()->isW());
+        
+        bool done = false;
+
+        while (!done) {
+            ApplyOpMetadata curOpToApply = opsMap.find(o.firstElementFieldName())->second;
+            Status status = Status::OK();
+            try {
+                status = curOpToApply.applyFunc(txn, ns, o);
+            }
+            catch (...) {
+                status = exceptionToStatus();
+            }
+            switch (status.code()) {
+            case ErrorCodes::WriteConflict: {
+                // Need to throw this up to a higher level where it will be caught and the
+                // operation retried.
+                throw WriteConflictException();
+            }
+            case ErrorCodes::BackgroundOperationInProgressForDatabase: {
+                Lock::TempRelease release(txn->lockState());
+
+                BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
+                break;
+            }
+            case ErrorCodes::BackgroundOperationInProgressForNamespace: {
+                Lock::TempRelease release(txn->lockState());
+
+                Command* cmd = Command::findCommand(o.firstElement().fieldName());
+                invariant(cmd);
+                BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nsToDatabase(ns), o));
+                break;
+            }
+            default:
+                if (_oplogCollectionName == masterSlaveOplogName) {
+                    error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                            << " with status " << status << " during oplog application";
+                }
+                else if (curOpToApply.acceptableErrors.find(status.code())
+                        == curOpToApply.acceptableErrors.end()) {
+                    error() << "Failed command " << o << " on " << nsToDatabaseSubstring(ns)
+                            << " with status " << status << " during oplog application";
+                    return status;
+                }
+                // fallthrough
+            case ErrorCodes::OK:
+                done = true;
+                break;
+            }
+        }
+
+        // AuthorizationManager's logOp method registers a RecoveryUnit::Change
+        // and to do so we need to have begun a UnitOfWork
+        WriteUnitOfWork wuow(txn);
+        getGlobalAuthorizationManager()->logOp(txn, opType, ns, o, nullptr);
         wuow.commit();
 
         return Status::OK();

@@ -38,8 +38,11 @@
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/isself.h"
+#include "mongo/db/repl/repl_set_declare_election_winner_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/repl_set_html_summary.h"
+#include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/server_parameters.h"
@@ -53,7 +56,7 @@ namespace repl {
 
     using std::vector;
 
-    const Seconds TopologyCoordinatorImpl::LastVote::leaseTime = Seconds(30);
+    const Seconds TopologyCoordinatorImpl::VoteLease::leaseTime = Seconds(30);
 
 namespace {
 
@@ -619,17 +622,17 @@ namespace {
                   << highestPriority->getHostAndPort().toString();
             vote = -10000;
         }
-        else if (_lastVote.when.millis + LastVote::leaseTime.total_milliseconds() >= now.millis &&
-                 _lastVote.whoId != args.whoid) {
+        else if (_voteLease.when.millis + VoteLease::leaseTime.total_milliseconds() >= now.millis &&
+                 _voteLease.whoId != args.whoid) {
             log() << "replSet voting no for "
                   <<  hopeful->getHostAndPort().toString()
-                  << "; voted for " << _lastVote.whoHostAndPort.toString() << ' '
-                  << (now.millis - _lastVote.when.millis) / 1000 << " secs ago";
+                  << "; voted for " << _voteLease.whoHostAndPort.toString() << ' '
+                  << (now.millis - _voteLease.when.millis) / 1000 << " secs ago";
         }
         else {
-            _lastVote.when = now;
-            _lastVote.whoId = args.whoid;
-            _lastVote.whoHostAndPort = hopeful->getHostAndPort();
+            _voteLease.when = now;
+            _voteLease.whoId = args.whoid;
+            _voteLease.whoHostAndPort = hopeful->getHostAndPort();
             vote = _selfConfig().getNumVotes();
             invariant(hopeful->getId() == args.whoid);
             if (vote > 0) {
@@ -990,7 +993,7 @@ namespace {
                               << (latestOpTime.getSecs() - highestPriorityMemberOptime.getSecs())
                               << " seconds behind me";
                         const Date_t until = now +
-                            LastVote::leaseTime.total_milliseconds() +
+                            VoteLease::leaseTime.total_milliseconds() +
                             kHeartbeatInterval.total_milliseconds();
                         if (_electionSleepUntil < until) {
                             _electionSleepUntil = until;
@@ -1737,9 +1740,9 @@ namespace {
         if (_stepDownUntil > now) {
             result |= StepDownPeriodActive;
         }
-        if (_lastVote.whoId != -1 &&
-                _lastVote.whoId !=_rsConfig.getMemberAt(_selfIndex).getId() &&
-                _lastVote.when.millis + LastVote::leaseTime.total_milliseconds() >= now.millis) {
+        if (_voteLease.whoId != -1 &&
+                _voteLease.whoId !=_rsConfig.getMemberAt(_selfIndex).getId() &&
+                _voteLease.when.millis + VoteLease::leaseTime.total_milliseconds() >= now.millis) {
             result |= VotedTooRecently;
         }
 
@@ -1767,7 +1770,7 @@ namespace {
                 ss << "; ";
             }
             hasWrittenToStream = true;
-            ss << "I recently voted for " << _lastVote.whoHostAndPort.toString();
+            ss << "I recently voted for " << _voteLease.whoHostAndPort.toString();
         }
         if (ur & CannotSeeMajority) {
             if (hasWrittenToStream) {
@@ -1876,16 +1879,16 @@ namespace {
             return false;
         }
         int selfId = _selfConfig().getId();
-        if ((_lastVote.when + LastVote::leaseTime.total_milliseconds() >= now) 
-            && (_lastVote.whoId != selfId)) {
+        if ((_voteLease.when + VoteLease::leaseTime.total_milliseconds() >= now) 
+            && (_voteLease.whoId != selfId)) {
             log() << "not voting yea for " << selfId <<
-                " voted for " << _lastVote.whoHostAndPort.toString() << ' ' << 
-                (now - _lastVote.when) / 1000 << " secs ago";
+                " voted for " << _voteLease.whoHostAndPort.toString() << ' ' << 
+                (now - _voteLease.when) / 1000 << " secs ago";
             return false;
         }
-        _lastVote.when = now;
-        _lastVote.whoId = selfId;
-        _lastVote.whoHostAndPort = _selfConfig().getHostAndPort();
+        _voteLease.when = now;
+        _voteLease.whoId = selfId;
+        _voteLease.whoHostAndPort = _selfConfig().getHostAndPort();
         return true;
     }
 
@@ -1930,10 +1933,10 @@ namespace {
         _electionId = OID();
         _role = Role::follower;
 
-        // Clear lastVote time, if we voted for ourselves in this election.
+        // Clear voteLease time, if we voted for ourselves in this election.
         // This will allow us to vote for others.
-        if (_lastVote.whoId == _selfConfig().getId()) {
-            _lastVote.when = 0;
+        if (_voteLease.whoId == _selfConfig().getId()) {
+            _voteLease.when = 0;
         }
     }
 
@@ -2082,6 +2085,88 @@ namespace {
         return false;
     }
 
+    void TopologyCoordinatorImpl::prepareCursorResponseInfo(
+            BSONObjBuilder* objBuilder,
+            const Timestamp& lastCommittedOpTime) const {
+        objBuilder->append("term", _term);
+        objBuilder->append("lastOpCommittedTimestamp", lastCommittedOpTime.getSecs());
+        objBuilder->append("lastOpCommittedTerm", lastCommittedOpTime.getInc());
+        objBuilder->append("configVersion", _rsConfig.getConfigVersion());
+        objBuilder->append("primaryId", _rsConfig.getMemberAt(_currentPrimaryIndex).getId());
+    }
+
+    void TopologyCoordinatorImpl::summarizeAsHtml(ReplSetHtmlSummary* output) {
+        output->setConfig(_rsConfig);
+        output->setHBData(_hbdata);
+        output->setSelfIndex(_selfIndex);
+        output->setPrimaryIndex(_currentPrimaryIndex);
+        output->setSelfState(getMemberState());
+        output->setSelfHeartbeatMessage(_hbmsg);
+    }
+
+    void TopologyCoordinatorImpl::processReplSetRequestVotes(
+            const ReplSetRequestVotesArgs& args,
+            ReplSetRequestVotesResponse* response,
+            const OpTime& lastAppliedOpTime) {
+        response->setOk(true);
+        response->setTerm(_term);
+
+        if (args.getTerm() < _term) {
+            response->setVoteGranted(false);
+            response->setReason("candidate's term is lower than mine");
+        }
+        else if (args.getConfigVersion() != _rsConfig.getConfigVersion()) {
+            response->setVoteGranted(false);
+            response->setReason("candidate's config version differs from mine");
+        }
+        else if (args.getSetName() != _rsConfig.getReplSetName()) {
+            response->setVoteGranted(false);
+            response->setReason("candidate's set name differs from mine");
+        }
+        // TODO(dannenberg): switch comparison to OpTimes once lastAppliedOpTime is an OpTime again
+        else if (args.getLastCommittedOp() < lastAppliedOpTime) {
+            response->setVoteGranted(false);
+            response->setReason("candidate's data is staler than mine");
+        }
+        else if (_lastVote.getTerm() == args.getTerm()) {
+            response->setVoteGranted(false);
+            response->setReason("already voted for another candidate this term");
+        }
+        else {
+            _lastVote.setTerm(args.getTerm());
+            _lastVote.setCandidateId(args.getCandidateId());
+            response->setVoteGranted(true);
+        }
+
+    }
+
+    Status TopologyCoordinatorImpl::processReplSetDeclareElectionWinner(
+            const ReplSetDeclareElectionWinnerArgs& args,
+            long long* responseTerm) {
+        *responseTerm = _term;
+        if (args.getReplSetName() != _rsConfig.getReplSetName()) {
+            return {ErrorCodes::BadValue, "replSet name does not match"};
+        }
+        else if (args.getTerm() < _term) {
+            return {ErrorCodes::BadValue, "term has already passed"};
+        }
+        else if (args.getTerm() == _term &&
+                 args.getWinnerId() != _rsConfig.getMemberAt(_currentPrimaryIndex).getId()) {
+            return {ErrorCodes::BadValue, "term already has a primary"};
+        }
+
+        if (args.getTerm() > _term) {
+            _term = args.getTerm();
+            *responseTerm = _term;
+        }
+
+        _currentPrimaryIndex = _rsConfig.findMemberIndexByConfigId(args.getWinnerId());
+        return Status::OK();
+    }
+
+    void TopologyCoordinatorImpl::loadLastVote(const LastVote& lastVote) {
+        _lastVote = lastVote;
+    }
 
 } // namespace repl
 } // namespace mongo

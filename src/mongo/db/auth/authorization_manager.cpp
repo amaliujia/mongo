@@ -252,10 +252,11 @@ namespace mongo {
         boost::unique_lock<boost::mutex> _lock;
     };
 
-    AuthorizationManager::AuthorizationManager(AuthzManagerExternalState* externalState) :
+    AuthorizationManager::AuthorizationManager(
+        std::unique_ptr<AuthzManagerExternalState> externalState) :
             _authEnabled(false),
             _privilegeDocsExist(false),
-            _externalState(externalState),
+            _externalState(std::move(externalState)),
             _version(schemaVersionInvalid),
             _isFetchPhaseBusy(false) {
         _updateCacheGeneration_inlock();
@@ -971,7 +972,7 @@ namespace {
                     mongoutils::str::stream() << "_id entries for user documents must be of "
                             "the form <dbname>.<username>.  Found: " << idstr);
         }
-        return StatusWith<UserName>(UserName(idstr.substr(splitPoint),
+        return StatusWith<UserName>(UserName(idstr.substr(splitPoint + 1),
                                              idstr.substr(0, splitPoint)));
     }
 

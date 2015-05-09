@@ -46,6 +46,7 @@
 #include "mongo/db/hasher.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/catalog/catalog_cache.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
@@ -88,7 +89,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forExactNamespace(
                                                             NamespaceString(parseNs(dbname,
                                                                                     cmdObj))),
@@ -108,8 +109,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             const string ns = parseNs(dbname, cmdObj);
             if (ns.size() == 0) {
@@ -173,11 +173,7 @@ namespace {
                 return false;
             }
 
-            if (!configServer.allUp(false, errmsg)) {
-                return false;
-            }
-
-            //the rest of the checks require a connection to the primary db
+            // The rest of the checks require a connection to the primary db
             ScopedDbConnection conn(config->getPrimary().getConnString());
 
             //check that collection is not capped
@@ -209,7 +205,7 @@ namespace {
             //    is "useful" for the proposed key.  A "useful" index is defined as follows
             //    Useful Index:
             //         i. contains proposedKey as a prefix
-            //         ii. is not sparse
+            //         ii. is not a sparse index or partial index
             //         iii. contains no null values
             //         iv. is not multikey (maybe lift this restriction later)
             //         v. if a hashed index, has default seed (lift this restriction later)
@@ -252,7 +248,9 @@ namespace {
                 BSONObj idx = *it;
                 BSONObj currentKey = idx["key"].embeddedObject();
                 // Check 2.i. and 2.ii.
-                if (!idx["sparse"].trueValue() && proposedKey.isPrefixOf(currentKey)) {
+                if (!idx["sparse"].trueValue() &&
+                    idx["filter"].eoo() &&
+                    proposedKey.isPrefixOf(currentKey)) {
 
                     // We can't currently use hashed indexes with a non-default hash seed
                     // Check v.
@@ -411,7 +409,13 @@ namespace {
                                       proposedKey,
                                       careAboutUnique);
 
-            config->shardCollection(ns, proposedShardKey, careAboutUnique, &initSplits);
+            Status status = grid.catalogManager()->shardCollection(ns,
+                                                                   proposedShardKey,
+                                                                   careAboutUnique,
+                                                                   &initSplits);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
 
             result << "collectionsharded" << ns;
 

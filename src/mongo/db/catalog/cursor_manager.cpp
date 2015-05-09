@@ -210,7 +210,7 @@ namespace mongo {
 
         // Check if we are authorized to erase this cursor.
         if (checkAuth) {
-            AuthorizationSession* as = txn->getClient()->getAuthorizationSession();
+            AuthorizationSession* as = AuthorizationSession::get(txn->getClient());
             Status authorizationStatus = as->checkAuthForKillCursors(nss, id);
             if (!authorizationStatus.isOK()) {
                 audit::logKillCursorsAuthzCheck(txn->getClient(),
@@ -298,7 +298,7 @@ namespace mongo {
         ConstDataCursor ids(_ids);
         int numDeleted = 0;
         for ( int i = 0; i < n; i++ ) {
-            if ( eraseCursorGlobalIfAuthorized(txn, ids.readLEAndAdvance<int64_t>()))
+            if ( eraseCursorGlobalIfAuthorized(txn, ids.readAndAdvance<LittleEndian<int64_t>>()))
                 numDeleted++;
             if ( inShutdown() )
                 break;
@@ -324,11 +324,12 @@ namespace mongo {
     }
 
     CursorManager::~CursorManager() {
-        invalidateAll( true );
+        invalidateAll(true, "collection going away");
         globalCursorIdCache->destroyed( _collectionCacheRuntimeId, _nss.ns() );
     }
 
-    void CursorManager::invalidateAll( bool collectionGoingAway ) {
+    void CursorManager::invalidateAll(bool collectionGoingAway,
+                                      const std::string& reason) {
         SimpleMutex::scoped_lock lk( _mutex );
 
         for ( ExecSet::iterator it = _nonCachedExecutors.begin();
@@ -337,7 +338,7 @@ namespace mongo {
 
             // we kill the executor, but it deletes itself
             PlanExecutor* exec = *it;
-            exec->kill();
+            exec->kill(reason);
             invariant( exec->collection() == NULL );
         }
         _nonCachedExecutors.clear();
@@ -383,7 +384,7 @@ namespace mongo {
                     // the underlying collection).  However, if they have an associated executor, we
                     // need to kill it, because it's now invalid.
                     if ( cc->getExecutor() )
-                        cc->getExecutor()->kill();
+                        cc->getExecutor()->kill(reason);
                     newMap.insert( *i );
                 }
                 else {

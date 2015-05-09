@@ -39,6 +39,7 @@
 #include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
@@ -94,7 +95,7 @@ namespace mongo {
             }
             const GetMoreRequest& request = parseStatus.getValue();
 
-            return client->getAuthorizationSession()->checkAuthForGetMore(request.nss,
+            return AuthorizationSession::get(client)->checkAuthForGetMore(request.nss,
                                                                           request.cursorid);
         }
 
@@ -110,8 +111,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) override {
+                 BSONObjBuilder& result) override {
             // Counted as a getMore, not as a command.
             globalOpCounters.gotGetMore();
 
@@ -220,6 +220,47 @@ namespace mongo {
                 }
             }
 
+            bool retVal = true;
+
+            // Fail the command if the PlanExecutor reports execution failure.
+            if (PlanExecutor::FAILURE == state) {
+                const std::unique_ptr<PlanStageStats> stats(exec->getStats());
+                error() << "GetMore executor error, stats: " << Explain::statsToBSON(*stats);
+                retVal = appendCommandStatus(result,
+                                             Status(ErrorCodes::OperationFailed,
+                                                    str::stream() << "GetMore executor error: "
+                                                        << WorkingSetCommon::toStatusString(obj)));
+            }
+            else {
+                CursorId respondWithId = 0;
+
+                if (shouldSaveCursorGetMore(state, exec, isCursorTailable(cursor))) {
+                    respondWithId = request.cursorid;
+
+                    exec->saveState();
+
+                    cursor->setLeftoverMaxTimeMicros(txn->getCurOp()->getRemainingMaxTimeMicros());
+                    cursor->incPos(numResults);
+
+                    if (isCursorTailable(cursor) && state == PlanExecutor::IS_EOF) {
+                        // Rather than swapping their existing RU into the client cursor, tailable
+                        // cursors should get a new recovery unit.
+                        ruSwapper.dismiss();
+                    }
+                }
+                else {
+                    txn->getCurOp()->debug().cursorExhausted = true;
+                }
+
+                appendGetMoreResponseObject(respondWithId,
+                                            request.nss.ns(),
+                                            nextBatch.arr(),
+                                            &result);
+                if (respondWithId) {
+                    cursorFreer.Dismiss();
+                }
+            }
+
             // If we are operating on an aggregation cursor, then we dropped our collection lock
             // earlier and need to reacquire it in order to clean up our ClientCursorPin.
             //
@@ -232,38 +273,7 @@ namespace mongo {
                     new Lock::CollectionLock(txn->lockState(), request.nss.ns(), MODE_IS));
             }
 
-            // Fail the command if the PlanExecutor reports execution failure.
-            if (PlanExecutor::FAILURE == state) {
-                const std::unique_ptr<PlanStageStats> stats(exec->getStats());
-                error() << "GetMore executor error, stats: " << Explain::statsToBSON(*stats);
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::OperationFailed,
-                                                  str::stream() << "GetMore executor error: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
-            }
-
-            CursorId respondWithId = 0;
-            if (shouldSaveCursorGetMore(state, exec, isCursorTailable(cursor))) {
-                respondWithId = request.cursorid;
-
-                exec->saveState();
-
-                cursor->setLeftoverMaxTimeMicros(txn->getCurOp()->getRemainingMaxTimeMicros());
-                cursor->incPos(numResults);
-
-                if (isCursorTailable(cursor) && state == PlanExecutor::IS_EOF) {
-                    // Rather than swapping their existing RU into the client cursor, tailable
-                    // cursors should get a new recovery unit.
-                    ruSwapper.dismiss();
-                }
-            }
-
-            Command::appendGetMoreResponseObject(respondWithId, request.nss.ns(), nextBatch.arr(),
-                                                 &result);
-            if (respondWithId) {
-                cursorFreer.Dismiss();
-            }
-            return true;
+            return retVal;
         }
 
     } getMoreCmd;

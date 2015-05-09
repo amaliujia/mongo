@@ -37,10 +37,14 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/lru_key_value.h"
+#include "mongo/db/query/plan_cache_indexability.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
+
+    // A PlanCacheKey is a string-ified version of a query's predicate/projection/sort.
+    typedef std::string PlanCacheKey;
 
     struct PlanRankingDecision;
     struct QuerySolution;
@@ -180,10 +184,6 @@ namespace mongo {
         // Owned here.
         std::vector<SolutionCacheData*> plannerData;
 
-        // An index into plannerData indicating the SolutionCacheData which should be
-        // used to produce a backup solution in the case of a blocking sort.
-        boost::optional<size_t> backupSoln;
-
         // Key used to provide feedback on the entry.
         PlanCacheKey key;
 
@@ -196,6 +196,10 @@ namespace mongo {
         BSONObj query;
         BSONObj sort;
         BSONObj projection;
+
+        // The number of work cycles taken to decide on a winning plan when the plan was first
+        // cached.
+        size_t decisionWorks;
     };
 
     /**
@@ -233,10 +237,6 @@ namespace mongo {
         // it from the cache a deep copy is made and returned inside CachedSolution.
         std::vector<SolutionCacheData*> plannerData;
 
-        // An index into plannerData indicating the SolutionCacheData which should be
-        // used to produce a backup solution in the case of a blocking sort.
-        boost::optional<size_t> backupSoln;
-
         // TODO: Do we really want to just hold a copy of the CanonicalQuery?  For now we just
         // extract the data we need.
         //
@@ -257,16 +257,6 @@ namespace mongo {
         // Annotations from cached runs.  The CachedPlanStage provides these stats about its
         // runs when they complete.
         std::vector<PlanCacheEntryFeedback*> feedback;
-
-        // The average score of all stored feedback.
-        boost::optional<double> averageScore;
-
-        // The standard deviation of the scores from stored as feedback.
-        boost::optional<double> stddevScore;
-
-        // In order to justify eviction, the deviation from the mean must exceed a
-        // minimum threshold.
-        static const double kMinDeviation;
     };
 
     /**
@@ -323,8 +313,8 @@ namespace mongo {
 
         /**
          * When the CachedPlanStage runs a plan out of the cache, we want to record data about the
-         * plan's performance.  The CachedPlanStage calls feedback(...) at the end of query
-         * execution in order to do this.
+         * plan's performance.  The CachedPlanStage calls feedback(...) after executing the cached
+         * plan for a trial period in order to do this.
          *
          * Cache takes ownership of 'feedback'.
          *
@@ -333,9 +323,6 @@ namespace mongo {
          *
          * If the entry corresponding to 'cq' still exists, 'feedback' is added to the run
          * statistics about the plan.  Status::OK() is returned.
-         *
-         * May cause the cache entry to be removed if it is determined that the cached plan
-         * is badly performing.
          */
         Status feedback(const CanonicalQuery& cq, PlanCacheEntryFeedback* feedback);
 
@@ -346,9 +333,20 @@ namespace mongo {
         Status remove(const CanonicalQuery& canonicalQuery);
 
         /**
-         * Remove *all* entries.
+         * Remove *all* cached plans.  Does not clear index information.
          */
         void clear();
+
+        /**
+         * Get the cache key corresponding to the given canonical query.  The query need not already
+         * be cached.
+         *
+         * This is provided in the public API simply as a convenience for consumers who need some
+         * description of query shape (e.g. index filters).
+         *
+         * Callers must hold the collection lock when calling this method.
+         */
+        PlanCacheKey computeKey(const CanonicalQuery&) const;
 
         /**
          * Returns a copy of a cache entry.
@@ -387,32 +385,37 @@ namespace mongo {
          */
         void notifyOfWriteOp();
 
-    private:
-
         /**
-         * Releases resources associated with each cache entry
-         * and clears map.
-         * Invoked by clear() and during destruction.
+         * Updates internal state kept about the collection's indexes.  Must be called when the set
+         * of indexes on the associated collection have changed.
+         *
+         * Callers must hold the collection lock in exclusive mode when calling this method.
          */
-        void _clear();
+        void notifyOfIndexEntries(const std::vector<IndexEntry>& indexEntries);
+
+    private:
+        void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) const;
+        void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) const;
+        void encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuilder) const;
 
         LRUKeyValue<PlanCacheKey, PlanCacheEntry> _cache;
 
-        /**
-         * Protects _cache.
-         */
+        // Protects _cache.
         mutable boost::mutex _cacheMutex;
 
-        /**
-         * Counter for write notifications since initialization or last clear() invocation.
-         * Starts at 0.
-         */
+        // Counter for write notifications since initialization or last clear() invocation.  Starts
+        // at 0.
         AtomicInt32 _writeOperations;
 
-        /**
-         * Full namespace of collection.
-         */
+        // Full namespace of collection.
         std::string _ns;
+
+        // Holds computed information about the collection's indexes.  Used for generating plan
+        // cache keys.
+        //
+        // Concurrent access is synchronized by the collection lock.  Multiple concurrent readers
+        // are allowed.
+        PlanCacheIndexabilityState _indexabilityState;
     };
 
 }  // namespace mongo

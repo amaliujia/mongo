@@ -31,28 +31,28 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/client/connpool.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/config.h"
-#include "mongo/s/distlock.h"
 #include "mongo/s/d_state.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
     using std::endl;
     using std::string;
     using mongoutils::str::stream;
 
-    static BSONObj buildApplyOpsCmd( const OwnedPointerVector<ChunkType>&,
-                                     const ChunkVersion&,
-                                     const ChunkVersion& );
+    static Status runApplyOpsCmd(const OwnedPointerVector<ChunkType>&,
+                                 const ChunkVersion&,
+                                 const ChunkVersion&);
 
     static BSONObj buildMergeLogEntry( const OwnedPointerVector<ChunkType>&,
                                        const ChunkVersion&,
@@ -82,15 +82,15 @@ namespace mongo {
         // Get the distributed lock
         //
 
-        ScopedDistributedLock collLock( configLoc, nss.ns() );
-        collLock.setLockMessage( stream() << "merging chunks in " << nss.ns() << " from "
-                                          << minKey << " to " << maxKey );
+        string whyMessage = stream() << "merging chunks in " << nss.ns()
+                                     << " from " << minKey << " to " << maxKey;
+        auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                nss.ns(), whyMessage);
 
-        Status acquisitionStatus = collLock.tryAcquire();
-        if (!acquisitionStatus.isOK()) {
+        if (!scopedDistLock.isOK()) {
             *errMsg = stream() << "could not acquire collection lock for " << nss.ns()
                                << " to merge chunks in [" << minKey << "," << maxKey << ")"
-                               << causedBy(acquisitionStatus);
+                               << causedBy(scopedDistLock.getStatus());
 
             warning() << *errMsg << endl;
             return false;
@@ -162,11 +162,10 @@ namespace mongo {
         itChunk.setNS( nss.ns() );
         itChunk.setShard( shardingState.getShardName() );
 
-        while ( itChunk.getMax().woCompare( maxKey ) < 0 &&
-                metadata->getNextChunk( itChunk.getMax(), &itChunk ) ) {
-            auto_ptr<ChunkType> saved( new ChunkType );
-            itChunk.cloneTo( saved.get() );
-            chunksToMerge.mutableVector().push_back( saved.release() );
+        while (itChunk.getMax().woCompare(maxKey) < 0 &&
+                metadata->getNextChunk(itChunk.getMax(), &itChunk)) {
+
+            chunksToMerge.mutableVector().push_back(new ChunkType(itChunk));
         }
 
         if ( chunksToMerge.empty() ) {
@@ -270,29 +269,9 @@ namespace mongo {
         //
         // Run apply ops command
         //
-
-        BSONObj applyOpsCmd = buildApplyOpsCmd( chunksToMerge,
-                                                shardVersion,
-                                                mergeVersion );
-
-        bool ok;
-        BSONObj result;
-        try {
-            ScopedDbConnection conn( configLoc, 30.0 );
-            ok = conn->runCommand( "config", applyOpsCmd, result );
-            if ( !ok ) *errMsg = result.toString();
-            conn.done();
-        }
-        catch( const DBException& ex ) {
-            ok = false;
-            *errMsg = ex.toString();
-        }
-
-        if ( !ok ) {
-            *errMsg = stream() << "could not merge chunks for " << nss.ns()
-                               << ", writing to config failed" << causedBy( errMsg );
-
-            warning() << *errMsg << endl;
+        Status applyOpsStatus = runApplyOpsCmd(chunksToMerge, shardVersion, mergeVersion);
+        if (!applyOpsStatus.isOK()) {
+            warning() << applyOpsStatus;
             return false;
         }
 
@@ -379,9 +358,10 @@ namespace mongo {
         return opB.obj();
     }
 
-    BSONObj buildOpPrecond( const string& ns,
-                            const string& shardName,
-                            const ChunkVersion& shardVersion ) {
+    BSONArray buildOpPrecond(const string& ns,
+                             const string& shardName,
+                             const ChunkVersion& shardVersion) {
+        BSONArrayBuilder preCond;
         BSONObjBuilder condB;
         condB.append( "ns", ChunkType::ConfigNS );
         condB.append( "q", BSON( "query" << BSON( ChunkType::ns( ns ) )
@@ -391,23 +371,21 @@ namespace mongo {
             shardVersion.addToBSON( resB, ChunkType::DEPRECATED_lastmod() );
             resB.done();
         }
-
-        return condB.obj();
+        preCond.append(condB.obj());
+        return preCond.arr();
     }
 
-    BSONObj buildApplyOpsCmd( const OwnedPointerVector<ChunkType>& chunksToMerge,
-                              const ChunkVersion& currShardVersion,
-                              const ChunkVersion& newMergedVersion ) {
+    Status runApplyOpsCmd(const OwnedPointerVector<ChunkType>& chunksToMerge,
+                          const ChunkVersion& currShardVersion,
+                          const ChunkVersion& newMergedVersion) {
 
-        BSONObjBuilder applyOpsCmdB;
-        BSONArrayBuilder updatesB( applyOpsCmdB.subarrayStart( "applyOps" ) );
+        BSONArrayBuilder updatesB;
 
         // The chunk we'll be "expanding" is the first chunk
         const ChunkType* chunkToMerge = *chunksToMerge.begin();
 
         // Fill in details not tracked by metadata
-        ChunkType mergedChunk;
-        chunkToMerge->cloneTo( &mergedChunk );
+        ChunkType mergedChunk = *chunkToMerge;
         mergedChunk.setName( Chunk::genID( chunkToMerge->getNS(), chunkToMerge->getMin() ) );
         mergedChunk.setMax( ( *chunksToMerge.vector().rbegin() )->getMax() );
         mergedChunk.setVersion( newMergedVersion );
@@ -422,14 +400,10 @@ namespace mongo {
             updatesB.append( buildOpRemoveChunk( *chunkToMerge ) );
         }
 
-        updatesB.done();
-
-        applyOpsCmdB.append( "preCondition",
-                             buildOpPrecond( chunkToMerge->getNS(),
-                                             chunkToMerge->getShard(),
-                                             currShardVersion ) );
-
-        return applyOpsCmdB.obj();
+        BSONArray preCond = buildOpPrecond(chunkToMerge->getNS(),
+                                           chunkToMerge->getShard(),
+                                           currShardVersion);
+        return grid.catalogManager()->applyChunkOpsDeprecated(updatesB.arr(), preCond);
     }
 
 }

@@ -8,7 +8,7 @@ env.Library(target="unittest",
                 'temp_dir.cpp',
                 'unittest_helpers.cpp',
             ],
-            LIBDEPS=['$BUILD_DIR/mongo/foundation',
+            LIBDEPS=['$BUILD_DIR/mongo/util/foundation',
                      '$BUILD_DIR/mongo/util/options_parser/options_parser',
             ])
 
@@ -16,7 +16,7 @@ env.Library("unittest_main", ['unittest_main.cpp'],
             LIBDEPS=[
                 'unittest',
                 '$BUILD_DIR/mongo/base/base',
-                '$BUILD_DIR/mongo/signal_handlers_synchronous',
+                '$BUILD_DIR/mongo/util/signal_handlers_synchronous',
                  ])
 
 env.Library("unittest_crutch", ['crutch.cpp'])

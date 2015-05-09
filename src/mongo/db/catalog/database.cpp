@@ -369,8 +369,9 @@ namespace mongo {
             if (nss.isSystem()) {
                 if (nss.isSystemDotProfile()) {
                     if ( _profile != 0 )
-                        return Status( ErrorCodes::IllegalOperation,
-                                       "turn off profiling before dropping system.profile collection" );
+                        return Status(
+                            ErrorCodes::IllegalOperation,
+                            "turn off profiling before dropping system.profile collection");
                 }
                 else {
                     return Status( ErrorCodes::IllegalOperation, "can't drop system ns" );
@@ -380,7 +381,7 @@ namespace mongo {
 
         BackgroundOperation::assertNoBgOpInProgForNs( fullns );
 
-        audit::logDropCollection( currentClient.get(), fullns );
+        audit::logDropCollection( &cc(), fullns );
 
         Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
         if ( !s.isOK() ) {
@@ -392,11 +393,12 @@ namespace mongo {
         verify( collection->_details->getTotalIndexCount( txn ) == 0 );
         LOG(1) << "\t dropIndexes done" << endl;
 
-        Top::global.collectionDropped( fullns );
+        Top::get(txn->getClient()->getServiceContext()).collectionDropped(fullns);
 
         s = _dbEntry->dropCollection( txn, fullns );
 
-        _clearCollectionCache( txn, fullns ); // we want to do this always
+         // we want to do this always
+        _clearCollectionCache(txn, fullns, "collection dropped");
 
         if ( !s.isOK() )
             return s;
@@ -420,7 +422,9 @@ namespace mongo {
         return Status::OK();
     }
 
-    void Database::_clearCollectionCache(OperationContext* txn, StringData fullns ) {
+    void Database::_clearCollectionCache(OperationContext* txn, 
+                                         StringData fullns,
+                                         const std::string& reason) {
         verify( _name == nsToDatabaseSubstring( fullns ) );
         CollectionMap::const_iterator it = _collections.find( fullns.toString() );
         if ( it == _collections.end() )
@@ -429,7 +433,7 @@ namespace mongo {
         // Takes ownership of the collection
         txn->recoveryUnit()->registerChange(new RemoveCollectionChange(this, it->second));
 
-        it->second->_cursorManager.invalidateAll(false);
+        it->second->_cursorManager.invalidateAll(false, reason);
         _collections.erase( it );
     }
 
@@ -450,23 +454,26 @@ namespace mongo {
                                        StringData toNS,
                                        bool stayTemp ) {
 
-        audit::logRenameCollection( currentClient.get(), fromNS, toNS );
+        audit::logRenameCollection( &cc(), fromNS, toNS );
         invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
         { // remove anything cached
             Collection* coll = getCollection( fromNS );
             if ( !coll )
-                return Status( ErrorCodes::NamespaceNotFound, "collection not found to rename" );
-            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator( txn, true );
+                return Status(ErrorCodes::NamespaceNotFound, "collection not found to rename");
+
+            string clearCacheReason = str::stream() << "renamed collection '" << fromNS
+                                                    << "' to '" << toNS << "'";
+            IndexCatalog::IndexIterator ii = coll->getIndexCatalog()->getIndexIterator(txn, true);
             while ( ii.more() ) {
                 IndexDescriptor* desc = ii.next();
-                _clearCollectionCache( txn, desc->indexNamespace() );
+                _clearCollectionCache(txn, desc->indexNamespace(), clearCacheReason);
             }
 
-            _clearCollectionCache( txn, fromNS );
-            _clearCollectionCache( txn, toNS );
+            _clearCollectionCache(txn, fromNS, clearCacheReason);
+            _clearCollectionCache(txn, toNS, clearCacheReason);
 
-            Top::global.collectionDropped( fromNS.toString() );
+            Top::get(txn->getClient()->getServiceContext()).collectionDropped(fromNS.toString());
         }
 
         txn->recoveryUnit()->registerChange( new AddCollectionChange(this, toNS) );
@@ -508,7 +515,7 @@ namespace mongo {
         NamespaceString nss( ns );
         uassert( 17316, "cannot create a blank collection", nss.coll() > 0 );
 
-        audit::logCreateCollection( currentClient.get(), ns );
+        audit::logCreateCollection( &cc(), ns );
 
         txn->recoveryUnit()->registerChange( new AddCollectionChange(this, ns) );
 
@@ -558,10 +565,18 @@ namespace mongo {
 
         for (vector<string>::iterator i = n.begin(); i != n.end(); i++) {
             if (*i != "local") {
-                Database* db = dbHolder().get(txn, *i);
-                invariant(db);
-
-                dropDatabase(txn, db);
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    Database* db = dbHolder().get(txn, *i);
+                    // This is needed since dropDatabase can't be rolled back.
+                    // This is safe be replaced by "invariant(db);dropDatabase(txn, db);" once fixed
+                    if (db == nullptr) {
+                        log() << "database disappeared after listDatabases but before drop: " << *i;
+                    } else {
+                        dropDatabase(txn, db);
+                    }
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn,
+                                                      "dropAllDatabasesExceptLocal",
+                                                      *i);
             }
         }
     }
@@ -577,7 +592,7 @@ namespace mongo {
 
         BackgroundOperation::assertNoBgOpInProgForDb(name.c_str());
 
-        audit::logDropDatabase( currentClient.get(), name );
+        audit::logDropDatabase( &cc(), name );
 
         dbHolder().close( txn, name );
         db = NULL; // d is now deleted

@@ -36,6 +36,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
@@ -49,7 +50,7 @@ namespace mongo {
 
     void SnapshotData::takeSnapshot() {
         _created = curTimeMicros64();
-        Top::global.cloneMap(_usage);
+        Top::get(getGlobalServiceContext()).cloneMap(_usage);
     }
 
     SnapshotDelta::SnapshotDelta( const SnapshotData& older , const SnapshotData& newer )
@@ -109,8 +110,6 @@ namespace mongo {
 
     void SnapshotThread::run() {
         Client::initThread("snapshot");
-        Client& client = cc();
-
         while ( ! inShutdown() ) {
             try {
                 statsSnapshots.takeSnapshot();
@@ -121,8 +120,6 @@ namespace mongo {
 
             sleepsecs(4);
         }
-
-        client.shutdown();
     }
 
     Snapshots statsSnapshots;

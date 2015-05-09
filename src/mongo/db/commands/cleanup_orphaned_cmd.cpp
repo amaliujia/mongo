@@ -47,14 +47,13 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/type_settings.h"
 #include "mongo/util/log.h"
 
 namespace {
     using mongo::WriteConcernOptions;
 
     const int kDefaultWTimeoutMs = 60 * 1000;
-    const WriteConcernOptions DefaultWriteConcern("majority",
+    const WriteConcernOptions DefaultWriteConcern(WriteConcernOptions::kMajority,
                                                   WriteConcernOptions::NONE,
                                                   kDefaultWTimeoutMs);
 }
@@ -194,7 +193,7 @@ namespace mongo {
         virtual Status checkAuthForCommand( ClientBasic* client,
                                             const std::string& dbname,
                                             const BSONObj& cmdObj ) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                         ResourcePattern::forClusterResource(), ActionType::cleanupOrphaned)) {
                 return Status(ErrorCodes::Unauthorized,
                               "Not authorized for cleanupOrphaned command.");
@@ -216,8 +215,7 @@ namespace mongo {
                   BSONObj &cmdObj,
                   int,
                   string &errmsg,
-                  BSONObjBuilder &result,
-                  bool ) {
+                  BSONObjBuilder &result) {
 
             string ns;
             if ( !FieldParser::extract( cmdObj, nsField, &ns, &errmsg ) ) {

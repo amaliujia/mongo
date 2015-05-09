@@ -44,6 +44,7 @@
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -84,7 +85,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                                         ResourcePattern::forExactNamespace(
                                                             NamespaceString(parseNs(dbname,
                                                                                     cmdObj))),
@@ -104,12 +105,7 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-
-            if (!configServer.allUp(false, errmsg)) {
-                return false;
-            }
+                         BSONObjBuilder& result) {
 
             ShardConnection::sync();
 

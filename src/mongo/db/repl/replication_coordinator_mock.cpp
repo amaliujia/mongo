@@ -33,6 +33,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -134,6 +135,10 @@ namespace repl {
     void ReplicationCoordinatorMock::setMyLastOptime(const Timestamp& ts) {}
 
     void ReplicationCoordinatorMock::resetMyLastOptime() {}
+
+    OpTime ReplicationCoordinatorMock::getMyLastOptimeV1() const {
+        return OpTime();
+    }
 
     Timestamp ReplicationCoordinatorMock::getMyLastOptime() const {
         // TODO
@@ -298,6 +303,32 @@ namespace repl {
     Timestamp ReplicationCoordinatorMock::getLastCommittedOpTime() const {
         return Timestamp();
     }
+
+    Status ReplicationCoordinatorMock::processReplSetRequestVotes(
+            OperationContext* txn,
+            const ReplSetRequestVotesArgs& args,
+            ReplSetRequestVotesResponse* response) {
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
+            const ReplSetDeclareElectionWinnerArgs& args,
+            long long* responseTerm) {
+        return Status::OK();
+    }
+
+    void ReplicationCoordinatorMock::prepareCursorResponseInfo(BSONObjBuilder* objBuilder) {}
+
+    Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+                                                          ReplSetHeartbeatResponseV1* response) {
+        return Status::OK();
+    }
+
+    bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
+        return true;
+    }
+
+    void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
 
 } // namespace repl
 } // namespace mongo

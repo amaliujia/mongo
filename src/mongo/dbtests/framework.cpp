@@ -46,12 +46,16 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/d_state.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/version.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -116,9 +120,18 @@ namespace mongo {
             srand( (unsigned) frameworkGlobalParams.seed );
             printGitVersion();
             printOpenSSLVersion();
-            printSysInfo();
 
             getGlobalServiceContext()->setGlobalStorageEngine(storageGlobalParams.engine);
+
+            // Initialize the sharding state so we can run starding tests in isolation
+            shardingState.initialize("$dummy:10000");
+
+            // Note: ShardingState::initialize also initializes the distLockMgr.
+            auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
+                    grid.catalogManager()->getDistLockManager());
+            if (distLockMgr) {
+                distLockMgr->enablePinger(false);
+            }
 
             TestWatchDog twd;
             twd.go();
@@ -128,7 +141,6 @@ namespace mongo {
                                                     frameworkGlobalParams.runsPerTest);
 
 
-            cc().shutdown();
             exitCleanly( (ExitCode)ret ); // so everything shuts down cleanly
             return ret;
         }

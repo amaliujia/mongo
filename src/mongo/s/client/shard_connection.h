@@ -37,14 +37,11 @@
 namespace mongo {
 
     class ChunkManager;
-    class Shard;
-
     typedef boost::shared_ptr<ChunkManager> ChunkManagerPtr;
+
     
     class ShardConnection : public AScopedConnection {
     public:
-        ShardConnection(const Shard* s, const std::string& ns, ChunkManagerPtr manager = ChunkManagerPtr());
-        ShardConnection(const Shard& s, const std::string& ns, ChunkManagerPtr manager = ChunkManagerPtr());
         ShardConnection(const std::string& addr, const std::string& ns, ChunkManagerPtr manager = ChunkManagerPtr());
 
         ~ShardConnection();
@@ -137,22 +134,6 @@ namespace mongo {
 
         DBClientBase* _conn;
         bool _setVersion;
-    };
-
-
-    class ShardingConnectionHook : public DBConnectionHook {
-    public:
-
-        ShardingConnectionHook( bool shardedConnections )
-            : _shardedConnections( shardedConnections ) {
-
-        }
-
-        virtual void onCreate( DBClientBase * conn );
-        virtual void onDestroy( DBClientBase * conn );
-        virtual void onRelease(DBClientBase* conn);
-
-        bool _shardedConnections;
     };
 
 

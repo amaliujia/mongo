@@ -479,6 +479,32 @@ namespace {
         }
 #endif
 
+        bool haveAuthenticationMechanisms = true;
+        bool hasAuthorizationEnabled = false;
+        if (params.count("security.authenticationMechanisms") &&
+            params["security.authenticationMechanisms"].as<std::vector<std::string> >().empty()) {
+            haveAuthenticationMechanisms = false;
+        }
+        if (params.count("setParameter")) {
+            std::map<std::string, std::string> parameters =
+                params["setParameter"].as<std::map<std::string, std::string> >();
+            auto authMechParameter = parameters.find("authenticationMechanisms");
+            if (authMechParameter != parameters.end() && authMechParameter->second.empty()) {
+                haveAuthenticationMechanisms = false;
+            }
+        }
+        if ((params.count("security.authorization") &&
+            params["security.authorization"].as<std::string>() == "enabled") ||
+            params.count("security.clusterAuthMode") ||
+            params.count("security.keyFile") ||
+            params.count("auth")) {
+            hasAuthorizationEnabled = true;
+        }
+        if (hasAuthorizationEnabled && !haveAuthenticationMechanisms) {
+            return Status(ErrorCodes::BadValue,
+                          "Authorization is enabled but no authentication mechanisms are present.");
+        }
+
         return Status::OK();
     }
 
@@ -952,8 +978,5 @@ namespace {
 
         return Status::OK();
     }
-
-    // FIXME: This function will not return the correct value if someone renames the mongos binary
-    bool isMongos() { return serverGlobalParams.binaryName == "mongos"; }
 
 } // namespace mongo

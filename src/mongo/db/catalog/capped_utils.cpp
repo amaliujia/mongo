@@ -33,6 +33,7 @@
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -41,6 +42,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -158,6 +160,8 @@ namespace {
                     InternalPlanner::FORWARD));
 
 
+        DisableDocumentValidation validationDisabler(txn);
+
         while (true) {
             BSONObj obj;
             PlanExecutor::ExecState state = exec->getNext(&obj, NULL);
@@ -224,8 +228,9 @@ namespace {
         }
 
 
-        bool shouldReplicateWrites = txn->writesAreReplicated();
+        const bool shouldReplicateWrites = txn->writesAreReplicated();
         txn->setReplicatedWrites(false);
+        ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
         Status status = cloneCollectionAsCapped(txn,
                                                 db,
                                                 shortSource.toString(),
@@ -234,7 +239,6 @@ namespace {
                                                 true);
 
         if (!status.isOK()) {
-            txn->setReplicatedWrites(shouldReplicateWrites);
             return status;
         }
 

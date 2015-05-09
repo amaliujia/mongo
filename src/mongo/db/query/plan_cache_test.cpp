@@ -54,6 +54,7 @@ namespace {
     using boost::scoped_ptr;
     using std::auto_ptr;
     using std::string;
+    using std::unique_ptr;
     using std::vector;
 
     static const char* ns = "somebogusns";
@@ -142,7 +143,7 @@ namespace {
     MatchExpression* parseMatchExpression(const BSONObj& obj) {
         StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
         if (!status.isOK()) {
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "failed to parse query: " << obj.toString()
                << ". Reason: " << status.getStatus().toString();
             FAIL(ss);
@@ -155,7 +156,7 @@ namespace {
         if (actual->equivalent(expected)) {
             return;
         }
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Match expressions are not equivalent."
            << "\nOriginal query: " << queryStr
            << "\nExpected: " << expected->toString()
@@ -206,7 +207,7 @@ namespace {
         if (PlanCache::shouldCacheQuery(query)) {
             return;
         }
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Canonical query should be cacheable: " << query.toString();
         FAIL(ss);
     }
@@ -215,7 +216,7 @@ namespace {
         if (!PlanCache::shouldCacheQuery(query)) {
             return;
         }
-        mongoutils::str::stream ss;
+        str::stream ss;
         ss << "Canonical query should not be cacheable: " << query.toString();
         FAIL(ss);
     }
@@ -466,11 +467,13 @@ namespace {
             // The first false means not multikey.
             // The second false means not sparse.
             // The third arg is the index name and I am egotistical.
+            // The NULL means no filter expression.
             params.indices.push_back(IndexEntry(keyPattern,
                                                 multikey,
                                                 false,
                                                 false,
                                                 "hari_king_of_the_stove",
+                                                NULL,
                                                 BSONObj()));
         }
 
@@ -480,6 +483,7 @@ namespace {
                                                 sparse,
                                                 false,
                                                 "note_to_self_dont_break_build",
+                                                NULL,
                                                 BSONObj()));
         }
 
@@ -564,7 +568,7 @@ namespace {
         // Solution introspection.
         //
 
-        void dumpSolutions(mongoutils::str::stream& ost) const {
+        void dumpSolutions(str::stream& ost) const {
             for (vector<QuerySolution*>::const_iterator it = solns.begin();
                     it != solns.end();
                     ++it) {
@@ -601,7 +605,7 @@ namespace {
             if (numMatches == matches) {
                 return;
             }
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "expected " << numMatches << " matches for solution " << solnJson
                << " but got " << matches
                << " instead. all solutions generated: " << '\n';
@@ -645,11 +649,9 @@ namespace {
             PlanCacheEntry entry(solutions, createDecision(1U));
             CachedSolution cachedSoln(ck, entry);
 
-            QuerySolution *out, *backupOut;
-            s = QueryPlanner::planFromCache(*scopedCq.get(), params, cachedSoln,
-                                            &out, &backupOut);
+            QuerySolution *out;
+            s = QueryPlanner::planFromCache(*scopedCq.get(), params, cachedSoln, &out);
             ASSERT_OK(s);
-            std::auto_ptr<QuerySolution> cleanBackup(backupOut);
 
             return out;
         }
@@ -671,7 +673,7 @@ namespace {
                 }
             }
 
-            mongoutils::str::stream ss;
+            str::stream ss;
             ss << "Could not find a match for solution " << solnJson
                << " All solutions generated: " << '\n';
             dumpSolutions(ss);
@@ -689,7 +691,7 @@ namespace {
         void assertSolutionMatches(QuerySolution* trueSoln, const string& solnJson) const {
             BSONObj testSoln = fromjson(solnJson);
             if (!QueryPlannerTestLib::solutionMatches(testSoln, trueSoln->root.get())) {
-                mongoutils::str::stream ss;
+                str::stream ss;
                 ss << "Expected solution " << solnJson << " did not match true solution: "
                    << trueSoln->toString() << '\n';
                 FAIL(ss);
@@ -1052,6 +1054,162 @@ namespace {
         runQuery(query);
         assertNotCached("{or: {nodes: [{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}},"
                                       "{fetch: {node: {ixscan: {pattern: {b: '2d'}}}}}]}}");
+    }
+
+    /**
+     * Test functions for computeKey.  Cache keys are intentionally obfuscated and are
+     * meaningful only within the current lifetime of the server process. Users should treat plan
+     * cache keys as opaque.
+     */
+    void testComputeKey(const char* queryStr,
+                        const char* sortStr,
+                        const char* projStr,
+                        const char *expectedStr) {
+        PlanCache planCache;
+        auto_ptr<CanonicalQuery> cq(canonicalize(queryStr, sortStr, projStr));
+        PlanCacheKey key = planCache.computeKey(*cq);
+        PlanCacheKey expectedKey(expectedStr);
+        if (key == expectedKey) {
+            return;
+        }
+        str::stream ss;
+        ss << "Unexpected plan cache key. Expected: " << expectedKey << ". Actual: " << key
+           << ". Query: " << cq->toString();
+        FAIL(ss);
+    }
+
+    TEST(PlanCacheTest, ComputeKey) {
+        // Generated cache keys should be treated as opaque to the user.
+
+        // No sorts
+        testComputeKey("{}", "{}", "{}", "an");
+        testComputeKey("{$or: [{a: 1}, {b: 2}]}", "{}", "{}", "or[eqa,eqb]");
+        testComputeKey("{$or: [{a: 1}, {b: 1}, {c: 1}], d: 1}", "{}", "{}",
+                       "an[or[eqa,eqb,eqc],eqd]");
+        testComputeKey("{$or: [{a: 1}, {b: 1}], c: 1, d: 1}", "{}", "{}",
+                       "an[or[eqa,eqb],eqc,eqd]");
+        testComputeKey("{a: 1, b: 1, c: 1}", "{}", "{}", "an[eqa,eqb,eqc]");
+        testComputeKey("{a: 1, beqc: 1}", "{}", "{}", "an[eqa,eqbeqc]");
+        testComputeKey("{ap1a: 1}", "{}", "{}", "eqap1a");
+        testComputeKey("{aab: 1}", "{}", "{}", "eqaab");
+
+        // With sort
+        testComputeKey("{}", "{a: 1}", "{}", "an~aa");
+        testComputeKey("{}", "{a: -1}", "{}", "an~da");
+        testComputeKey("{}", "{a: {$meta: 'textScore'}}", "{a: {$meta: 'textScore'}}",
+                       "an~ta|{ $meta: \"textScore\" }a");
+        testComputeKey("{a: 1}", "{b: 1}", "{}", "eqa~ab");
+
+        // With projection
+        testComputeKey("{}", "{}", "{a: 1}", "an|1a");
+        testComputeKey("{}", "{}", "{a: 0}", "an|0a");
+        testComputeKey("{}", "{}", "{a: 99}", "an|99a");
+        testComputeKey("{}", "{}", "{a: 'foo'}", "an|\"foo\"a");
+        testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}}", "an|{ $slice: \\[ 3\\, 5 \\] }a");
+        testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}}",
+                       "an|{ $elemMatch: { x: 2 } }a");
+        testComputeKey("{a: 1}", "{}", "{'a.$': 1}", "eqa|1a.$");
+        testComputeKey("{a: 1}", "{}", "{a: 1}", "eqa|1a");
+
+        // Projection should be order-insensitive
+        testComputeKey("{}", "{}", "{a: 1, b: 1}", "an|1a1b");
+        testComputeKey("{}", "{}", "{b: 1, a: 1}", "an|1a1b");
+
+        // With or-elimination and projection
+        testComputeKey("{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}", "eqa|0_id1a");
+        testComputeKey("{$or: [{a: 1}]}", "{}", "{'a.$': 1}", "eqa|1a.$");
+    }
+
+    // Delimiters found in user field names or non-standard projection field values
+    // must be escaped.
+    TEST(PlanCacheTest, ComputeKeyEscaped) {
+        // Field name in query.
+        testComputeKey("{'a,[]~|<>': 1}", "{}", "{}", "eqa\\,\\[\\]\\~\\|\\<\\>");
+
+        // Field name in sort.
+        testComputeKey("{}", "{'a,[]~|<>': 1}", "{}", "an~aa\\,\\[\\]\\~\\|\\<\\>");
+
+        // Field name in projection.
+        testComputeKey("{}", "{}", "{'a,[]~|<>': 1}", "an|1a\\,\\[\\]\\~\\|\\<\\>");
+
+        // Value in projection.
+        testComputeKey("{}", "{}", "{a: 'foo,[]~|<>'}", "an|\"foo\\,\\[\\]\\~\\|\\<\\>\"a");
+    }
+
+    // Cache keys for $geoWithin queries with legacy and GeoJSON coordinates should
+    // not be the same.
+    TEST(PlanCacheTest, ComputeKeyGeoWithin) {
+        PlanCache planCache;
+
+        // Legacy coordinates.
+        auto_ptr<CanonicalQuery> cqLegacy(canonicalize("{a: {$geoWithin: "
+                                                       "{$box: [[-180, -90], [180, 90]]}}}"));
+        // GeoJSON coordinates.
+        auto_ptr<CanonicalQuery> cqNew(canonicalize("{a: {$geoWithin: "
+                                                    "{$geometry: {type: 'Polygon', coordinates: "
+                                                    "[[[0, 0], [0, 90], [90, 0], [0, 0]]]}}}}"));
+        ASSERT_NOT_EQUALS(planCache.computeKey(*cqLegacy),
+                          planCache.computeKey(*cqNew));
+    }
+
+    // GEO_NEAR cache keys should include information on geometry and CRS in addition
+    // to the match type and field name.
+    TEST(PlanCacheTest, ComputeKeyGeoNear) {
+        testComputeKey("{a: {$near: [0,0], $maxDistance:0.3 }}", "{}", "{}", "gnanrfl");
+        testComputeKey("{a: {$nearSphere: [0,0], $maxDistance: 0.31 }}", "{}", "{}", "gnanssp");
+        testComputeKey("{a: {$geoNear: {$geometry: {type: 'Point', coordinates: [0,0]},"
+                       "$maxDistance:100}}}", "{}", "{}", "gnanrsp");
+    }
+
+    // When a sparse index is present, computeKey() should generate different keys depending on
+    // whether or not the predicates in the given query can use the index.
+    TEST(PlanCacheTest, ComputeKeySparseIndex) {
+        PlanCache planCache;
+        planCache.notifyOfIndexEntries({IndexEntry(BSON("a" << 1),
+                                                   false, // multikey
+                                                   true, // sparse
+                                                   false, // unique
+                                                   "", // name
+                                                   nullptr, // filterExpr
+                                                   BSONObj())});
+
+        unique_ptr<CanonicalQuery> cqEqNumber(canonicalize("{a: 0}}"));
+        unique_ptr<CanonicalQuery> cqEqString(canonicalize("{a: 'x'}}"));
+        unique_ptr<CanonicalQuery> cqEqNull(canonicalize("{a: null}}"));
+
+        // 'cqEqNumber' and 'cqEqString' get the same key, since both are compatible with this
+        // index.
+        ASSERT_EQ(planCache.computeKey(*cqEqNumber), planCache.computeKey(*cqEqString));
+
+        // 'cqEqNull' gets a different key, since it is not compatible with this index.
+        ASSERT_NOT_EQUALS(planCache.computeKey(*cqEqNull), planCache.computeKey(*cqEqNumber));
+    }
+
+    // When a partial index is present, computeKey() should generate different keys depending on
+    // whether or not the predicates in the given query "match" the predicates in the partial index
+    // filter.
+    TEST(PlanCacheTest, ComputeKeyPartialIndex) {
+        BSONObj filterObj = BSON("f" << BSON("$gt" << 0));
+        unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+        PlanCache planCache;
+        planCache.notifyOfIndexEntries({IndexEntry(BSON("a" << 1),
+                                                   false, // multikey
+                                                   false, // sparse
+                                                   false, // unique
+                                                   "", // name
+                                                   filterExpr.get(),
+                                                   BSONObj())});
+
+        unique_ptr<CanonicalQuery> cqGtNegativeFive(canonicalize("{f: {$gt: -5}}"));
+        unique_ptr<CanonicalQuery> cqGtZero(canonicalize("{f: {$gt: 0}}"));
+        unique_ptr<CanonicalQuery> cqGtFive(canonicalize("{f: {$gt: 5}}"));
+
+        // 'cqGtZero' and 'cqGtFive' get the same key, since both are compatible with this index.
+        ASSERT_EQ(planCache.computeKey(*cqGtZero), planCache.computeKey(*cqGtFive));
+
+        // 'cqGtNegativeFive' gets a different key, since it is not compatible with this index.
+        ASSERT_NOT_EQUALS(planCache.computeKey(*cqGtNegativeFive), planCache.computeKey(*cqGtZero));
     }
 
 }  // namespace

@@ -28,29 +28,49 @@
 
 #pragma once
 
+#include <boost/thread/condition.hpp>
+#include <boost/thread/thread.hpp>
 #include <string>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/s/catalog/catalog_manager.h"
 
 namespace mongo {
+
+    class DistLockManager;
+
 
     /**
      * Implements the catalog manager using the legacy 3-config server protocol.
      */
     class CatalogManagerLegacy : public CatalogManager {
     public:
-        CatalogManagerLegacy() = default;
-        virtual ~CatalogManagerLegacy() = default;
+        CatalogManagerLegacy();
+        virtual ~CatalogManagerLegacy();
 
         /**
          * Initializes the catalog manager with the hosts, which will be used as a configuration
          * server. Can only be called once for the lifetime.
          */
-        Status init(const std::vector<std::string>& configHosts);
+        Status init(const ConnectionString& configCS);
+
+        /**
+         * Starts the thread that periodically checks data consistency amongst the config servers.
+         * Note: this is not thread safe and can only be called once for the lifetime.
+         */
+        Status startConfigServerChecker();
+
+        virtual void shutDown() override;
 
         virtual Status enableSharding(const std::string& dbName);
+
+        virtual Status shardCollection(const std::string& ns,
+                                       const ShardKeyPattern& fieldsAndOrder,
+                                       bool unique,
+                                       std::vector<BSONObj>* initPoints,
+                                       std::vector<Shard>* initShards);
 
         virtual StatusWith<std::string> addShard(const std::string& name,
                                                  const ConnectionString& shardConnectionString,
@@ -65,21 +85,45 @@ namespace mongo {
 
         virtual StatusWith<DatabaseType> getDatabase(const std::string& dbName);
 
+        virtual Status updateCollection(const std::string& collNs, const CollectionType& coll);
+
+        virtual StatusWith<CollectionType> getCollection(const std::string& collNs);
+
+        virtual Status getCollections(const std::string* dbName,
+                                      std::vector<CollectionType>* collections);
+
+        virtual Status dropCollection(const std::string& collectionNs);
+
         virtual void getDatabasesForShard(const std::string& shardName,
                                           std::vector<std::string>* dbs);
 
         virtual Status getChunksForShard(const std::string& shardName,
                                          std::vector<ChunkType>* chunks);
 
+        virtual Status getChunks(const Query& query, std::vector<ChunkType>* chunks);
+
         virtual Status getAllShards(std::vector<ShardType>* shards);
+
+        virtual bool isShardHost(const ConnectionString& shardConnectionString);
+
+        virtual bool doShardsExist();
+
+        virtual Status applyChunkOpsDeprecated(const BSONArray& updateOps,
+                                               const BSONArray& preCondition);
+
+        virtual void logAction(const ActionLogType& actionLog);
 
         virtual void logChange(OperationContext* txn,
                                const std::string& what,
                                const std::string& ns,
                                const BSONObj& detail);
 
+        virtual StatusWith<SettingsType> getGlobalSettings(const std::string& key);
+
         virtual void writeConfigServerDirect(const BatchedCommandRequest& request,
                                              BatchedCommandResponse* response);
+
+        virtual DistLockManager* getDistLockManager() override;
 
     private:
         /**
@@ -94,9 +138,53 @@ namespace mongo {
          */
         StatusWith<std::string> _getNewShardName() const;
 
+        /**
+         * Returns the number of shards recognized by the config servers
+         * in this sharded cluster.
+         * Optional: use query parameter to filter shard count.
+         */
+        size_t _getShardCount(const BSONObj& query = {}) const;
+
+        /**
+         * Returns true if all config servers have the same state.
+         * If inconsistency detected on first attempt, checks at most 3 more times.
+         */
+        bool _checkConfigServersConsistent(const unsigned tries = 4) const;
+
+        /**
+         * Checks data consistency amongst config servers every 60 seconds.
+         */
+        void _consistencyChecker();
+
+        /**
+         * Returns true if the config servers have the same contents since the last
+         * check was performed.
+         */
+        bool _isConsistentFromLastCheck();
+
         // Parsed config server hosts, as specified on the command line.
         ConnectionString _configServerConnectionString;
         std::vector<ConnectionString> _configServers;
+
+        // Distribted lock manager singleton.
+        std::unique_ptr<DistLockManager> _distLockManager;
+
+        // protects _inShutdown, _consistentFromLastCheck; used by _consistencyCheckerCV
+        boost::mutex _mutex;
+
+        // True if CatalogManagerLegacy::shutDown has been called. False, otherwise.
+        bool _inShutdown = false;
+
+        // used by consistency checker thread to check if config
+        // servers are consistent
+        bool _consistentFromLastCheck = false;
+
+        // Thread that runs dbHash on config servers for checking data consistency.
+        boost::thread _consistencyCheckerThread;
+
+        // condition variable used by the consistency checker thread to wait
+        // for <= 60s, on every iteration, until shutDown is called
+        boost::condition _consistencyCheckerCV;
     };
 
 } // namespace mongo

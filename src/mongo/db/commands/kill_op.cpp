@@ -60,7 +60,7 @@ namespace mongo {
                                    const std::string& dbname,
                                    const BSONObj& cmdObj) final {
 
-            bool isAuthorized = client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                                     ResourcePattern::forClusterResource(),
                                     ActionType::killop);
             return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -71,8 +71,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) final {
+                 BSONObjBuilder& result) final {
 
             long long op;
             uassertStatusOK(bsonExtractIntegerField(cmdObj, "op", &op));

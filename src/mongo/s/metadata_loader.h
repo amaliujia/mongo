@@ -36,6 +36,7 @@
 
 namespace mongo {
 
+    class CatalogManager;
     class CollectionMetadata;
     class CollectionType;
     class DBClientCursor;
@@ -66,12 +67,7 @@ namespace mongo {
     class MetadataLoader {
     public:
 
-        /**
-         * Takes a connection std::string to the config servers to be used for loading data. Note
-         * that we make no restrictions about which connection std::string that is, including
-         * CUSTOM, which we rely on in testing.
-         */
-        explicit MetadataLoader( const ConnectionString& configLoc );
+        explicit MetadataLoader();
 
         ~MetadataLoader();
 
@@ -94,10 +90,11 @@ namespace mongo {
          * @return HostUnreachable if there was an error contacting the config servers
          * @return RemoteChangeDetected if the data loaded was modified by another operation
          */
-        Status makeCollectionMetadata( const std::string& ns,
-                                       const std::string& shard,
-                                       const CollectionMetadata* oldMetadata,
-                                       CollectionMetadata* metadata ) const;
+        Status makeCollectionMetadata(CatalogManager* catalogManager,
+                                      const std::string& ns,
+                                      const std::string& shard,
+                                      const CollectionMetadata* oldMetadata,
+                                      CollectionMetadata* metadata) const;
 
         /**
          * Replaces the pending chunks of the remote metadata with the more up-to-date pending
@@ -124,7 +121,6 @@ namespace mongo {
                                      CollectionMetadata* remoteMetadata ) const;
 
     private:
-        ConnectionString _configLoc;
 
         /**
          * Returns OK and fills in the internal state of 'metadata' with general collection
@@ -137,9 +133,10 @@ namespace mongo {
          * @return RemoteChangeDetected if the collection doc loaded is unexpectedly different
          *
          */
-        Status initCollection( const std::string& ns,
+        Status _initCollection(CatalogManager* catalogManager,
+                               const std::string& ns,
                                const std::string& shard,
-                               CollectionMetadata* metadata ) const;
+                               CollectionMetadata* metadata) const;
 
         /**
          * Returns OK and fills in the chunk state of 'metadata' to portray the chunks of the
@@ -154,10 +151,11 @@ namespace mongo {
          * @return NamespaceNotFound if there are no chunks loaded and an epoch change is detected
          * TODO: @return FailedToParse
          */
-        Status initChunks( const std::string& ns,
-                           const std::string& shard,
-                           const CollectionMetadata* oldMetadata,
-                           CollectionMetadata* metadata ) const;
+        Status initChunks(CatalogManager* catalogManager,
+                          const std::string& ns,
+                          const std::string& shard,
+                          const CollectionMetadata* oldMetadata,
+                          CollectionMetadata* metadata ) const;
     };
 
 } // namespace mongo

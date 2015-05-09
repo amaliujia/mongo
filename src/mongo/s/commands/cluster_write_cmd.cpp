@@ -29,19 +29,19 @@
 #include "mongo/platform/basic.h"
  
 #include "mongo/base/error_codes.h"
+#include "mongo/db/client.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
-#include "mongo/s/cluster_write.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/s/client_info.h"
-#include "mongo/s/cluster_last_error_info.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/s/cluster_explain.h"
+#include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/cluster_write.h"
+#include "mongo/s/write_ops/batch_upconvert.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/batch_upconvert.h"
-#include "mongo/db/stats/counters.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -77,7 +77,7 @@ namespace {
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
 
-            Status status = auth::checkAuthForWriteCommand(client->getAuthorizationSession(),
+            Status status = auth::checkAuthForWriteCommand(AuthorizationSession::get(client),
                                                            _writeType,
                                                            NamespaceString(parseNs(dbname,
                                                                                    cmdObj)),
@@ -85,7 +85,7 @@ namespace {
 
             // TODO: Remove this when we standardize GLE reporting from commands
             if (!status.isOK()) {
-                setLastError(status.code(), status.reason().c_str());
+                LastError::get(client).setLastError(status.code(), status.reason());
             }
 
             return status;
@@ -142,16 +142,14 @@ namespace {
                          BSONObj& cmdObj,
                          int options,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             BatchedCommandRequest request(_writeType);
             BatchedCommandResponse response;
 
             ClusterWriter writer(true, 0);
 
-            // NOTE: Sometimes this command is invoked with LE disabled for legacy writes
-            LastError* cmdLastError = lastError.get(false);
+            LastError* cmdLastError = &LastError::get(cc());
 
             {
                 // Disable the last error object for the duration of the write
@@ -175,11 +173,9 @@ namespace {
                 dassert(response.isValid(NULL));
             }
 
-            if (cmdLastError) {
-                // Populate the lastError object based on the write response
-                cmdLastError->reset();
-                batchErrorToLastError(request, response, cmdLastError);
-            }
+            // Populate the lastError object based on the write response
+            cmdLastError->reset();
+            batchErrorToLastError(request, response, cmdLastError);
 
             size_t numAttempts;
 
@@ -212,9 +208,8 @@ namespace {
             }
 
             // Save the last opTimes written on each shard for this client, to allow GLE to work
-            if (ClientInfo::exists() && writer.getStats().hasShardStats()) {
-                ClientInfo* clientInfo = ClientInfo::get();
-                ClusterLastErrorInfo::get(clientInfo).addHostOpTimes(
+            if (haveClient() && writer.getStats().hasShardStats()) {
+                ClusterLastErrorInfo::get(cc()).addHostOpTimes(
                         writer.getStats().getShardStats().getWriteOpTimes());
             }
 

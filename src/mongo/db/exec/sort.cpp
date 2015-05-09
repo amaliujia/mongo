@@ -231,7 +231,7 @@ namespace mongo {
         params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
         // We're creating a "virtual index" with key pattern equal to the sort order.
-        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, false, "doesnt_matter",
+        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, false, "doesnt_matter", NULL,
                              BSONObj());
         params.indices.push_back(sortOrder);
 
@@ -483,11 +483,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* SortStage::getCommonStats() {
+    const CommonStats* SortStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* SortStage::getSpecificStats() {
+    const SpecificStats* SortStage::getSpecificStats() const {
         return &_specificStats;
     }
 

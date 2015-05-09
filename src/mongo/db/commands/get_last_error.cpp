@@ -66,10 +66,13 @@ namespace mongo {
             help << "reset error state (used with getpreverror)";
         }
         CmdResetError() : Command("resetError", false, "reseterror") {}
-        bool run(OperationContext* txn, const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            LastError *le = lastError.get();
-            verify( le );
-            le->reset();
+        bool run(OperationContext* txn,
+                 const string& db,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
+            LastError::get(txn->getClient()).reset();
             return true;
         }
     } cmdResetError;
@@ -83,7 +86,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         virtual void help( stringstream& help ) const {
-            lastError.disableForCommand(); // SERVER-11492
+            LastError::get(cc()).disable(); // SERVER-11492
             help << "return error status of the last operation on this connection\n"
                  << "options:\n"
                  << "  { fsync:true } - fsync before returning, or wait for journal commit if running with --journal\n"
@@ -97,8 +100,7 @@ namespace mongo {
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl ) {
+                  BSONObjBuilder& result) {
 
             //
             // Correct behavior here is very finicky.
@@ -124,7 +126,8 @@ namespace mongo {
             // err is null.
             //
 
-            LastError *le = lastError.disableForCommand();
+            LastError *le = &LastError::get(txn->getClient());
+            le->disable();
 
             // Always append lastOp and connectionId
             Client& c = *txn->getClient();
@@ -169,9 +172,8 @@ namespace mongo {
 
             // Errors aren't reported when wOpTime is used
             if ( !lastOpTimePresent ) {
-                if ( le->nPrev != 1 ) {
+                if ( le->getNPrev() != 1 ) {
                     errorOccurred = LastError::noError.appendSelf( result, false );
-                    le->appendSelfStatus( result );
                 }
                 else {
                     errorOccurred = le->appendSelf( result, false );
@@ -275,13 +277,19 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         CmdGetPrevError() : Command("getPrevError", false, "getpreverror") {}
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            LastError *le = lastError.disableForCommand();
-            le->appendSelf( result );
-            if ( le->valid )
-                result.append( "nPrev", le->nPrev );
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
+            LastError *le = &LastError::get(txn->getClient());
+            le->disable();
+            le->appendSelf(result, true);
+            if (le->isValid())
+                result.append("nPrev", le->getNPrev());
             else
-                result.append( "nPrev", -1 );
+                result.append("nPrev", -1);
             return true;
         }
     } cmdGetPrevError;

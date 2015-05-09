@@ -40,6 +40,7 @@ namespace mongo {
 
     class CanonicalQuery;
     class ChunkManager;
+    class CollectionType;
     struct QuerySolutionNode;
 
     typedef boost::shared_ptr<ChunkManager> ChunkManagerPtr;
@@ -114,7 +115,7 @@ namespace mongo {
         typedef std::map<std::string, ChunkVersion> ShardVersionMap;
 
         // Loads a new chunk manager from a collection document
-        ChunkManager( const BSONObj& collDoc );
+        explicit ChunkManager(const CollectionType& coll);
 
         // Creates an empty chunk manager for the namespace
         ChunkManager( const std::string& ns, const ShardKeyPattern& pattern, bool unique );
@@ -136,13 +137,12 @@ namespace mongo {
         //
 
         // Creates new chunks based on info in chunk manager
-        void createFirstChunks( const std::string& config,
-                                const Shard& primary,
-                                const std::vector<BSONObj>* initPoints,
-                                const std::vector<Shard>* initShards );
+        void createFirstChunks(const Shard& primary,
+                               const std::vector<BSONObj>* initPoints,
+                               const std::vector<Shard>* initShards);
 
         // Loads existing ranges based on info in chunk manager
-        void loadExistingRanges(const std::string& config, const ChunkManager* oldManager);
+        void loadExistingRanges(const ChunkManager* oldManager);
 
 
         // Helpers for load
@@ -203,10 +203,6 @@ namespace mongo {
         ChunkVersion getVersion(const std::string& shardName) const;
         ChunkVersion getVersion() const;
 
-        void getInfo( BSONObjBuilder& b ) const;
-
-        void drop() const;
-
         void _printChunks() const;
 
         int getCurrentDesiredChunkSize() const;
@@ -221,8 +217,7 @@ namespace mongo {
         // helpers for loading
 
         // returns true if load was consistent
-        bool _load(const std::string& config,
-                   ChunkMap& chunks,
+        bool _load(ChunkMap& chunks,
                    std::set<Shard>& shards,
                    ShardVersionMap* shardVersions,
                    const ChunkManager* oldManager);
