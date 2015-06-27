@@ -151,6 +151,7 @@ src/session/session_compact.c
 src/session/session_dhandle.c
 src/session/session_salvage.c
 src/support/cksum.c
+src/support/crypto.c
 src/support/err.c
 src/support/filename.c
 src/support/global.c
@@ -167,4 +168,5 @@ src/txn/txn.c
 src/txn/txn_ckpt.c
 src/txn/txn_ext.c
 src/txn/txn_log.c
+src/txn/txn_nsnap.c
 src/txn/txn_recover.c

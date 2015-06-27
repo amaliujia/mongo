@@ -109,7 +109,7 @@ __wt_lsm_get_chunk_to_flush(WT_SESSION_IMPL *session,
 	 * enough to trigger checkpoints.
 	 */
 	if (evict_chunk != NULL && flush_chunk != NULL) {
-		chunk = (__wt_random(session->rnd) & 1) ?
+		chunk = (__wt_random(&session->rnd) & 1) ?
 		    evict_chunk : flush_chunk;
 		WT_ERR(__wt_lsm_manager_push_entry(
 		    session, WT_LSM_WORK_FLUSH, 0, lsm_tree));
@@ -215,6 +215,10 @@ __wt_lsm_work_bloom(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree)
 		    chunk->count == 0)
 			continue;
 
+		/* Never create a bloom filter on the oldest chunk */
+		if (chunk == lsm_tree->chunk[0] &&
+		    !FLD_ISSET(lsm_tree->bloom, WT_LSM_BLOOM_OLDEST))
+			continue;
 		/*
 		 * See if we win the race to switch on the "busy" flag and
 		 * recheck that the chunk still needs a Bloom filter.
@@ -307,7 +311,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	if ((ret = __wt_session_get_btree(
 	    session, chunk->uri, NULL, NULL, 0)) == 0) {
 		saved_isolation = session->txn.isolation;
-		session->txn.isolation = TXN_ISO_EVICTION;
+		session->txn.isolation = WT_ISO_EVICTION;
 		ret = __wt_cache_op(session, NULL, WT_SYNC_WRITE_LEAVES);
 		session->txn.isolation = saved_isolation;
 		WT_TRET(__wt_session_release_btree(session));
@@ -329,6 +333,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 
 	/* Update the flush timestamp to help track ongoing progress. */
 	WT_RET(__wt_epoch(session, &lsm_tree->last_flush_ts));
+	++lsm_tree->chunks_flushed;
 
 	/* Lock the tree, mark the chunk as on disk and update the metadata. */
 	WT_RET(__wt_lsm_tree_writelock(session, lsm_tree));

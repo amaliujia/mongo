@@ -30,87 +30,102 @@
 
 #include <string>
 
+#include "mongo/util/net/hostandport.h"
+
 namespace mongo {
 
-    class BSONObj;
-    class BSONObjBuilder;
-    class Status;
+class BSONObj;
+class BSONObjBuilder;
+class Status;
 
 namespace repl {
 
+/**
+ * Arguments to the replSetHeartbeat command.
+ */
+class ReplSetHeartbeatArgsV1 {
+public:
     /**
-     * Arguments to the replSetHeartbeat command.
+     * Initializes this ReplSetHeartbeatArgsV1 from the contents of args.
      */
-    class ReplSetHeartbeatArgsV1 {
-    public:
-        /**
-         * Initializes this ReplSetHeartbeatArgsV1 from the contents of args.
-         */
-        Status initialize(const BSONObj& argsObj);
+    Status initialize(const BSONObj& argsObj);
 
-        /**
-         * Returns true if all required fields have been initialized.
-         */
-        bool isInitialized() const;
+    /**
+     * Returns true if all required fields have been initialized.
+     */
+    bool isInitialized() const;
 
-        /**
-         * Gets the version of the Heartbeat protocol being used by the sender.
-         */
-        long long getProtocolVersion() const { return _protocolVersion; }
+    /**
+     * Gets the ReplSetConfig version number of the sender.
+     */
+    long long getConfigVersion() const {
+        return _configVersion;
+    }
 
-        /**
-         * Gets the ReplSetConfig version number of the sender.
-         */ 
-        long long getConfigVersion() const { return _configVersion; }
+    /**
+     * Gets the _id of the sender in their ReplSetConfig.
+     */
+    long long getSenderId() const {
+        return _senderId;
+    }
 
-        /**
-         * Gets the _id of the sender in their ReplSetConfig.
-         */
-        long long getSenderId() const { return _senderId; }
+    /**
+     * Gets the HostAndPort of the sender.
+     */
+    HostAndPort getSenderHost() const {
+        return _senderHost;
+    }
 
-        /**
-         * Gets the replSet name of the sender's replica set.
-         */
-        std::string getSetName() const { return _setName; }
+    /**
+     * Gets the replSet name of the sender's replica set.
+     */
+    std::string getSetName() const {
+        return _setName;
+    }
 
-        /**
-         * Gets the term the sender believes it to be.
-         */
-        long long getTerm() const { return _term; }
+    /**
+     * Gets the term the sender believes it to be.
+     */
+    long long getTerm() const {
+        return _term;
+    }
 
-        /**
-         * Returns whether or not the sender is checking for emptiness.
-         */
-        bool hasCheckEmpty() const { return _checkEmpty; }
+    /**
+     * Returns whether or not the sender is checking for emptiness.
+     */
+    bool hasCheckEmpty() const {
+        return _checkEmpty;
+    }
 
-        /**
-         * The below methods set the value in the method name to 'newVal'.
-         */
-        void setConfigVersion(long long newVal);
-        void setProtocolVersion(long long newVal);
-        void setSenderId(long long newVal);
-        void setSetName(const std::string& newVal);
-        void setTerm(long long newVal);
-        void setCheckEmpty();
+    /**
+     * The below methods set the value in the method name to 'newVal'.
+     */
+    void setConfigVersion(long long newVal);
+    void setSenderId(long long newVal);
+    void setSenderHost(const HostAndPort& newVal);
+    void setSetName(const std::string& newVal);
+    void setTerm(long long newVal);
+    void setCheckEmpty();
 
-        /**
-         * Returns a BSONified version of the object.
-         * Should only be called if the mandatory fields have been set.
-         * Optional fields are only included if they have been set.
-         */
-        BSONObj toBSON() const;
+    /**
+     * Returns a BSONified version of the object.
+     * Should only be called if the mandatory fields have been set.
+     * Optional fields are only included if they have been set.
+     */
+    BSONObj toBSON() const;
 
-        void addToBSON(BSONObjBuilder* builder) const;
+    void addToBSON(BSONObjBuilder* builder) const;
 
-    private:
-        // look at the body of the isInitialized() function to see which fields are mandatory
-        long long _configVersion = -1;
-        long long _protocolVersion = -1;
-        long long _senderId = -1;
-        long long _term = -1;
-        bool _checkEmpty = false;
-        std::string _setName;
-    };
+private:
+    // look at the body of the isInitialized() function to see which fields are mandatory
+    long long _configVersion = -1;
+    long long _senderId = -1;
+    long long _term = -1;
+    bool _checkEmpty = false;
+    bool _hasSender = false;
+    std::string _setName;
+    HostAndPort _senderHost;
+};
 
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

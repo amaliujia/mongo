@@ -5,6 +5,7 @@ a = s._connections[0].getDB( "test" );
 b = s._connections[1].getDB( "test" );
 
 db = s.getDB( "test" );
+s.ensurePrimaryShard('test', 'shard0001');
 
 function numKeys(o){
     var num = 0;
@@ -131,7 +132,8 @@ collStatComp(coll_not_scaled, coll_scaled_1024, 1024, true);
     assert.commandWorked(t.ensureIndex({a: 1}));
     assert.eq(2, t.getIndexes().length);
 
-    var isWiredTiger = (jsTest.options().storageEngine == "wiredTiger");
+    var isWiredTiger = (!jsTest.options().storageEngine
+                        || jsTest.options().storageEngine === "wiredTiger");
 
     var stats = assert.commandWorked(t.stats({indexDetails: true}));
     var shardName;

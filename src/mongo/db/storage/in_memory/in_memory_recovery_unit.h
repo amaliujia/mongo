@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
 #include <vector>
 
 #include "mongo/db/record_id.h"
@@ -38,41 +37,39 @@
 
 namespace mongo {
 
-    class SortedDataInterface;
+class SortedDataInterface;
 
-    class InMemoryRecoveryUnit : public RecoveryUnit {
-    public:
-        InMemoryRecoveryUnit() : _depth(0) {}
-        virtual ~InMemoryRecoveryUnit();
+class InMemoryRecoveryUnit : public RecoveryUnit {
+public:
+    void beginUnitOfWork(OperationContext* opCtx) final{};
+    void commitUnitOfWork() final;
+    void abortUnitOfWork() final;
 
-        virtual void beginUnitOfWork(OperationContext* opCtx);
-        virtual void commitUnitOfWork();
-        virtual void endUnitOfWork();
+    virtual bool waitUntilDurable() {
+        return true;
+    }
 
-        virtual bool awaitCommit() {
-            return true;
-        }
+    virtual void abandonSnapshot() {}
 
-        virtual void commitAndRestart() {}
+    virtual void registerChange(Change* change) {
+        _changes.push_back(ChangePtr(change));
+    }
 
-        virtual void registerChange(Change* change) {
-            _changes.push_back(ChangePtr(change));
-        }
+    virtual void* writingPtr(void* data, size_t len) {
+        invariant(!"don't call writingPtr");
+    }
 
-        virtual void* writingPtr(void* data, size_t len) {
-            invariant(!"don't call writingPtr");
-        }
+    virtual void setRollbackWritesDisabled() {}
 
-        virtual void setRollbackWritesDisabled() {}
+    virtual SnapshotId getSnapshotId() const {
+        return SnapshotId();
+    }
 
-        virtual SnapshotId getSnapshotId() const { return SnapshotId(); }
+private:
+    typedef std::shared_ptr<Change> ChangePtr;
+    typedef std::vector<ChangePtr> Changes;
 
-    private:
-        typedef boost::shared_ptr<Change> ChangePtr;
-        typedef std::vector<ChangePtr> Changes;
+    Changes _changes;
+};
 
-        int _depth;
-        Changes _changes;
-    };
-
-}
+}  // namespace mongo

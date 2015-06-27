@@ -75,8 +75,7 @@ __collator_confchk(
 	WT_CONNECTION_IMPL *conn;
 	WT_NAMED_COLLATOR *ncoll;
 
-	if (collatorp != NULL)
-		*collatorp = NULL;
+	*collatorp = NULL;
 
 	if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
 		return (0);
@@ -84,22 +83,11 @@ __collator_confchk(
 	conn = S2C(session);
 	TAILQ_FOREACH(ncoll, &conn->collqh, q)
 		if (WT_STRING_MATCH(ncoll->name, cname->str, cname->len)) {
-			if (collatorp != NULL)
-				*collatorp = ncoll->collator;
+			*collatorp = ncoll->collator;
 			return (0);
 		}
 	WT_RET_MSG(session, EINVAL,
 	    "unknown collator '%.*s'", (int)cname->len, cname->str);
-}
-
-/*
- * __wt_collator_confchk --
- *	Check for a valid custom collator (public).
- */
-int
-__wt_collator_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname)
-{
-	return (__collator_confchk(session, cname, NULL));
 }
 
 /*
@@ -130,6 +118,622 @@ __wt_collator_config(WT_SESSION_IMPL *session, const char *uri,
 		*ownp = 1;
 
 	return (0);
+}
+
+/*
+ * __conn_add_collator --
+ *	WT_CONNECTION->add_collator method.
+ */
+static int
+__conn_add_collator(WT_CONNECTION *wt_conn,
+    const char *name, WT_COLLATOR *collator, const char *config)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_COLLATOR *ncoll;
+	WT_SESSION_IMPL *session;
+
+	ncoll = NULL;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, add_collator, config, cfg);
+	WT_UNUSED(cfg);
+
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for a collator: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &ncoll));
+	WT_ERR(__wt_strdup(session, name, &ncoll->name));
+	ncoll->collator = collator;
+
+	__wt_spin_lock(session, &conn->api_lock);
+	TAILQ_INSERT_TAIL(&conn->collqh, ncoll, q);
+	ncoll = NULL;
+	__wt_spin_unlock(session, &conn->api_lock);
+
+err:	if (ncoll != NULL) {
+		__wt_free(session, ncoll->name);
+		__wt_free(session, ncoll);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __wt_conn_remove_collator --
+ *	Remove collator added by WT_CONNECTION->add_collator, only used
+ * internally.
+ */
+int
+__wt_conn_remove_collator(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_COLLATOR *ncoll;
+
+	conn = S2C(session);
+
+	while ((ncoll = TAILQ_FIRST(&conn->collqh)) != NULL) {
+		/* Call any termination method. */
+		if (ncoll->collator->terminate != NULL)
+			WT_TRET(ncoll->collator->terminate(
+			    ncoll->collator, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->collqh, ncoll, q);
+		__wt_free(session, ncoll->name);
+		__wt_free(session, ncoll);
+	}
+
+	return (ret);
+}
+
+/*
+ * __compressor_confchk --
+ *	Validate the compressor.
+ */
+static int
+__compressor_confchk(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_COMPRESSOR *ncomp;
+
+	*compressorp = NULL;
+
+	if (cval->len == 0 || WT_STRING_MATCH("none", cval->str, cval->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(ncomp, &conn->compqh, q)
+		if (WT_STRING_MATCH(ncomp->name, cval->str, cval->len)) {
+			*compressorp = ncomp->compressor;
+			return (0);
+		}
+	WT_RET_MSG(session, EINVAL,
+	    "unknown compressor '%.*s'", (int)cval->len, cval->str);
+}
+
+/*
+ * __wt_compressor_config --
+ *	Given a configuration, configure the compressor.
+ */
+int
+__wt_compressor_config(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
+{
+	return (__compressor_confchk(session, cval, compressorp));
+}
+
+/*
+ * __conn_add_compressor --
+ *	WT_CONNECTION->add_compressor method.
+ */
+static int
+__conn_add_compressor(WT_CONNECTION *wt_conn,
+    const char *name, WT_COMPRESSOR *compressor, const char *config)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_COMPRESSOR *ncomp;
+	WT_SESSION_IMPL *session;
+
+	WT_UNUSED(name);
+	WT_UNUSED(compressor);
+	ncomp = NULL;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, add_compressor, config, cfg);
+	WT_UNUSED(cfg);
+
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for a compressor: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &ncomp));
+	WT_ERR(__wt_strdup(session, name, &ncomp->name));
+	ncomp->compressor = compressor;
+
+	__wt_spin_lock(session, &conn->api_lock);
+	TAILQ_INSERT_TAIL(&conn->compqh, ncomp, q);
+	ncomp = NULL;
+	__wt_spin_unlock(session, &conn->api_lock);
+
+err:	if (ncomp != NULL) {
+		__wt_free(session, ncomp->name);
+		__wt_free(session, ncomp);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __wt_conn_remove_compressor --
+ *	remove compressor added by WT_CONNECTION->add_compressor, only used
+ * internally.
+ */
+int
+__wt_conn_remove_compressor(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_COMPRESSOR *ncomp;
+
+	conn = S2C(session);
+
+	while ((ncomp = TAILQ_FIRST(&conn->compqh)) != NULL) {
+		/* Call any termination method. */
+		if (ncomp->compressor->terminate != NULL)
+			WT_TRET(ncomp->compressor->terminate(
+			    ncomp->compressor, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->compqh, ncomp, q);
+		__wt_free(session, ncomp->name);
+		__wt_free(session, ncomp);
+	}
+
+	return (ret);
+}
+
+/*
+ * __conn_add_data_source --
+ *	WT_CONNECTION->add_data_source method.
+ */
+static int
+__conn_add_data_source(WT_CONNECTION *wt_conn,
+    const char *prefix, WT_DATA_SOURCE *dsrc, const char *config)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_DATA_SOURCE *ndsrc;
+	WT_SESSION_IMPL *session;
+
+	ndsrc = NULL;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, add_data_source, config, cfg);
+	WT_UNUSED(cfg);
+
+	WT_ERR(__wt_calloc_one(session, &ndsrc));
+	WT_ERR(__wt_strdup(session, prefix, &ndsrc->prefix));
+	ndsrc->dsrc = dsrc;
+
+	/* Link onto the environment's list of data sources. */
+	__wt_spin_lock(session, &conn->api_lock);
+	TAILQ_INSERT_TAIL(&conn->dsrcqh, ndsrc, q);
+	ndsrc = NULL;
+	__wt_spin_unlock(session, &conn->api_lock);
+
+err:	if (ndsrc != NULL) {
+		__wt_free(session, ndsrc->prefix);
+		__wt_free(session, ndsrc);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __wt_conn_remove_data_source --
+ *	Remove data source added by WT_CONNECTION->add_data_source.
+ */
+int
+__wt_conn_remove_data_source(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_DATA_SOURCE *ndsrc;
+
+	conn = S2C(session);
+
+	while ((ndsrc = TAILQ_FIRST(&conn->dsrcqh)) != NULL) {
+		/* Call any termination method. */
+		if (ndsrc->dsrc->terminate != NULL)
+			WT_TRET(ndsrc->dsrc->terminate(
+			    ndsrc->dsrc, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->dsrcqh, ndsrc, q);
+		__wt_free(session, ndsrc->prefix);
+		__wt_free(session, ndsrc);
+	}
+
+	return (ret);
+}
+
+/*
+ * __encryptor_confchk --
+ *	Validate the encryptor.
+ */
+static int
+__encryptor_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval,
+    WT_NAMED_ENCRYPTOR **nencryptorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_ENCRYPTOR *nenc;
+
+	if (nencryptorp != NULL)
+		*nencryptorp = NULL;
+
+	if (cval->len == 0 || WT_STRING_MATCH("none", cval->str, cval->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(nenc, &conn->encryptqh, q)
+		if (WT_STRING_MATCH(nenc->name, cval->str, cval->len)) {
+			if (nencryptorp != NULL)
+				*nencryptorp = nenc;
+			return (0);
+		}
+
+	WT_RET_MSG(session, EINVAL,
+	    "unknown encryptor '%.*s'", (int)cval->len, cval->str);
+}
+
+/*
+ * __wt_encryptor_config --
+ *	Given a configuration, configure the encryptor.
+ */
+int
+__wt_encryptor_config(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval,
+    WT_CONFIG_ITEM *keyid, WT_CONFIG_ARG *cfg_arg,
+    WT_KEYED_ENCRYPTOR **kencryptorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_ENCRYPTOR *encryptor;
+	WT_KEYED_ENCRYPTOR *kenc;
+	WT_NAMED_ENCRYPTOR *nenc;
+	uint64_t bucket, hash;
+
+	*kencryptorp = NULL;
+
+	kenc = NULL;
+	conn = S2C(session);
+
+	__wt_spin_lock(session, &conn->encryptor_lock);
+
+	WT_ERR(__encryptor_confchk(session, cval, &nenc));
+	if (nenc == NULL) {
+		if (keyid->len != 0)
+			WT_ERR_MSG(session, EINVAL, "encryption.keyid "
+			    "requires encryption.name to be set");
+		goto out;
+	}
+
+	/*
+	 * Check if encryption is set on the connection.  If
+	 * someone wants encryption on a table, it needs to be
+	 * configured on the database as well.
+	 */
+	if (conn->kencryptor == NULL && kencryptorp != &conn->kencryptor)
+		WT_ERR_MSG(session, EINVAL, "table encryption "
+		    "requires connection encryption to be set");
+	hash = __wt_hash_city64(keyid->str, keyid->len);
+	bucket = hash % WT_HASH_ARRAY_SIZE;
+	SLIST_FOREACH(kenc, &nenc->keyedhashlh[bucket], l)
+		if (WT_STRING_MATCH(kenc->keyid, keyid->str, keyid->len))
+			goto out;
+
+	WT_ERR(__wt_calloc_one(session, &kenc));
+	WT_ERR(__wt_strndup(session, keyid->str, keyid->len, &kenc->keyid));
+	encryptor = nenc->encryptor;
+	if (encryptor->customize != NULL) {
+		WT_ERR(encryptor->customize(encryptor, &session->iface,
+		    cfg_arg, &encryptor));
+		if (encryptor == NULL)
+			encryptor = nenc->encryptor;
+		else
+			kenc->owned = 1;
+	}
+	WT_ERR(encryptor->sizing(encryptor, &session->iface,
+	    &kenc->size_const));
+	kenc->encryptor = encryptor;
+	SLIST_INSERT_HEAD(&nenc->keyedlh, kenc, l);
+	SLIST_INSERT_HEAD(&nenc->keyedhashlh[bucket], kenc, hashl);
+
+out:	__wt_spin_unlock(session, &conn->encryptor_lock);
+	*kencryptorp = kenc;
+	return (0);
+
+err:	if (kenc != NULL) {
+		__wt_free(session, kenc->keyid);
+		__wt_free(session, kenc);
+	}
+	__wt_spin_unlock(session, &conn->encryptor_lock);
+	return (ret);
+}
+
+/*
+ * __conn_add_encryptor --
+ *	WT_CONNECTION->add_encryptor method.
+ */
+static int
+__conn_add_encryptor(WT_CONNECTION *wt_conn,
+    const char *name, WT_ENCRYPTOR *encryptor, const char *config)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_ENCRYPTOR *nenc;
+	WT_SESSION_IMPL *session;
+	int i;
+
+	nenc = NULL;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, add_encryptor, config, cfg);
+	WT_UNUSED(cfg);
+
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for an encryptor: %s", name);
+
+	if (encryptor->encrypt == NULL || encryptor->decrypt == NULL ||
+	    encryptor->sizing == NULL)
+		WT_ERR_MSG(session, EINVAL,
+		    "encryptor: %s: required callbacks not set", name);
+
+	/*
+	 * Verify that terminate is set if customize is set. We could relax this
+	 * restriction and give an error if customize returns an encryptor and
+	 * terminate is not set. That seems more prone to mistakes.
+	 */
+	if (encryptor->customize != NULL && encryptor->terminate == NULL)
+		WT_ERR_MSG(session, EINVAL,
+		    "encryptor: %s: has customize but no terminate", name);
+
+	WT_ERR(__wt_calloc_one(session, &nenc));
+	WT_ERR(__wt_strdup(session, name, &nenc->name));
+	nenc->encryptor = encryptor;
+	SLIST_INIT(&nenc->keyedlh);
+	for (i = 0; i < WT_HASH_ARRAY_SIZE; i++)
+		SLIST_INIT(&nenc->keyedhashlh[i]);
+
+	TAILQ_INSERT_TAIL(&conn->encryptqh, nenc, q);
+	nenc = NULL;
+
+err:	if (nenc != NULL) {
+		__wt_free(session, nenc->name);
+		__wt_free(session, nenc);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __wt_conn_remove_encryptor --
+ *	remove encryptors added by WT_CONNECTION->add_encryptor, only used
+ * internally.
+ */
+int
+__wt_conn_remove_encryptor(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_KEYED_ENCRYPTOR *kenc;
+	WT_NAMED_ENCRYPTOR *nenc;
+
+	conn = S2C(session);
+
+	while ((nenc = TAILQ_FIRST(&conn->encryptqh)) != NULL) {
+		while ((kenc = SLIST_FIRST(&nenc->keyedlh)) != NULL) {
+			/* Call any termination method. */
+			if (kenc->owned && kenc->encryptor->terminate != NULL)
+				WT_TRET(kenc->encryptor->terminate(
+				    kenc->encryptor, (WT_SESSION *)session));
+
+			/* Remove from the connection's list, free memory. */
+			SLIST_REMOVE(
+			    &nenc->keyedlh, kenc, __wt_keyed_encryptor, l);
+			__wt_free(session, kenc->keyid);
+			__wt_free(session, kenc);
+		}
+
+		/* Call any termination method. */
+		if (nenc->encryptor->terminate != NULL)
+			WT_TRET(nenc->encryptor->terminate(
+			    nenc->encryptor, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->encryptqh, nenc, q);
+		__wt_free(session, nenc->name);
+		__wt_free(session, nenc);
+	}
+	return (ret);
+}
+
+/*
+ * __conn_add_extractor --
+ *	WT_CONNECTION->add_extractor method.
+ */
+static int
+__conn_add_extractor(WT_CONNECTION *wt_conn,
+    const char *name, WT_EXTRACTOR *extractor, const char *config)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_EXTRACTOR *nextractor;
+	WT_SESSION_IMPL *session;
+
+	nextractor = NULL;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, add_extractor, config, cfg);
+	WT_UNUSED(cfg);
+
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for an extractor: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &nextractor));
+	WT_ERR(__wt_strdup(session, name, &nextractor->name));
+	nextractor->extractor = extractor;
+
+	__wt_spin_lock(session, &conn->api_lock);
+	TAILQ_INSERT_TAIL(&conn->extractorqh, nextractor, q);
+	nextractor = NULL;
+	__wt_spin_unlock(session, &conn->api_lock);
+
+err:	if (nextractor != NULL) {
+		__wt_free(session, nextractor->name);
+		__wt_free(session, nextractor);
+	}
+
+	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __extractor_confchk --
+ *	Check for a valid custom extractor.
+ */
+static int
+__extractor_confchk(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname, WT_EXTRACTOR **extractorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_EXTRACTOR *nextractor;
+
+	*extractorp = NULL;
+
+	if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(nextractor, &conn->extractorqh, q)
+		if (WT_STRING_MATCH(nextractor->name, cname->str, cname->len)) {
+			*extractorp = nextractor->extractor;
+			return (0);
+		}
+	WT_RET_MSG(session, EINVAL,
+	    "unknown extractor '%.*s'", (int)cname->len, cname->str);
+}
+
+/*
+ * __wt_extractor_config --
+ *	Given a configuration, configure the extractor.
+ */
+int
+__wt_extractor_config(WT_SESSION_IMPL *session,
+    const char *uri, const char *config, WT_EXTRACTOR **extractorp, int *ownp)
+{
+	WT_CONFIG_ITEM cname;
+	WT_EXTRACTOR *extractor;
+
+	*extractorp = NULL;
+	*ownp = 0;
+
+	WT_RET_NOTFOUND_OK(
+	    __wt_config_getones_none(session, config, "extractor", &cname));
+	if (cname.len == 0)
+		return (0);
+
+	WT_RET(__extractor_confchk(session, &cname, &extractor));
+	if (extractor == NULL)
+		return (0);
+
+	if (extractor->customize != NULL) {
+		WT_RET(__wt_config_getones(session,
+		    config, "app_metadata", &cname));
+		WT_RET(extractor->customize(extractor, &session->iface,
+		    uri, &cname, extractorp));
+	}
+
+	if (*extractorp == NULL)
+		*extractorp = extractor;
+	else
+		*ownp = 1;
+
+	return (0);
+}
+
+/*
+ * __wt_conn_remove_extractor --
+ *	Remove extractor added by WT_CONNECTION->add_extractor, only used
+ * internally.
+ */
+int
+__wt_conn_remove_extractor(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_NAMED_EXTRACTOR *nextractor;
+
+	conn = S2C(session);
+
+	while ((nextractor = TAILQ_FIRST(&conn->extractorqh)) != NULL) {
+		/* Call any termination method. */
+		if (nextractor->extractor->terminate != NULL)
+			WT_TRET(nextractor->extractor->terminate(
+			    nextractor->extractor, (WT_SESSION *)session));
+
+		/* Remove from the connection's list, free memory. */
+		TAILQ_REMOVE(&conn->extractorqh, nextractor, q);
+		__wt_free(session, nextractor->name);
+		__wt_free(session, nextractor);
+	}
+
+	return (ret);
+}
+
+/*
+ * __conn_async_flush --
+ *	WT_CONNECTION.async_flush method.
+ */
+static int
+__conn_async_flush(WT_CONNECTION *wt_conn)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_SESSION_IMPL *session;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL_NOCONF(conn, session, async_flush);
+	WT_ERR(__wt_async_flush(session));
+
+err:	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __conn_async_new_op --
+ *	WT_CONNECTION.async_new_op method.
+ */
+static int
+__conn_async_new_op(WT_CONNECTION *wt_conn, const char *uri, const char *config,
+    WT_ASYNC_CALLBACK *callback, WT_ASYNC_OP **asyncopp)
+{
+	WT_ASYNC_OP_IMPL *op;
+	WT_CONNECTION_IMPL *conn;
+	WT_DECL_RET;
+	WT_SESSION_IMPL *session;
+
+	conn = (WT_CONNECTION_IMPL *)wt_conn;
+	CONNECTION_API_CALL(conn, session, async_new_op, config, cfg);
+	WT_ERR(__wt_async_new_op(session, uri, config, cfg, callback, &op));
+
+	*asyncopp = &op->iface;
+
+err:	API_END_RET_NOTFOUND_MAP(session, ret);
 }
 
 /*
@@ -306,445 +910,6 @@ err:	__wt_scr_free(session, &expath);
 }
 
 /*
- * __conn_add_collator --
- *	WT_CONNECTION->add_collator method.
- */
-static int
-__conn_add_collator(WT_CONNECTION *wt_conn,
-    const char *name, WT_COLLATOR *collator, const char *config)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_COLLATOR *ncoll;
-	WT_SESSION_IMPL *session;
-
-	ncoll = NULL;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL(conn, session, add_collator, config, cfg);
-	WT_UNUSED(cfg);
-
-	if (WT_STREQ(name, "none"))
-		WT_ERR_MSG(session, EINVAL,
-		    "invalid name for a collator: %s", name);
-
-	WT_ERR(__wt_calloc_one(session, &ncoll));
-	WT_ERR(__wt_strdup(session, name, &ncoll->name));
-	ncoll->collator = collator;
-
-	__wt_spin_lock(session, &conn->api_lock);
-	TAILQ_INSERT_TAIL(&conn->collqh, ncoll, q);
-	ncoll = NULL;
-	__wt_spin_unlock(session, &conn->api_lock);
-
-err:	if (ncoll != NULL) {
-		__wt_free(session, ncoll->name);
-		__wt_free(session, ncoll);
-	}
-
-	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
- * __wt_conn_remove_collator --
- *	Remove collator added by WT_CONNECTION->add_collator, only used
- * internally.
- */
-int
-__wt_conn_remove_collator(WT_SESSION_IMPL *session)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_COLLATOR *ncoll;
-
-	conn = S2C(session);
-
-	while ((ncoll = TAILQ_FIRST(&conn->collqh)) != NULL) {
-		/* Call any termination method. */
-		if (ncoll->collator->terminate != NULL)
-			WT_TRET(ncoll->collator->terminate(
-			    ncoll->collator, (WT_SESSION *)session));
-
-		/* Remove from the connection's list, free memory. */
-		TAILQ_REMOVE(&conn->collqh, ncoll, q);
-		__wt_free(session, ncoll->name);
-		__wt_free(session, ncoll);
-	}
-
-	return (ret);
-}
-
-/*
- * __compressor_confchk --
- *	Validate the compressor.
- */
-static int
-__compressor_confchk(
-    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_NAMED_COMPRESSOR *ncomp;
-
-	if (compressorp != NULL)
-		*compressorp = NULL;
-
-	if (cval->len == 0 || WT_STRING_MATCH("none", cval->str, cval->len))
-		return (0);
-
-	conn = S2C(session);
-	TAILQ_FOREACH(ncomp, &conn->compqh, q)
-		if (WT_STRING_MATCH(ncomp->name, cval->str, cval->len)) {
-			if (compressorp != NULL)
-				*compressorp = ncomp->compressor;
-			return (0);
-		}
-	WT_RET_MSG(session, EINVAL,
-	    "unknown compressor '%.*s'", (int)cval->len, cval->str);
-}
-
-/*
- * __wt_compressor_confchk --
- *	Validate the compressor (public).
- */
-int
-__wt_compressor_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval)
-{
-	return (__compressor_confchk(session, cval, NULL));
-}
-
-/*
- * __wt_compressor_config --
- *	Given a configuration, configure the compressor.
- */
-int
-__wt_compressor_config(
-    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
-{
-	return (__compressor_confchk(session, cval, compressorp));
-}
-
-/*
- * __conn_add_compressor --
- *	WT_CONNECTION->add_compressor method.
- */
-static int
-__conn_add_compressor(WT_CONNECTION *wt_conn,
-    const char *name, WT_COMPRESSOR *compressor, const char *config)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_COMPRESSOR *ncomp;
-	WT_SESSION_IMPL *session;
-
-	WT_UNUSED(name);
-	WT_UNUSED(compressor);
-	ncomp = NULL;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL(conn, session, add_compressor, config, cfg);
-	WT_UNUSED(cfg);
-
-	if (WT_STREQ(name, "none"))
-		WT_ERR_MSG(session, EINVAL,
-		    "invalid name for a compressor: %s", name);
-
-	WT_ERR(__wt_calloc_one(session, &ncomp));
-	WT_ERR(__wt_strdup(session, name, &ncomp->name));
-	ncomp->compressor = compressor;
-
-	__wt_spin_lock(session, &conn->api_lock);
-	TAILQ_INSERT_TAIL(&conn->compqh, ncomp, q);
-	ncomp = NULL;
-	__wt_spin_unlock(session, &conn->api_lock);
-
-err:	if (ncomp != NULL) {
-		__wt_free(session, ncomp->name);
-		__wt_free(session, ncomp);
-	}
-
-	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
- * __wt_conn_remove_compressor --
- *	remove compressor added by WT_CONNECTION->add_compressor, only used
- * internally.
- */
-int
-__wt_conn_remove_compressor(WT_SESSION_IMPL *session)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_COMPRESSOR *ncomp;
-
-	conn = S2C(session);
-
-	while ((ncomp = TAILQ_FIRST(&conn->compqh)) != NULL) {
-		/* Call any termination method. */
-		if (ncomp->compressor->terminate != NULL)
-			WT_TRET(ncomp->compressor->terminate(
-			    ncomp->compressor, (WT_SESSION *)session));
-
-		/* Remove from the connection's list, free memory. */
-		TAILQ_REMOVE(&conn->compqh, ncomp, q);
-		__wt_free(session, ncomp->name);
-		__wt_free(session, ncomp);
-	}
-
-	return (ret);
-}
-
-/*
- * __conn_add_data_source --
- *	WT_CONNECTION->add_data_source method.
- */
-static int
-__conn_add_data_source(WT_CONNECTION *wt_conn,
-    const char *prefix, WT_DATA_SOURCE *dsrc, const char *config)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_DATA_SOURCE *ndsrc;
-	WT_SESSION_IMPL *session;
-
-	ndsrc = NULL;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL(conn, session, add_data_source, config, cfg);
-	WT_UNUSED(cfg);
-
-	WT_ERR(__wt_calloc_one(session, &ndsrc));
-	WT_ERR(__wt_strdup(session, prefix, &ndsrc->prefix));
-	ndsrc->dsrc = dsrc;
-
-	/* Link onto the environment's list of data sources. */
-	__wt_spin_lock(session, &conn->api_lock);
-	TAILQ_INSERT_TAIL(&conn->dsrcqh, ndsrc, q);
-	ndsrc = NULL;
-	__wt_spin_unlock(session, &conn->api_lock);
-
-err:	if (ndsrc != NULL) {
-		__wt_free(session, ndsrc->prefix);
-		__wt_free(session, ndsrc);
-	}
-
-	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
- * __wt_conn_remove_data_source --
- *	Remove data source added by WT_CONNECTION->add_data_source.
- */
-int
-__wt_conn_remove_data_source(WT_SESSION_IMPL *session)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_DATA_SOURCE *ndsrc;
-
-	conn = S2C(session);
-
-	while ((ndsrc = TAILQ_FIRST(&conn->dsrcqh)) != NULL) {
-		/* Call any termination method. */
-		if (ndsrc->dsrc->terminate != NULL)
-			WT_TRET(ndsrc->dsrc->terminate(
-			    ndsrc->dsrc, (WT_SESSION *)session));
-
-		/* Remove from the connection's list, free memory. */
-		TAILQ_REMOVE(&conn->dsrcqh, ndsrc, q);
-		__wt_free(session, ndsrc->prefix);
-		__wt_free(session, ndsrc);
-	}
-
-	return (ret);
-}
-
-/*
- * __conn_add_extractor --
- *	WT_CONNECTION->add_extractor method.
- */
-static int
-__conn_add_extractor(WT_CONNECTION *wt_conn,
-    const char *name, WT_EXTRACTOR *extractor, const char *config)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_EXTRACTOR *nextractor;
-	WT_SESSION_IMPL *session;
-
-	nextractor = NULL;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL(conn, session, add_extractor, config, cfg);
-	WT_UNUSED(cfg);
-
-	if (WT_STREQ(name, "none"))
-		WT_ERR_MSG(session, EINVAL,
-		    "invalid name for an extractor: %s", name);
-
-	WT_ERR(__wt_calloc_one(session, &nextractor));
-	WT_ERR(__wt_strdup(session, name, &nextractor->name));
-	nextractor->extractor = extractor;
-
-	__wt_spin_lock(session, &conn->api_lock);
-	TAILQ_INSERT_TAIL(&conn->extractorqh, nextractor, q);
-	nextractor = NULL;
-	__wt_spin_unlock(session, &conn->api_lock);
-
-err:	if (nextractor != NULL) {
-		__wt_free(session, nextractor->name);
-		__wt_free(session, nextractor);
-	}
-
-	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
- * __extractor_confchk --
- *	Check for a valid custom extractor.
- */
-static int
-__extractor_confchk(
-    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname, WT_EXTRACTOR **extractorp)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_NAMED_EXTRACTOR *nextractor;
-
-	if (extractorp != NULL)
-		*extractorp = NULL;
-
-	if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
-		return (0);
-
-	conn = S2C(session);
-	TAILQ_FOREACH(nextractor, &conn->extractorqh, q)
-		if (WT_STRING_MATCH(nextractor->name, cname->str, cname->len)) {
-			if (extractorp != NULL)
-				*extractorp = nextractor->extractor;
-			return (0);
-		}
-	WT_RET_MSG(session, EINVAL,
-	    "unknown extractor '%.*s'", (int)cname->len, cname->str);
-}
-
-/*
- * __wt_extractor_confchk --
- *	Check for a valid custom extractor (public).
- */
-int
-__wt_extractor_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname)
-{
-	return (__extractor_confchk(session, cname, NULL));
-}
-
-/*
- * __wt_extractor_config --
- *	Given a configuration, configure the extractor.
- */
-int
-__wt_extractor_config(WT_SESSION_IMPL *session,
-    const char *config, WT_EXTRACTOR **extractorp, int *ownp)
-{
-	WT_CONFIG_ITEM cname;
-	WT_EXTRACTOR *extractor;
-
-	*extractorp = NULL;
-	*ownp = 0;
-
-	WT_RET_NOTFOUND_OK(
-	    __wt_config_getones_none(session, config, "extractor", &cname));
-	if (cname.len == 0)
-		return (0);
-
-	WT_RET(__extractor_confchk(session, &cname, &extractor));
-	if (extractor == NULL)
-		return (0);
-
-	if (extractor->customize != NULL) {
-		WT_RET(__wt_config_getones(session,
-		    config, "app_metadata", &cname));
-		WT_RET(extractor->customize(extractor, &session->iface,
-		   session->dhandle->name, &cname, extractorp));
-	}
-
-	if (*extractorp == NULL)
-		*extractorp = extractor;
-	else
-		*ownp = 1;
-
-	return (0);
-}
-
-/*
- * __wt_conn_remove_extractor --
- *	Remove extractor added by WT_CONNECTION->add_extractor, only used
- * internally.
- */
-int
-__wt_conn_remove_extractor(WT_SESSION_IMPL *session)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_NAMED_EXTRACTOR *nextractor;
-
-	conn = S2C(session);
-
-	while ((nextractor = TAILQ_FIRST(&conn->extractorqh)) != NULL) {
-		/* Call any termination method. */
-		if (nextractor->extractor->terminate != NULL)
-			WT_TRET(nextractor->extractor->terminate(
-			    nextractor->extractor, (WT_SESSION *)session));
-
-		/* Remove from the connection's list, free memory. */
-		TAILQ_REMOVE(&conn->extractorqh, nextractor, q);
-		__wt_free(session, nextractor->name);
-		__wt_free(session, nextractor);
-	}
-
-	return (ret);
-}
-
-/*
- * __conn_async_flush --
- *	WT_CONNECTION.async_flush method.
- */
-static int
-__conn_async_flush(WT_CONNECTION *wt_conn)
-{
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_SESSION_IMPL *session;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL_NOCONF(conn, session, async_flush);
-	WT_ERR(__wt_async_flush(session));
-
-err:	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
- * __conn_async_new_op --
- *	WT_CONNECTION.async_new_op method.
- */
-static int
-__conn_async_new_op(WT_CONNECTION *wt_conn, const char *uri, const char *config,
-    WT_ASYNC_CALLBACK *callback, WT_ASYNC_OP **asyncopp)
-{
-	WT_ASYNC_OP_IMPL *op;
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_SESSION_IMPL *session;
-
-	conn = (WT_CONNECTION_IMPL *)wt_conn;
-	CONNECTION_API_CALL(conn, session, async_new_op, config, cfg);
-	WT_ERR(__wt_async_new_op(session, uri, config, cfg, callback, &op));
-
-	*asyncopp = &op->iface;
-
-err:	API_END_RET_NOTFOUND_MAP(session, ret);
-}
-
-/*
  * __conn_get_home --
  *	WT_CONNECTION.get_home method.
  */
@@ -814,11 +979,14 @@ err:	/*
 	 */
 	for (s = conn->sessions, i = 0; i < conn->session_cnt; ++s, ++i)
 		if (s->active && !F_ISSET(s, WT_SESSION_INTERNAL) &&
-		    F_ISSET(&s->txn, TXN_RUNNING)) {
+		    F_ISSET(&s->txn, WT_TXN_RUNNING)) {
 			wt_session = &s->iface;
 			WT_TRET(wt_session->rollback_transaction(
 			    wt_session, NULL));
 		}
+
+	/* Release all named snapshots. */
+	WT_TRET(__wt_txn_named_snapshot_destroy(session));
 
 	/* Close open, external sessions. */
 	for (s = conn->sessions, i = 0; i < conn->session_cnt; ++s, ++i)
@@ -1205,10 +1373,14 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_FH *fh;
 	size_t len;
 	wt_off_t size;
+	int exist, is_create;
 	char buf[256];
 
 	conn = S2C(session);
 	fh = NULL;
+
+	WT_RET(__wt_config_gets(session, cfg, "create", &cval));
+	is_create = cval.val == 0 ? 0 : 1;
 
 	__wt_spin_lock(session, &__wt_process.spinlock);
 
@@ -1243,10 +1415,6 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 	 * WiredTiger file and system utilities on Windows can't copy locked
 	 * files.
 	 *
-	 * For this reason, we don't use the lock file's existence to decide if
-	 * we're creating the database or not, use the WiredTiger file instead,
-	 * it has existed in every version of WiredTiger.
-	 *
 	 * Additionally, avoid an upgrade race: a 2.3.1 release process might
 	 * have the WiredTiger file locked, and we're going to create the lock
 	 * file and lock it instead. For this reason, first acquire a lock on
@@ -1257,12 +1425,22 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 	 * then successfully lock the WiredTiger file, but I can't think of any
 	 * way to fix that.)
 	 *
-	 * Open the WiredTiger lock file, creating it if it doesn't exist. (I'm
-	 * not removing the lock file if we create it and subsequently fail, it
-	 * isn't simple to detect that case, and there's no risk other than a
-	 * useless file being left in the directory.)
+	 * Open the WiredTiger lock file, optionally creating it if it doesn't
+	 * exist. The "optional" part of that statement is tricky: we don't want
+	 * to create the lock file in random directories when users mistype the
+	 * database home directory path, so we only create the lock file in two
+	 * cases: First, applications creating databases will configure create,
+	 * create the lock file. Second, after a hot backup, all of the standard
+	 * files will have been copied into place except for the lock file (see
+	 * above, locked files cannot be copied on Windows). If the WiredTiger
+	 * file exists in the directory, create the lock file, covering the case
+	 * of a hot backup.
 	 */
-	WT_ERR(__wt_open(session, WT_SINGLETHREAD, 1, 0, 0, &conn->lock_fh));
+	exist = 0;
+	if (!is_create)
+		WT_ERR(__wt_exist(session, WT_WIREDTIGER, &exist));
+	WT_ERR(__wt_open(session,
+	    WT_SINGLETHREAD, is_create || exist, 0, 0, &conn->lock_fh));
 
 	/*
 	 * Lock a byte of the file: if we don't get the lock, some other process
@@ -1275,22 +1453,22 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 		    "process");
 
 	/*
-	 * If the size of the lock file is 0, we created it (or we won a locking
-	 * race with the thread that created it, it doesn't matter).
+	 * If the size of the lock file is non-zero, we created it (or won a
+	 * locking race with the thread that created it, it doesn't matter).
 	 *
 	 * Write something into the file, zero-length files make me nervous.
+	 *
+	 * The test against the expected length is sheer paranoia (the length
+	 * should be 0 or correct), but it shouldn't hurt.
 	 */
-	WT_ERR(__wt_filesize(session, conn->lock_fh, &size));
-	if (size == 0) {
 #define	WT_SINGLETHREAD_STRING	"WiredTiger lock file\n"
+	WT_ERR(__wt_filesize(session, conn->lock_fh, &size));
+	if (size != strlen(WT_SINGLETHREAD_STRING))
 		WT_ERR(__wt_write(session, conn->lock_fh, (wt_off_t)0,
 		    strlen(WT_SINGLETHREAD_STRING), WT_SINGLETHREAD_STRING));
-	}
 
 	/* We own the lock file, optionally create the WiredTiger file. */
-	WT_ERR(__wt_config_gets(session, cfg, "create", &cval));
-	WT_ERR(__wt_open(session,
-	    WT_WIREDTIGER, cval.val == 0 ? 0 : 1, 0, 0, &fh));
+	WT_ERR(__wt_open(session, WT_WIREDTIGER, is_create, 0, 0, &fh));
 
 	/*
 	 * Lock the WiredTiger file (for backward compatibility reasons as
@@ -1304,25 +1482,27 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_ERR(__wt_bytelock(fh, (wt_off_t)0, 0));
 
 	/*
-	 * If the size of the file is zero, we created it, fill it in. If the
-	 * size of the file is non-zero, fail if configured for exclusivity.
+	 * We own the database home, figure out if we're creating it. There are
+	 * a few files created when initializing the database home and we could
+	 * crash in-between any of them, so there's no simple test. The last
+	 * thing we do during initialization is rename a turtle file into place,
+	 * and there's never a database home after that point without a turtle
+	 * file. If the turtle file doesn't exist, it's a create.
 	 */
-	WT_ERR(__wt_filesize(session, fh, &size));
-	if (size == 0) {
+	WT_ERR(__wt_exist(session, WT_METADATA_TURTLE, &exist));
+	conn->is_new = exist ? 0 : 1;
+
+	if (conn->is_new) {
 		len = (size_t)snprintf(buf, sizeof(buf),
 		    "%s\n%s\n", WT_WIREDTIGER, WIREDTIGER_VERSION_STRING);
 		WT_ERR(__wt_write(session, fh, (wt_off_t)0, len, buf));
 		WT_ERR(__wt_fsync(session, fh));
-
-		conn->is_new = 1;
 	} else {
 		WT_ERR(__wt_config_gets(session, cfg, "exclusive", &cval));
 		if (cval.val != 0)
 			WT_ERR_MSG(session, EEXIST,
 			    "WiredTiger database already exists and exclusive "
 			    "option configured");
-
-		conn->is_new = 0;
 	}
 
 err:	/*
@@ -1465,16 +1645,17 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
  *	Save the base configuration used to create a database.
  */
 static int
-__conn_write_base_config(
-    WT_SESSION_IMPL *session, const char *cfg[], const char *config)
+__conn_write_base_config(WT_SESSION_IMPL *session, const char *cfg[])
 {
 	FILE *fp;
 	WT_CONFIG parser;
 	WT_CONFIG_ITEM cval, k, v;
 	WT_DECL_RET;
 	int exist;
+	const char *base_config;
 
 	fp = NULL;
+	base_config = NULL;
 
 	/*
 	 * Discard any base configuration setup file left-over from previous
@@ -1483,7 +1664,12 @@ __conn_write_base_config(
 	 */
 	WT_RET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
 
-	/* The base configuration file is optional, check the configuration. */
+	/*
+	 * The base configuration file is only written if creating the database,
+	 * and even then, a base configuration file is optional.
+	 */
+	if (!S2C(session)->is_new)
+		return (0);
 	WT_RET(__wt_config_gets(session, cfg, "config_base", &cval));
 	if (!cval.val)
 		return (0);
@@ -1503,13 +1689,13 @@ __conn_write_base_config(
 	WT_RET(__wt_fopen(session,
 	    WT_BASECONFIG_SET, WT_FHANDLE_WRITE, 0, &fp));
 
-	fprintf(fp, "%s\n\n",
+	WT_ERR(__wt_fprintf(fp, "%s\n\n",
 	    "# Do not modify this file.\n"
 	    "#\n"
 	    "# WiredTiger created this file when the database was created,\n"
 	    "# to store persistent database settings.  Instead of changing\n"
 	    "# these settings, set a WIREDTIGER_CONFIG environment variable\n"
-	    "# or create a WiredTiger.config file to override them.");
+	    "# or create a WiredTiger.config file to override them."));
 
 	/*
 	 * The base configuration file contains all changes to default settings
@@ -1523,29 +1709,46 @@ __conn_write_base_config(
 	 * file in that protection.
 	 *
 	 * We were passed the configuration items specified by the application.
-	 * That list includes configuring the default setting, presumably if
+	 * That list includes configuring the default settings, presumably if
 	 * the application configured it explicitly, that setting should survive
 	 * even if the default changes.
+	 *
+	 * When writing the base configuration file, we write the version and
+	 * any configuration information set by the application (in other words,
+	 * the stack except for cfg[0]). However, some configuration values need
+	 * to be stripped out from the base configuration file; do that now, and
+	 * merge the rest to be written.
 	 */
-	WT_ERR(__wt_config_init(session, &parser, config));
+	WT_ERR(__wt_config_merge(session, cfg + 1,
+	    "config_base=,"
+	    "create=,"
+	    "encryption=(secretkey=),"
+	    "exclusive=,"
+	    "log=(recover=),"
+	    "use_environment_priv=,", &base_config));
+	WT_ERR(__wt_config_init(session, &parser, base_config));
 	while ((ret = __wt_config_next(&parser, &k, &v)) == 0) {
 		/* Fix quoting for non-trivial settings. */
 		if (v.type == WT_CONFIG_ITEM_STRING) {
 			--v.str;
 			v.len += 2;
 		}
-		fprintf(fp,
-		    "%.*s=%.*s\n", (int)k.len, k.str, (int)v.len, v.str);
+		WT_ERR(__wt_fprintf(fp,
+		    "%.*s=%.*s\n", (int)k.len, k.str, (int)v.len, v.str));
 	}
 	WT_ERR_NOTFOUND_OK(ret);
 
 	/* Flush the handle and rename the file into place. */
-	return (__wt_sync_and_rename_fp(
-	    session, &fp, WT_BASECONFIG_SET, WT_BASECONFIG));
+	ret = __wt_sync_and_rename_fp(
+	    session, &fp, WT_BASECONFIG_SET, WT_BASECONFIG);
 
-	/* Close any file handle left open, remove any temporary file. */
-err:	WT_TRET(__wt_fclose(&fp, WT_FHANDLE_WRITE));
-	WT_TRET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
+	if (0) {
+		/* Close open file handle, remove any temporary file. */
+err:		WT_TRET(__wt_fclose(&fp, WT_FHANDLE_WRITE));
+		WT_TRET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
+	}
+
+	__wt_free(session, base_config);
 
 	return (ret);
 }
@@ -1572,6 +1775,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 		__conn_add_data_source,
 		__conn_add_collator,
 		__conn_add_compressor,
+		__conn_add_encryptor,
 		__conn_add_extractor,
 		__conn_get_extension_api
 	};
@@ -1582,15 +1786,16 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 		{ NULL, 0 }
 	};
 
-	WT_CONFIG_ITEM cval, sval;
+	WT_CONFIG_ITEM cval, keyid, secretkey, sval;
 	WT_CONNECTION_IMPL *conn;
+	WT_DECL_ITEM(encbuf);
 	WT_DECL_ITEM(i1);
 	WT_DECL_ITEM(i2);
 	WT_DECL_ITEM(i3);
 	WT_DECL_RET;
 	const WT_NAME_FLAG *ft;
 	WT_SESSION_IMPL *session;
-	const char *base_merge;
+	const char *enc_cfg[] = { NULL, NULL };
 	char version[64];
 
 	/* Leave lots of space for optional additional configuration. */
@@ -1601,7 +1806,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 
 	conn = NULL;
 	session = NULL;
-	base_merge = NULL;
 
 	WT_RET(__wt_library_init());
 
@@ -1620,7 +1824,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	session = conn->default_session = &conn->dummy_session;
 	session->iface.connection = &conn->iface;
 	session->name = "wiredtiger_open";
-	__wt_random_init(session->rnd);
+	__wt_random_init(&session->rnd);
 	__wt_event_handler_set(session, event_handler);
 
 	/* Remaining basic initialization of the connection structure. */
@@ -1678,26 +1882,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	 * Merge the full configuration stack and save it for reconfiguration.
 	 */
 	WT_ERR(__wt_config_merge(session, cfg, NULL, &conn->cfg));
-
-	/*
-	 * When writing the base configuration file, we write the version and
-	 * any configuration information set by the application (in other words,
-	 * the stack except for cfg[0]). However, some configuration values need
-	 * to be stripped out from the base configuration file; do that now, and
-	 * merge the rest to be written.
-	 */
-	WT_ERR(__wt_config_merge(session, cfg + 1, "create=", &base_merge));
-
-	/*
-	 * Reset cfg to the configuration stack we're going to use for the rest
-	 * of the open.
-	 *
-	 * Underlying code distinguishes the base values from the user-specified
-	 * information by ignoring cfg[0]. Make that work by leaving base values
-	 * in cfg[0], and the collapsed user-specified values in cfg[1].
-	 */
-	cfg[1] = base_merge;
-	cfg[2] = NULL;
 
 	/*
 	 * Configuration ...
@@ -1791,15 +1975,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	session = conn->default_session;
 
 	/*
-	 * Check on the turtle and metadata files, creating them if necessary
-	 * (which avoids application threads racing to create the metadata file
-	 * later).  Once the metadata file exists, get a reference to it in
-	 * the connection's session.
-	 */
-	WT_ERR(__wt_turtle_init(session));
-	WT_ERR(__wt_metadata_open(session));
-
-	/*
 	 * Load the extensions after initialization completes; extensions expect
 	 * everything else to be in place, and the extensions call back into the
 	 * library.
@@ -1807,10 +1982,46 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	WT_ERR(__conn_load_extensions(session, cfg));
 
 	/*
-	 * Configuration completed; optionally write the base configuration file
-	 * if it doesn't already exist.
+	 * The metadata/log encryptor is configured after extensions, since
+	 * extensions may load encryptors.  We have to do this before creating
+	 * the metadata file.
+	 *
+	 * The encryption customize callback needs the fully realized set of
+	 * encryption args, as simply grabbing "encryption" doesn't work.
+	 * As an example, configuration for the current call may just be
+	 * "encryption=(secretkey=xxx)", with encryption.name,
+	 * encryption.keyid being 'inherited' from the stored base
+	 * configuration.
 	 */
-	WT_ERR(__conn_write_base_config(session, cfg, base_merge));
+	WT_ERR(__wt_config_gets_none(session, cfg, "encryption.name", &cval));
+	WT_ERR(__wt_config_gets_none(session, cfg, "encryption.keyid", &keyid));
+	WT_ERR(__wt_config_gets_none(session, cfg, "encryption.secretkey",
+	    &secretkey));
+	WT_ERR(__wt_scr_alloc(session, 0, &encbuf));
+	WT_ERR(__wt_buf_fmt(session, encbuf,
+	    "(name=%.*s,keyid=%.*s,secretkey=%.*s)",
+	    (int)cval.len, cval.str, (int)keyid.len, keyid.str,
+	    (int)secretkey.len, secretkey.str));
+	enc_cfg[0] = encbuf->data;
+	WT_ERR(__wt_encryptor_config(session, &cval, &keyid,
+	    (WT_CONFIG_ARG *)enc_cfg, &conn->kencryptor));
+
+	/*
+	 * Configuration completed; optionally write a base configuration file.
+	 */
+	WT_ERR(__conn_write_base_config(session, cfg));
+
+	/*
+	 * Check on the turtle and metadata files, creating them if necessary
+	 * (which avoids application threads racing to create the metadata file
+	 * later).  Once the metadata file exists, get a reference to it in
+	 * the connection's session.
+	 *
+	 * THE TURTLE FILE MUST BE THE LAST FILE CREATED WHEN INITIALIZING THE
+	 * DATABASE HOME, IT'S WHAT WE USE TO DECIDE IF WE'RE CREATING OR NOT.
+	 */
+	WT_ERR(__wt_turtle_init(session));
+	WT_ERR(__wt_metadata_open(session));
 
 	/*
 	 * Start the worker threads last.
@@ -1821,11 +2032,10 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	*wt_connp = &conn->iface;
 
 err:	/* Discard the scratch buffers. */
+	__wt_scr_free(session, &encbuf);
 	__wt_scr_free(session, &i1);
 	__wt_scr_free(session, &i2);
 	__wt_scr_free(session, &i3);
-
-	__wt_free(session, base_merge);
 
 	/*
 	 * We may have allocated scratch memory when using the dummy session or

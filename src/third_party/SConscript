@@ -40,16 +40,24 @@ if not use_system_version_of_library('stemmer'):
     thirdPartyIncludePathList.append(
         ('stemmer', '#/src/third_party/libstemmer_c/include'))
 
-# Note that the wiredtiger header is generated, so
+# Note that the wiredtiger.h header is generated, so
 # we want to look for it in the build directory not
 # the source directory.
+# The wiredtiger_ext.h is a static file in the source tree
+# In the system installs, wiredtiger.h and wiredtiger_ext.h are in the same directory
 if wiredtiger and not use_system_version_of_library('wiredtiger'):
     thirdPartyIncludePathList.append(
         ('wiredtiger', '$BUILD_DIR/third_party/wiredtiger'))
+    thirdPartyIncludePathList.append(
+        ('wiredtiger_ext', '#/src/third_party/wiredtiger/src/include'))
 
 if not use_system_version_of_library('yaml'):
     thirdPartyIncludePathList.append(
         ('yaml', '#/src/third_party/yaml-cpp-0.5.1/include'))
+
+if not use_system_version_of_library('asio'):
+    thirdPartyIncludePathList.append(
+        ('asio', '#/src/third_party/asio-asio-1-11-0/asio/include'))
 
 def injectAllThirdPartyIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=[entry[1] for entry in thirdPartyIncludePathList])
@@ -295,3 +303,22 @@ if wiredtiger:
             'shim_wiredtiger.cpp'
         ])
 
+if use_system_version_of_library("asio"):
+    asioEnv = env.Clone(
+        SYSLIBDEPS=[
+            env['LIBDEPS_ASIO_SYSLIBDEP'],
+        ])
+else:
+    asioEnv = env.Clone()
+    asioEnv.InjectThirdPartyIncludePaths(libraries=['asio'])
+    asioEnv.SConscript('asio-asio-1-11-0/SConscript', exports={ 'env' : asioEnv })
+    asioEnv = asioEnv.Clone(
+        LIBDEPS=[
+            'asio-asio-1-11-0/asio',
+        ])
+
+asioEnv.Library(
+    target="shim_asio",
+    source=[
+        'shim_asio.cpp'
+    ])

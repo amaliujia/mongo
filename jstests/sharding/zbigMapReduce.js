@@ -17,6 +17,7 @@ function setupTest() {
     config.settings.save({_id: "chunksize", value: 1});
 
     s.adminCommand( { enablesharding : "test" } )
+    s.ensurePrimaryShard('test', 'test-rs0');
     s.adminCommand( { shardcollection : "test.foo", key : { "_id" : 1 } } )
     return s;
 }
@@ -217,7 +218,7 @@ function runTest(s) {
 }
 
 var s = setupTest();
-if (s.getDB( "admin" ).runCommand( "buildInfo" ).pointerSizeBits < 64) {
+if (s.getDB( "admin" ).runCommand( "buildInfo" ).bits < 64) {
     print("Skipping test on 32-bit platforms");
 }
 else {

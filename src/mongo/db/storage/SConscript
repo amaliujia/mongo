@@ -35,6 +35,7 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/db/service_context',
         ],
     )
 
@@ -47,6 +48,15 @@ env.Library(
         '$BUILD_DIR/mongo/bson/bson',
         ]
     )
+
+env.Library(
+    target='paths',
+    source=[
+        'paths.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
 
 env.Library(
     target='sorted_data_interface_test_harness',
@@ -104,7 +114,7 @@ env.Library(
         'storage_engine_lock_file_${TARGET_OS_FAMILY}.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/paths',
+        'paths',
         ]
     )
 

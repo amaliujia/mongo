@@ -108,8 +108,8 @@ __create_file(WT_SESSION_IMPL *session,
 	}
 
 	/*
-	 * Open the file to check that it was setup correctly.   We don't need
-	 * to pass the configuration, we just wrote the collapsed configuration
+	 * Open the file to check that it was setup correctly. We don't need to
+	 * pass the configuration, we just wrote the collapsed configuration
 	 * into the metadata file, and it's going to be read/used by underlying
 	 * functions.
 	 *
@@ -476,6 +476,10 @@ __create_index(WT_SESSION_IMPL *session,
 			ret = exclusive ? EEXIST : 0;
 		goto err;
 	}
+
+	/* Make sure that the configuration is valid. */
+	WT_ERR(__wt_schema_open_index(
+	    session, table, idxname, strlen(idxname), NULL));
 
 err:	__wt_free(session, idxconf);
 	__wt_free(session, sourceconf);

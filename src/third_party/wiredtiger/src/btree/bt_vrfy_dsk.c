@@ -91,6 +91,8 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 	flags = dsk->flags;
 	if (LF_ISSET(WT_PAGE_COMPRESSED))
 		LF_CLR(WT_PAGE_COMPRESSED);
+	if (LF_ISSET(WT_PAGE_ENCRYPTED))
+		LF_CLR(WT_PAGE_ENCRYPTED);
 	if (dsk->type == WT_PAGE_ROW_LEAF) {
 		if (LF_ISSET(WT_PAGE_EMPTY_V_ALL) &&
 		    LF_ISSET(WT_PAGE_EMPTY_V_NONE))
@@ -298,8 +300,8 @@ __verify_dsk_row(
 		 * Remaining checks are for key order and prefix compression.
 		 * If this cell isn't a key, we're done, move to the next cell.
 		 * If this cell is an overflow item, instantiate the key and
-		 * compare it with the last key.   Otherwise, we have to deal
-		 * with prefix compression.
+		 * compare it with the last key. Otherwise, we have to deal with
+		 * prefix compression.
 		 */
 		switch (cell_type) {
 		case WT_CELL_KEY:

@@ -461,7 +461,6 @@ __wt_stat_init_connection_stats(WT_CONNECTION_STATS *stats)
 	stats->log_buffer_grow.desc = "log: log buffer size increases";
 	stats->log_bytes_payload.desc = "log: log bytes of payload data";
 	stats->log_bytes_written.desc = "log: log bytes written";
-	stats->log_reads.desc = "log: log read operations";
 	stats->log_compress_writes.desc = "log: log records compressed";
 	stats->log_compress_write_fails.desc =
 	    "log: log records not compressed";
@@ -550,6 +549,7 @@ __wt_stat_init_connection_stats(WT_CONNECTION_STATS *stats)
 	    "transaction: transaction range of IDs currently pinned";
 	stats->txn_pinned_checkpoint_range.desc =
 	    "transaction: transaction range of IDs currently pinned by a checkpoint";
+	stats->txn_sync.desc = "transaction: transaction sync calls";
 	stats->txn_commit.desc = "transaction: transactions committed";
 	stats->txn_rollback.desc = "transaction: transactions rolled back";
 }
@@ -634,7 +634,6 @@ __wt_stat_refresh_connection_stats(void *stats_arg)
 	stats->log_buffer_grow.v = 0;
 	stats->log_bytes_payload.v = 0;
 	stats->log_bytes_written.v = 0;
-	stats->log_reads.v = 0;
 	stats->log_compress_writes.v = 0;
 	stats->log_compress_write_fails.v = 0;
 	stats->log_compress_small.v = 0;
@@ -671,6 +670,7 @@ __wt_stat_refresh_connection_stats(void *stats_arg)
 	stats->txn_begin.v = 0;
 	stats->txn_checkpoint.v = 0;
 	stats->txn_fail_cache.v = 0;
+	stats->txn_sync.v = 0;
 	stats->txn_commit.v = 0;
 	stats->txn_rollback.v = 0;
 }

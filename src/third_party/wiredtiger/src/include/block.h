@@ -185,7 +185,8 @@ struct __wt_bm {
 	int (*sync)(WT_BM *, WT_SESSION_IMPL *, int);
 	int (*verify_addr)(WT_BM *, WT_SESSION_IMPL *, const uint8_t *, size_t);
 	int (*verify_end)(WT_BM *, WT_SESSION_IMPL *);
-	int (*verify_start)(WT_BM *, WT_SESSION_IMPL *, WT_CKPT *);
+	int (*verify_start)
+	    (WT_BM *, WT_SESSION_IMPL *, WT_CKPT *, const char *[]);
 	int (*write) (WT_BM *,
 	    WT_SESSION_IMPL *, WT_ITEM *, uint8_t *, size_t *, int);
 	int (*write_size)(WT_BM *, WT_SESSION_IMPL *, size_t *);
@@ -246,6 +247,7 @@ struct __wt_block {
 
 				/* Verification support */
 	int	   verify;		/* If performing verification */
+	int	   verify_strict;	/* Fail hard on any error */
 	wt_off_t   verify_size;		/* Checkpoint's file size */
 	WT_EXTLIST verify_alloc;	/* Verification allocation list */
 	uint64_t   frags;		/* Maximum frags in the file */
@@ -330,13 +332,15 @@ struct __wt_block_header {
 	((void *)((uint8_t *)(dsk) + WT_BLOCK_HEADER_BYTE_SIZE))
 
 /*
- * Don't compress the block's WT_PAGE_HEADER and WT_BLOCK_HEADER structures.
- * We need the WT_PAGE_HEADER in-memory size, and the WT_BLOCK_HEADER checksum
- * and on-disk size to be immediately available without decompression.  We use
- * the on-disk size and checksum during salvage to figure out where the blocks
- * are, and the in-memory size tells us how large a buffer we need to decompress
- * the block.  We could skip less than 64B, but a 64B boundary may offer better
- * alignment for the underlying compression engine, and skipping 64B won't make
- * a difference in terms of compression efficiency.
+ * We don't compress or encrypt the block's WT_PAGE_HEADER or WT_BLOCK_HEADER
+ * structures because we need both available with decompression or decryption.
+ * We use the WT_BLOCK_HEADER checksum and on-disk size during salvage to
+ * figure out where the blocks are, and we use the WT_PAGE_HEADER in-memory
+ * size during decompression and decryption to know how large a target buffer
+ * to allocate. We can only skip the header information when doing encryption,
+ * but we skip the first 64B when doing compression; a 64B boundary may offer
+ * better alignment for the underlying compression engine, and skipping 64B
+ * shouldn't make any difference in terms of compression efficiency.
  */
 #define	WT_BLOCK_COMPRESS_SKIP	64
+#define	WT_BLOCK_ENCRYPT_SKIP	WT_BLOCK_HEADER_BYTE_SIZE

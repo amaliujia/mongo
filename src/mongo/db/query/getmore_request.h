@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
@@ -37,37 +38,38 @@
 
 namespace mongo {
 
-    struct GetMoreRequest {
-        /**
-         * Construct an empty request.
-         */
-        GetMoreRequest();
+struct GetMoreRequest {
+    /**
+     * Construct an empty request.
+     */
+    GetMoreRequest();
 
-        /**
-         * Construct a GetMoreRequesst from the command specification and db name.
-         */
-        static StatusWith<GetMoreRequest> parseFromBSON(const std::string& dbname,
-                                                        const BSONObj& cmdObj);
+    /**
+     * Construct a GetMoreRequest from the command specification and db name.
+     */
+    static StatusWith<GetMoreRequest> parseFromBSON(const std::string& dbname,
+                                                    const BSONObj& cmdObj);
 
-        static std::string parseNs(const std::string& dbname, const BSONObj& cmdObj);
+    static std::string parseNs(const std::string& dbname, const BSONObj& cmdObj);
 
-        const NamespaceString nss;
-        const CursorId cursorid;
-        const int batchSize;
+    const NamespaceString nss;
+    const CursorId cursorid;
 
-        static const int kDefaultBatchSize;
+    // The batch size is optional. If not provided, we will put as many documents into the batch
+    // as fit within the byte limit.
+    const boost::optional<int> batchSize;
 
-    private:
-        /**
-         * Construct from parsed BSON
-         */
-        GetMoreRequest(const std::string& fullns, CursorId id, int batch);
+private:
+    /**
+     * Construct from parsed BSON
+     */
+    GetMoreRequest(const std::string& fullns, CursorId id, boost::optional<int> batch);
 
-        /**
-         * Returns a non-OK status if there are semantic errors in the parsed request
-         * (e.g. a negative batchSize).
-         */
-        Status isValid() const;
-    };
+    /**
+     * Returns a non-OK status if there are semantic errors in the parsed request
+     * (e.g. a negative batchSize).
+     */
+    Status isValid() const;
+};
 
-} // namespace mongo
+}  // namespace mongo

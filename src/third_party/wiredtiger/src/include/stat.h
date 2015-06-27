@@ -217,7 +217,6 @@ struct __wt_connection_stats {
 	WT_STATS log_prealloc_files;
 	WT_STATS log_prealloc_max;
 	WT_STATS log_prealloc_used;
-	WT_STATS log_reads;
 	WT_STATS log_release_write_lsn;
 	WT_STATS log_scan_records;
 	WT_STATS log_scan_rereads;
@@ -274,6 +273,7 @@ struct __wt_connection_stats {
 	WT_STATS txn_pinned_checkpoint_range;
 	WT_STATS txn_pinned_range;
 	WT_STATS txn_rollback;
+	WT_STATS txn_sync;
 	WT_STATS write_io;
 };
 
