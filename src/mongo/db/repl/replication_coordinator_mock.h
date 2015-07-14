@@ -128,6 +128,8 @@ public:
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result);
 
+    virtual void processReplicationMetadata(const ReplicationMetadata& replMetadata);
+
     virtual Status setMaintenanceMode(bool activate);
 
     virtual bool getMaintenanceMode();
@@ -198,7 +200,9 @@ public:
 
     virtual long long getTerm();
 
-    virtual bool updateTerm(long long term);
+    virtual Status updateTerm(long long term);
+
+    virtual void onSnapshotCreate(OpTime timeOfSnapshot);
 
 private:
     const ReplSettings _settings;

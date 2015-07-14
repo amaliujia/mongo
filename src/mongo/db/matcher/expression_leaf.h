@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <unordered_map>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
@@ -388,13 +389,28 @@ private:
  */
 class TypeMatchExpression : public MatchExpression {
 public:
+    static const std::string kMatchesAllNumbersAlias;
+    static const std::unordered_map<std::string, BSONType> typeAliasMap;
+
     TypeMatchExpression() : MatchExpression(TYPE_OPERATOR) {}
 
-    Status init(StringData path, int type);
+    /**
+     * Initialize as matching against a specific BSONType.
+     */
+    Status initWithBSONType(StringData path, BSONType type);
+
+    /**
+     * Initialize as matching against all number types (NumberDouble, NumberLong, and NumberInt).
+     */
+    Status initAsMatchingAllNumbers(StringData path);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<TypeMatchExpression> e = stdx::make_unique<TypeMatchExpression>();
-        e->init(_path, _type);
+        if (_matchesAllNumbers) {
+            e->initAsMatchingAllNumbers(_path);
+        } else {
+            e->initWithBSONType(_path, _type);
+        }
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
@@ -414,8 +430,16 @@ public:
     /**
      * What is the type we're matching against?
      */
-    int getData() const {
+    BSONType getType() const {
         return _type;
+    }
+
+    /**
+     * Whether or not to match against all number types (NumberDouble, NumberLong, and NumberInt).
+     * Defaults to false. If this is true, _type is undefined.
+     */
+    bool matchesAllNumbers() const {
+        return _matchesAllNumbers;
     }
 
     virtual const StringData path() const {
@@ -427,7 +451,8 @@ private:
 
     StringData _path;
     ElementPath _elementPath;
-    int _type;
+    bool _matchesAllNumbers = false;
+    BSONType _type;
 };
 
 }  // namespace mongo

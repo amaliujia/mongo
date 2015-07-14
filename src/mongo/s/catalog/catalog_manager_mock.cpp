@@ -26,13 +26,14 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/catalog/catalog_manager_mock.h"
 
 #include "mongo/base/status.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_settings.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -52,15 +53,11 @@ ConnectionString CatalogManagerMock::connectionString() const {
     return kConfigHost;
 }
 
-Status CatalogManagerMock::startup(bool upgrade) {
+Status CatalogManagerMock::startup() {
     return Status::OK();
 }
 
 void CatalogManagerMock::shutDown() {}
-
-Status CatalogManagerMock::enableSharding(const string& dbName) {
-    return Status::OK();
-}
 
 Status CatalogManagerMock::shardCollection(OperationContext* txn,
                                            const string& ns,
@@ -72,7 +69,7 @@ Status CatalogManagerMock::shardCollection(OperationContext* txn,
 }
 
 StatusWith<string> CatalogManagerMock::addShard(OperationContext* txn,
-                                                const string& name,
+                                                const std::string* shardProposedName,
                                                 const ConnectionString& shardConnectionString,
                                                 const long long maxSize) {
     return Status::OK();
@@ -81,10 +78,6 @@ StatusWith<string> CatalogManagerMock::addShard(OperationContext* txn,
 StatusWith<ShardDrainingStatus> CatalogManagerMock::removeShard(OperationContext* txn,
                                                                 const string& name) {
     return ShardDrainingStatus::COMPLETED;
-}
-
-Status CatalogManagerMock::createDatabase(const string& dbName) {
-    return Status::OK();
 }
 
 Status CatalogManagerMock::updateDatabase(const string& dbName, const DatabaseType& db) {
@@ -148,9 +141,9 @@ bool CatalogManagerMock::runUserManagementWriteCommand(const string& commandName
     return true;
 }
 
-bool CatalogManagerMock::runUserManagementReadCommand(const string& dbname,
-                                                      const BSONObj& cmdObj,
-                                                      BSONObjBuilder* result) {
+bool CatalogManagerMock::runReadCommand(const string& dbname,
+                                        const BSONObj& cmdObj,
+                                        BSONObjBuilder* result) {
     return true;
 }
 
@@ -175,6 +168,18 @@ void CatalogManagerMock::writeConfigServerDirect(const BatchedCommandRequest& re
 
 DistLockManager* CatalogManagerMock::getDistLockManager() const {
     return _mockDistLockMgr.get();
+}
+
+Status CatalogManagerMock::_checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const {
+    return Status::OK();
+}
+
+StatusWith<std::string> CatalogManagerMock::_generateNewShardName() const {
+    return {ErrorCodes::InternalError, "Method not implemented"};
+}
+
+Status CatalogManagerMock::checkAndUpgrade(bool checkOnly) {
+    return Status::OK();
 }
 
 }  // namespace mongo

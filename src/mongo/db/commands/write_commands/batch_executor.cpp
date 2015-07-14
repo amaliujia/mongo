@@ -65,12 +65,12 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/s/collection_metadata.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/write_ops/batched_upsert_detail.h"
@@ -169,7 +169,7 @@ static void noteInCriticalSection(WriteErrorDetail* staleError) {
 // static
 Status WriteBatchExecutor::validateBatch(const BatchedCommandRequest& request) {
     // Validate namespace
-    const NamespaceString& nss = request.getNSS();
+    const NamespaceString& nss = request.getNS();
     if (!nss.isValid()) {
         return Status(ErrorCodes::InvalidNamespace, nss.ns() + " is not a valid namespace");
     }
@@ -481,9 +481,8 @@ static void beginCurrentOp(OperationContext* txn, const BatchItemRef& currWrite)
     CurOp* const currentOp = CurOp::get(txn);
     currentOp->setOp_inlock(getOpCode(currWrite));
     currentOp->ensureStarted();
-    currentOp->setNS_inlock(currWrite.getRequest()->getNS());
+    currentOp->setNS_inlock(currWrite.getRequest()->getNS().ns());
 
-    currentOp->debug().ns = currentOp->getNS();
     currentOp->debug().op = currentOp->getOp();
 
     if (currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert) {
@@ -928,7 +927,7 @@ bool WriteBatchExecutor::ExecInsertsState::_lockAndCheckImpl(WriteOpResult* resu
     if (request->isInsertIndexRequest())
         intentLock = false;  // can't build indexes in intent mode
 
-    const NamespaceString& nss = request->getNSS();
+    const NamespaceString& nss = request->getNS();
     invariant(!_collLock);
     invariant(!_dbLock);
     _dbLock =
@@ -1290,7 +1289,7 @@ static void multiUpdate(OperationContext* txn,
 static void multiRemove(OperationContext* txn,
                         const BatchItemRef& removeItem,
                         WriteOpResult* result) {
-    const NamespaceString& nss = removeItem.getRequest()->getNSS();
+    const NamespaceString& nss = removeItem.getRequest()->getNS();
     DeleteRequest request(nss);
     request.setQuery(removeItem.getDelete()->getQuery());
     request.setMulti(removeItem.getDelete()->getLimit() != 1);

@@ -35,6 +35,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -88,11 +89,10 @@ public:
     virtual ConnectionString connectionString() const = 0;
 
     /**
-     * Performs implementation-specific startup tasks including but not limited to doing any
-     * necessary config schema upgrade work.  Must be run after the catalog manager
+     * Performs implementation-specific startup tasks. Must be run after the catalog manager
      * has been installed into the global 'grid' object.
      */
-    virtual Status startup(bool upgrade) = 0;
+    virtual Status startup() = 0;
 
     /**
      * Performs necessary cleanup when shutting down cleanly.
@@ -109,7 +109,7 @@ public:
      *  - DatabaseDifferCase - database already exists, but with a different case
      *  - ShardNotFound - could not find a shard to place the DB on
      */
-    virtual Status enableSharding(const std::string& dbName) = 0;
+    Status enableSharding(const std::string& dbName);
 
     /**
      * Shards a collection. Assumes that the database is enabled for sharding.
@@ -137,17 +137,18 @@ public:
      * Adds a new shard. It expects a standalone mongod process or replica set to be running
      * on the provided address.
      *
-     * @param  name is an optional string with the name of the shard.
-     *         If empty, a name will be automatically generated.
+     * @param  shardProposedName is an optional string with the proposed name of the shard.
+     *         If it is nullptr, a name will be automatically generated; if not nullptr, it cannot
+     *         contain the empty string.
      * @param  shardConnectionString is the connection string of the shard being added.
      * @param  maxSize is the optional space quota in bytes. Zeros means there's
      *         no limitation to space usage.
      * @return either an !OK status or the name of the newly added shard.
      */
     virtual StatusWith<std::string> addShard(OperationContext* txn,
-                                             const std::string& name,
+                                             const std::string* shardProposedName,
                                              const ConnectionString& shardConnectionString,
-                                             const long long maxSize) = 0;
+                                             const long long maxSize);
 
     /**
      * Tries to remove a shard. To completely remove a shard from a sharded cluster,
@@ -159,20 +160,6 @@ public:
      */
     virtual StatusWith<ShardDrainingStatus> removeShard(OperationContext* txn,
                                                         const std::string& name) = 0;
-
-    /**
-     * Creates a new database entry for the specified database name in the configuration
-     * metadata and sets the specified shard as primary.
-     *
-     * @param dbName name of the database (case sensitive)
-     *
-     * Returns Status::OK on success or any error code indicating the failure. These are some
-     * of the known failures:
-     *  - NamespaceExists - database already exists
-     *  - DatabaseDifferCase - database already exists, but with a different case
-     *  - ShardNotFound - could not find a shard to place the DB on
-     */
-    virtual Status createDatabase(const std::string& dbName) = 0;
 
     /**
      * Updates or creates the metadata for a given database.
@@ -276,7 +263,9 @@ public:
     virtual bool isShardHost(const ConnectionString& shardConnectionString) = 0;
 
     /**
-     * Runs a user management command on the config servers.
+     * Runs a user management command on the config servers, potentially synchronizing through
+     * a distributed lock. Do not use for general write command execution.
+     *
      * @param commandName: name of command
      * @param dbname: database for which the user management command is invoked
      * @param cmdObj: command obj
@@ -289,11 +278,11 @@ public:
                                                BSONObjBuilder* result) = 0;
 
     /**
-     * Runs a read-only user management command on a single config server.
+     * Runs a read-only command on a single config server.
      */
-    virtual bool runUserManagementReadCommand(const std::string& dbname,
-                                              const BSONObj& cmdObj,
-                                              BSONObjBuilder* result) = 0;
+    virtual bool runReadCommand(const std::string& dbname,
+                                const BSONObj& cmdObj,
+                                BSONObjBuilder* result) = 0;
 
     /**
      * Applies oplog entries to the config servers.
@@ -362,6 +351,20 @@ public:
     virtual DistLockManager* getDistLockManager() const = 0;
 
     /**
+     * Creates a new database entry for the specified database name in the configuration
+     * metadata and sets the specified shard as primary.
+     *
+     * @param dbName name of the database (case sensitive)
+     *
+     * Returns Status::OK on success or any error code indicating the failure. These are some
+     * of the known failures:
+     *  - NamespaceExists - database already exists
+     *  - DatabaseDifferCase - database already exists, but with a different case
+     *  - ShardNotFound - could not find a shard to place the DB on
+     */
+    Status createDatabase(const std::string& dbName);
+
+    /**
      * Directly inserts a document in the specified namespace on the config server (only the
      * config or admin databases). If the document does not have _id field, the field will be
      * added.
@@ -397,6 +400,13 @@ public:
                   int limit,
                   BatchedCommandResponse* response);
 
+    /**
+     * Performs the necessary checks for version compatibility and can run the upgrade procedure.
+     * A new version document will be created if the current cluster config is empty. Otherwise,
+     * checkOnly should be false to perform the upgrade.
+     */
+    virtual Status checkAndUpgrade(bool checkOnly) = 0;
+
 protected:
     CatalogManager() = default;
 
@@ -405,6 +415,24 @@ protected:
      * available shards. Will return ShardNotFound if shard could not be found.
      */
     static StatusWith<ShardId> selectShardForNewDatabase(ShardRegistry* shardRegistry);
+
+private:
+    /**
+     * Checks that the given database name doesn't already exist in the config.databases
+     * collection, including under different casing. Optional db can be passed and will
+     * be set with the database details if the given dbName exists.
+     *
+     * Returns OK status if the db does not exist.
+     * Some known errors include:
+     *  NamespaceExists if it exists with the same casing
+     *  DatabaseDifferCase if it exists under different casing.
+     */
+    virtual Status _checkDbDoesNotExist(const std::string& dbName, DatabaseType* db) const = 0;
+
+    /**
+     * Generates a unique name to be given to a newly added shard.
+     */
+    virtual StatusWith<std::string> _generateNewShardName() const = 0;
 };
 
 }  // namespace mongo

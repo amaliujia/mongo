@@ -185,6 +185,8 @@ public:
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result) override;
 
+    virtual void processReplicationMetadata(const ReplicationMetadata& replMetadata) override;
+
     virtual Status setMaintenanceMode(bool activate) override;
 
     virtual bool getMaintenanceMode() override;
@@ -263,7 +265,9 @@ public:
      */
     virtual long long getTerm() override;
 
-    virtual bool updateTerm(long long term) override;
+    virtual Status updateTerm(long long term) override;
+
+    virtual void onSnapshotCreate(OpTime timeOfSnapshot) override;
 
     // ================== Test support API ===================
 
@@ -277,6 +281,11 @@ public:
      * Gets the replica set configuration in use by the node.
      */
     ReplicaSetConfig getReplicaSetConfig_forTest();
+
+    /**
+     * Gets the latest OpTime of the currentCommittedSnapshot.
+     */
+    OpTime getCurrentCommittedSnapshot_forTest();
 
     /**
      * Simple wrapper around _setLastOptime_inlock to make it easier to test.
@@ -402,6 +411,13 @@ private:
      */
     PostMemberStateUpdateAction _setCurrentRSConfig_inlock(const ReplicaSetConfig& newConfig,
                                                            int myIndex);
+
+    /**
+     * Updates the last committed OpTime to be "committedOpTime" if it is more recent than the
+     * current last committed OpTime.
+     */
+    void _setLastCommittedOpTime(const OpTime& committedOpTime);
+    void _setLastCommittedOpTime_inlock(const OpTime& committedOpTime);
 
     /**
      * Helper to wake waiters in _replicationWaiterList that are doneWaitingForReplication.
@@ -877,7 +893,29 @@ private:
                             long long term,
                             bool* updated,
                             Handle* cbHandle);
+    /**
+     * Returns true if the term increased.
+     */
     bool _updateTerm_incallback(long long term, Handle* cbHandle);
+
+    /**
+     * Callback that processes the ReplicationMetadata returned from a command run against another
+     * replica set member and updates protocol version 1 information (most recent optime that is
+     * committed, member id of the current PRIMARY, the current config version and the current term)
+     */
+    void _processReplicationMetadata_helper(const ReplicationExecutor::CallbackArgs& cbData,
+                                            const ReplicationMetadata& replMetadata);
+    void _processReplicationMetadata_incallback(const ReplicationMetadata& replMetadata);
+
+    /**
+     * Blesses a snapshot to be used for new committed reads.
+     */
+    void _updateCommittedSnapshot_inlock(OpTime newCommittedSnapshot);
+
+    /**
+     * Drops all snapshots and clears the "committed" snapshot.
+     */
+    void _dropAllSnapshots_inlock();
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -1019,6 +1057,13 @@ private:
 
     // Data Replicator used to replicate data
     DataReplicator _dr;  // (S)
+
+    // The OpTimes for all snapshots newer than the current commit point, kept in sorted order.
+    std::deque<OpTime> _uncommittedSnapshots;  // (M)
+
+    // The non-null OpTime of the current snapshot used for committed reads, if there is one. When
+    // engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
+    boost::optional<OpTime> _currentCommittedSnapshot;  // (M)
 };
 
 }  // namespace repl

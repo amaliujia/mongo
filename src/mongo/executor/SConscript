@@ -42,11 +42,35 @@ env.Library(
     target='network_interface_asio',
     source=[
         'network_interface_asio.cpp',
+        'network_interface_asio_auth.cpp',
+        'network_interface_asio_command.cpp',
+        'network_interface_asio_connect.cpp',
+        'network_interface_asio_ssl.cpp',
+        'network_interface_asio_operation.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/coredb',
         '$BUILD_DIR/mongo/db/repl/replication_executor',
-        '$BUILD_DIR/mongo/db/serveronly',
         '$BUILD_DIR/third_party/shim_asio',
     ])
+
+env.Library(
+    target='network_interface_factory',
+    source=[
+        'network_interface_factory.cpp',
+    ],
+    LIBDEPS=[
+        'network_interface',
+        'network_interface_asio',
+        'network_interface_impl',
+    ])
+
+env.Library('task_executor_test_fixture',
+            [
+                'task_executor_test_common.cpp',
+                'task_executor_test_fixture.cpp'],
+            LIBDEPS=[
+                'network_interface_mock',
+                'task_executor_interface',
+            ])

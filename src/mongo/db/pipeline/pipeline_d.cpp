@@ -30,7 +30,6 @@
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
-
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -41,7 +40,8 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_state.h"
 
 namespace mongo {
 
@@ -182,7 +182,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
 
     if (sortStage) {
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            pExpCtx->ns, queryObj, sortObj, projectionForQuery, whereCallback);
+            pExpCtx->ns.ns(), queryObj, sortObj, projectionForQuery, whereCallback);
 
         if (statusWithCQ.isOK()) {
             auto statusWithPlanExecutor = getExecutor(txn,
@@ -207,7 +207,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     if (!exec.get()) {
         const BSONObj noSort;
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            pExpCtx->ns, queryObj, noSort, projectionForQuery, whereCallback);
+            pExpCtx->ns.ns(), queryObj, noSort, projectionForQuery, whereCallback);
         uassertStatusOK(statusWithCQ.getStatus());
 
         exec = uassertStatusOK(getExecutor(txn,

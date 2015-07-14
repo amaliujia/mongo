@@ -45,8 +45,8 @@
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/s/collection_metadata.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/util/log.h"
 
 namespace {
@@ -113,7 +113,7 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
 
         return CleanupResult_Done;
     }
-    orphanRange.ns = ns;
+    orphanRange.ns = ns.ns();
     *stoppedAtKey = orphanRange.maxKey;
 
     // We're done with this metadata now, no matter what happens

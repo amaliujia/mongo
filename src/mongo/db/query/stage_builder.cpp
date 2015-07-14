@@ -28,6 +28,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/stage_builder.h"
 
 #include "mongo/db/client.h"
@@ -51,6 +53,7 @@
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -281,7 +284,7 @@ PlanStage* buildStages(OperationContext* txn,
             return NULL;
         }
         return new ShardFilterStage(
-            shardingState.getCollectionMetadata(collection->ns()), ws, childStage);
+            shardingState.getCollectionMetadata(collection->ns().ns()), ws, childStage);
     } else if (STAGE_KEEP_MUTATIONS == root->getType()) {
         const KeepMutationsNode* km = static_cast<const KeepMutationsNode*>(root);
         PlanStage* childStage = buildStages(txn, collection, qsol, km->children[0], ws);

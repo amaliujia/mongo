@@ -71,14 +71,18 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/snapshot_thread.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/platform/random.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -101,6 +105,8 @@ namespace {
 // cached copies of these...so don't rename them, drop them, etc.!!!
 Database* _localDB = nullptr;
 Collection* _localOplogCollection = nullptr;
+
+PseudoRandom hashGenerator(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
 
 // Synchronizes the section where a new Timestamp is generated and when it actually
 // appears in the oplog.
@@ -134,6 +140,8 @@ std::pair<OpTime, long long> getNextOpTime(OperationContext* txn,
                                            const char* ns,
                                            ReplicationCoordinator* replCoord,
                                            const char* opstr) {
+    synchronizeOnCappedInFlightResource(txn->lockState());
+
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
     Timestamp ts = getNextGlobalTimestamp();
     newTimestampNotifier.notify_all();
@@ -150,19 +158,7 @@ std::pair<OpTime, long long> getNextOpTime(OperationContext* txn,
             term = ReplClientInfo::forClient(txn->getClient()).getTerm();
         }
 
-        hashNew = BackgroundSync::get()->getLastAppliedHash();
-
-        // Check to make sure logOp() is legal at this point.
-        if (*opstr == 'n') {
-            // 'n' operations are always logged
-            invariant(*ns == '\0');
-            // 'n' operations do not advance the hash, since they are not rolled back
-        } else {
-            // Advance the hash
-            hashNew = (hashNew * 131 + ts.asLL()) * 17 + replCoord->getMyId();
-
-            BackgroundSync::get()->setLastAppliedHash(hashNew);
-        }
+        hashNew = hashGenerator.nextInt64();
     }
 
     OpTime opTime(ts, term);
@@ -361,11 +357,6 @@ OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops) {
         wunit.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "writeOps", _localOplogCollection->ns().ns());
-
-    BackgroundSync* bgsync = BackgroundSync::get();
-    // Keep this up-to-date, in case we step up to primary.
-    long long hash = ops.back()["h"].numberLong();
-    bgsync->setLastAppliedHash(hash);
 
     return lastOptime;
 }
@@ -820,7 +811,7 @@ void waitUpToOneSecondForTimestampChange(const Timestamp& referenceTime) {
     stdx::unique_lock<stdx::mutex> lk(newOpMutex);
 
     while (referenceTime == getLastSetTimestamp()) {
-        if (!newTimestampNotifier.timed_wait(lk, boost::posix_time::seconds(1)))
+        if (stdx::cv_status::timeout == newTimestampNotifier.wait_for(lk, stdx::chrono::seconds(1)))
             return;
     }
 }
@@ -856,6 +847,101 @@ void oplogCheckCloseDatabase(OperationContext* txn, Database* db) {
 
     _localDB = nullptr;
     _localOplogCollection = nullptr;
+}
+
+SnapshotThread::SnapshotThread(SnapshotManager* manager)
+    : _manager(manager), _thread([this] { run(); }) {}
+
+void SnapshotThread::run() {
+    Client::initThread("SnapshotThread");
+    auto& client = cc();
+    auto serviceContext = client.getServiceContext();
+    auto replCoord = ReplicationCoordinator::get(serviceContext);
+
+    Timestamp lastTimestamp = {};
+    while (true) {
+        {
+            stdx::unique_lock<stdx::mutex> lock(newOpMutex);
+            while (true) {
+                if (_inShutdown)
+                    return;
+
+                if (_forcedSnapshotPending || lastTimestamp != getLastSetTimestamp()) {
+                    _forcedSnapshotPending = false;
+                    lastTimestamp = getLastSetTimestamp();
+                    break;
+                }
+
+                newTimestampNotifier.wait(lock);
+            }
+        }
+
+        try {
+            auto txn = client.makeOperationContext();
+            Lock::GlobalLock globalLock(txn->lockState(), MODE_IS, UINT_MAX);
+
+            if (!replCoord->getMemberState().readable()) {
+                // If our MemberState isn't readable, we may not be in a consistent state so don't
+                // take snapshots. When we transition into a readable state from a non-readable
+                // state, a snapshot is forced to ensure we don't miss the latest write. This must
+                // be checked each time we acquire the global IS lock since that prevents the node
+                // from transitioning to a !readable() state from a readable() one.
+                continue;
+            }
+
+            {
+                // Make sure there are no in-flight capped inserts while we create our snapshot.
+                Lock::ResourceLock cappedInsertLock(
+                    txn->lockState(), resourceCappedInFlight, MODE_X);
+                _manager->prepareForCreateSnapshot(txn.get());
+            }
+
+            auto opTimeOfSnapshot = OpTime();
+            {
+                AutoGetCollectionForRead oplog(txn.get(), rsOplogName);
+                invariant(oplog.getCollection());
+                // Read the latest op from the oplog.
+                auto cursor = oplog.getCollection()->getCursor(txn.get(), /*forward*/ false);
+                auto record = cursor->next();
+                if (!record)
+                    continue;  // oplog is completely empty.
+
+                const auto op = record->data.releaseToBson();
+                opTimeOfSnapshot = extractOpTime(op);
+                invariant(!opTimeOfSnapshot.isNull());
+            }
+
+            _manager->createSnapshot(txn.get(), SnapshotName(opTimeOfSnapshot.getTimestamp()));
+            replCoord->onSnapshotCreate(opTimeOfSnapshot);
+        } catch (const WriteConflictException& wce) {
+            log() << "skipping storage snapshot pass due to write conflict";
+            continue;
+        }
+    }
+}
+
+void SnapshotThread::shutdown() {
+    invariant(_thread.joinable());
+    {
+        stdx::lock_guard<stdx::mutex> lock(newOpMutex);
+        invariant(!_inShutdown);
+        _inShutdown = true;
+        newTimestampNotifier.notify_all();
+    }
+    _thread.join();
+}
+
+void SnapshotThread::forceSnapshot() {
+    stdx::lock_guard<stdx::mutex> lock(newOpMutex);
+    _forcedSnapshotPending = true;
+    newTimestampNotifier.notify_all();
+}
+
+std::unique_ptr<SnapshotThread> SnapshotThread::start(ServiceContext* service) {
+    if (auto manager = service->getGlobalStorageEngine()->getSnapshotManager()) {
+        return std::unique_ptr<SnapshotThread>(new SnapshotThread(manager));
+    }
+    return {};
 }
 
 }  // namespace repl

@@ -1360,10 +1360,14 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
         response->append("stateStr", myState.toString());
         response->append("uptime", selfUptime);
 
-        BSONObjBuilder opTime(response->subobjStart("optime"));
-        opTime.append("ts", lastOpApplied.getTimestamp());
-        opTime.append("term", lastOpApplied.getTerm());
-        opTime.done();
+        if (_rsConfig.getProtocolVersion() == 1) {
+            BSONObjBuilder opTime(response->subobjStart("optime"));
+            opTime.append("ts", lastOpApplied.getTimestamp());
+            opTime.append("term", lastOpApplied.getTerm());
+            opTime.done();
+        } else {
+            response->append("optime", lastOpApplied.getTimestamp());
+        }
 
         response->appendDate("optimeDate",
                              Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
@@ -1391,10 +1395,14 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
             bb.append("stateStr", myState.toString());
             bb.append("uptime", selfUptime);
             if (!_selfConfig().isArbiter()) {
-                BSONObjBuilder opTime(bb.subobjStart("optime"));
-                opTime.append("ts", lastOpApplied.getTimestamp());
-                opTime.append("term", lastOpApplied.getTerm());
-                opTime.done();
+                if (_rsConfig.getProtocolVersion() == 1) {
+                    BSONObjBuilder opTime(bb.subobjStart("optime"));
+                    opTime.append("ts", lastOpApplied.getTimestamp());
+                    opTime.append("term", lastOpApplied.getTerm());
+                    opTime.done();
+                } else {
+                    bb.append("optime", lastOpApplied.getTimestamp());
+                }
 
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
@@ -1442,10 +1450,14 @@ void TopologyCoordinatorImpl::prepareStatusResponse(const ReplicationExecutor::C
                 it->getUpSince() != Date_t() ? durationCount<Seconds>(now - it->getUpSince()) : 0));
             bb.append("uptime", uptime);
             if (!itConfig.isArbiter()) {
-                BSONObjBuilder opTime(bb.subobjStart("optime"));
-                opTime.append("ts", it->getOpTime().getTimestamp());
-                opTime.append("term", it->getOpTime().getTerm());
-                opTime.done();
+                if (_rsConfig.getProtocolVersion() == 1) {
+                    BSONObjBuilder opTime(bb.subobjStart("optime"));
+                    opTime.append("ts", it->getOpTime().getTimestamp());
+                    opTime.append("term", it->getOpTime().getTerm());
+                    opTime.done();
+                } else {
+                    bb.append("optime", it->getOpTime().getTimestamp());
+                }
 
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(Seconds(it->getOpTime().getSecs())));
@@ -2192,6 +2204,10 @@ void TopologyCoordinatorImpl::incrementTerm() {
 void TopologyCoordinatorImpl::voteForMyselfV1() {
     _lastVote.setTerm(_term);
     _lastVote.setCandidateId(_selfConfig().getId());
+}
+
+void TopologyCoordinatorImpl::setPrimaryByMemberId(long long memberId) {
+    _currentPrimaryIndex = _rsConfig.findMemberIndexByConfigId(memberId);
 }
 
 }  // namespace repl

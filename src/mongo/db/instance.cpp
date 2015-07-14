@@ -1,32 +1,30 @@
-// instance.cpp
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2008-2014 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -79,6 +77,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -94,7 +93,6 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
@@ -634,7 +632,6 @@ void receivedKillCursors(OperationContext* txn, Message& m) {
 void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Message& m, CurOp& op) {
     DbMessage d(m);
     uassertStatusOK(userAllowedWriteNS(nsString));
-    op.debug().ns = nsString.ns();
     int flags = d.pullInt();
     BSONObj query = d.nextJsObj();
 
@@ -648,17 +645,18 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
     bool multi = flags & UpdateOption_Multi;
     bool broadcast = flags & UpdateOption_Broadcast;
 
+    op.debug().query = query;
+    {
+        stdx::lock_guard<Client> lk(*txn->getClient());
+        op.setNS_inlock(nsString.ns());
+        op.setQuery_inlock(query);
+    }
+
     Status status = AuthorizationSession::get(txn->getClient())
                         ->checkAuthForUpdate(nsString, query, toupdate, upsert);
     audit::logUpdateAuthzCheck(
         txn->getClient(), nsString, query, toupdate, upsert, multi, status.code());
     uassertStatusOK(status);
-
-    op.debug().query = query;
-    {
-        stdx::lock_guard<Client> lk(*txn->getClient());
-        op.setQuery_inlock(query);
-    }
 
     UpdateRequest request(nsString);
     request.setUpsert(upsert);
@@ -685,7 +683,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
             }
             Lock::CollectionLock collLock(
                 txn->lockState(), nsString.ns(), parsedUpdate.isIsolated() ? MODE_X : MODE_IX);
-            OldClientContext ctx(txn, nsString);
+            OldClientContext ctx(txn, nsString.ns());
 
             //  The common case: no implicit collection creation
             if (!upsert || ctx.db()->getCollection(nsString) != NULL) {
@@ -720,7 +718,7 @@ void receivedUpdate(OperationContext* txn, const NamespaceString& nsString, Mess
 
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbLock(txn->lockState(), nsString.db(), MODE_X);
-        OldClientContext ctx(txn, nsString);
+        OldClientContext ctx(txn, nsString.ns());
         uassert(ErrorCodes::NotMaster,
                 str::stream() << "Not primary while performing update on " << nsString.ns(),
                 repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString));
@@ -752,22 +750,22 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
     DbMessage d(m);
     uassertStatusOK(userAllowedWriteNS(nsString));
 
-    op.debug().ns = nsString.ns();
     int flags = d.pullInt();
     bool justOne = flags & RemoveOption_JustOne;
     verify(d.moreJSObjs());
     BSONObj pattern = d.nextJsObj();
 
-    Status status =
-        AuthorizationSession::get(txn->getClient())->checkAuthForDelete(nsString, pattern);
-    audit::logDeleteAuthzCheck(txn->getClient(), nsString, pattern, status.code());
-    uassertStatusOK(status);
-
     op.debug().query = pattern;
     {
         stdx::lock_guard<Client> lk(*txn->getClient());
         op.setQuery_inlock(pattern);
+        op.setNS_inlock(nsString.ns());
     }
+
+    Status status =
+        AuthorizationSession::get(txn->getClient())->checkAuthForDelete(nsString, pattern);
+    audit::logDeleteAuthzCheck(txn->getClient(), nsString, pattern, status.code());
+    uassertStatusOK(status);
 
     DeleteRequest request(nsString);
     request.setQuery(pattern);
@@ -789,7 +787,7 @@ void receivedDelete(OperationContext* txn, const NamespaceString& nsString, Mess
 
             Lock::CollectionLock collLock(
                 txn->lockState(), nsString.ns(), parsedDelete.isIsolated() ? MODE_X : MODE_IX);
-            OldClientContext ctx(txn, nsString);
+            OldClientContext ctx(txn, nsString.ns());
 
             unique_ptr<PlanExecutor> exec = uassertStatusOK(
                 getExecutorDelete(txn, ctx.db()->getCollection(nsString), &parsedDelete));
@@ -819,9 +817,13 @@ bool receivedGetMore(OperationContext* txn, DbResponse& dbresponse, Message& m, 
     int ntoreturn = d.pullInt();
     long long cursorid = d.pullInt64();
 
-    curop.debug().ns = ns;
     curop.debug().ntoreturn = ntoreturn;
     curop.debug().cursorid = cursorid;
+
+    {
+        stdx::lock_guard<Client>(*txn->getClient());
+        CurOp::get(txn)->setNS_inlock(ns);
+    }
 
     unique_ptr<AssertionException> ex;
     unique_ptr<Timer> timer;
@@ -1059,7 +1061,11 @@ static void insertSystemIndexes(OperationContext* txn, DbMessage& d, CurOp& curO
 void receivedInsert(OperationContext* txn, const NamespaceString& nsString, Message& m, CurOp& op) {
     DbMessage d(m);
     const char* ns = d.getns();
-    op.debug().ns = ns;
+    {
+        stdx::lock_guard<Client>(*txn->getClient());
+        CurOp::get(txn)->setNS_inlock(nsString.ns());
+    }
+
     uassertStatusOK(userAllowedWriteNS(nsString.ns()));
     if (nsString.isSystemDotIndexes()) {
         insertSystemIndexes(txn, d, op);
@@ -1155,6 +1161,7 @@ static void shutdownServer() {
     /* must do this before unmapping mem or you may get a seg fault */
     log(LogComponent::kNetwork) << "shutdown: going to close sockets..." << endl;
     stdx::thread close_socket_thread(stdx::bind(MessagingPort::closeAllSockets, 0));
+    close_socket_thread.detach();
 
     getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
 }

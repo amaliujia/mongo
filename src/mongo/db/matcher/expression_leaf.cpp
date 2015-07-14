@@ -31,6 +31,7 @@
 #include "mongo/db/matcher/expression_leaf.h"
 
 #include <cmath>
+#include <unordered_map>
 #include <pcrecpp.h>
 
 #include "mongo/bson/bsonobj.h"
@@ -390,13 +391,47 @@ bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
 
 // ----
 
-Status TypeMatchExpression::init(StringData path, int type) {
+const std::string TypeMatchExpression::kMatchesAllNumbersAlias = "number";
+
+const std::unordered_map<std::string, BSONType> TypeMatchExpression::typeAliasMap = {
+    {"double", NumberDouble},
+    {"string", String},
+    {"object", Object},
+    {"array", Array},
+    {"binData", BinData},
+    {"undefined", Undefined},
+    {"objectId", jstOID},
+    {"bool", Bool},
+    {"date", Date},
+    {"null", jstNULL},
+    {"regex", RegEx},
+    {"dbPointer", DBRef},
+    {"javascript", Code},
+    {"symbol", Symbol},
+    {"javascriptWithScope", CodeWScope},
+    {"int", NumberInt},
+    {"timestamp", bsonTimestamp},
+    {"long", NumberLong},
+    {"maxKey", MaxKey},
+    {"minKey", MinKey}};
+
+Status TypeMatchExpression::initWithBSONType(StringData path, BSONType type) {
     _path = path;
     _type = type;
     return _elementPath.init(_path);
 }
 
+Status TypeMatchExpression::initAsMatchingAllNumbers(StringData path) {
+    _path = path;
+    _matchesAllNumbers = true;
+    return _elementPath.init(_path);
+}
+
 bool TypeMatchExpression::matchesSingleElement(const BSONElement& e) const {
+    if (_matchesAllNumbers) {
+        return e.isNumber();
+    }
+
     return e.type() == _type;
 }
 
@@ -452,7 +487,16 @@ bool TypeMatchExpression::equivalent(const MatchExpression* other) const {
         return false;
 
     const TypeMatchExpression* realOther = static_cast<const TypeMatchExpression*>(other);
-    return _path == realOther->_path && _type == realOther->_type;
+
+    if (_path != realOther->_path) {
+        return false;
+    }
+
+    if (_matchesAllNumbers) {
+        return realOther->_matchesAllNumbers;
+    }
+
+    return _type == realOther->_type;
 }
 
 

@@ -39,6 +39,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/storage/record_fetcher.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -48,6 +49,7 @@ namespace mongo {
 
 using std::unique_ptr;
 using std::vector;
+using stdx::make_unique;
 
 // static
 const char* CollectionScan::kStageType = "COLLSCAN";
@@ -65,12 +67,6 @@ CollectionScan::CollectionScan(OperationContext* txn,
       _commonStats(kStageType) {
     // Explain reports the direction of the collection scan.
     _specificStats.direction = params.direction;
-
-    // We pre-allocate a WSM and use it to pass up fetch requests. This should never be used
-    // for anything other than passing up NEED_YIELD. We use the loc and owned obj state, but
-    // the loc isn't really pointing at any obj. The obj field of the WSM should never be used.
-    WorkingSetMember* member = _workingSet->get(_wsidForFetch);
-    member->state = WorkingSetMember::LOC_AND_OWNED_OBJ;
 }
 
 PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
@@ -80,7 +76,11 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
     ScopedTimer timer(&_commonStats.executionTimeMillis);
 
     if (_isDead) {
-        Status status(ErrorCodes::InternalError, "CollectionScan died");
+        Status status(
+            ErrorCodes::CappedPositionLost,
+            str::stream()
+                << "CollectionScan died due to position in capped collection being deleted. "
+                << "Last seen record id: " << _lastSeenId);
         *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
         return PlanStage::DEAD;
     }
@@ -110,8 +110,10 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
                 // time we'd need to create a cursor after already getting a record out of it.
                 if (!_cursor->seekExact(_lastSeenId)) {
                     _isDead = true;
-                    Status status(ErrorCodes::InternalError,
-                                  "CollectionScan died: Unexpected RecordId");
+                    Status status(ErrorCodes::CappedPositionLost,
+                                  str::stream() << "CollectionScan died due to failure to restore "
+                                                << "tailable cursor position. "
+                                                << "Last seen record id: " << _lastSeenId);
                     *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
                     return PlanStage::DEAD;
                 }
@@ -164,7 +166,7 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
     WorkingSetMember* member = _workingSet->get(id);
     member->loc = record->id;
     member->obj = {_txn->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
-    member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
+    _workingSet->transitionToLocAndObj(id);
 
     return returnIfMatches(member, id, out);
 }
@@ -226,8 +228,7 @@ void CollectionScan::restoreState(OperationContext* opCtx) {
     ++_commonStats.unyields;
     if (_cursor) {
         if (!_cursor->restore(opCtx)) {
-            warning() << "Collection dropped or state deleted during yield of CollectionScan: "
-                      << opCtx->getNS();
+            warning() << "Could not restore RecordCursor for CollectionScan: " << opCtx->getNS();
             _isDead = true;
         }
     }
@@ -238,7 +239,7 @@ vector<PlanStage*> CollectionScan::getChildren() const {
     return empty;
 }
 
-PlanStageStats* CollectionScan::getStats() {
+unique_ptr<PlanStageStats> CollectionScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (NULL != _filter) {
         BSONObjBuilder bob;
@@ -246,9 +247,9 @@ PlanStageStats* CollectionScan::getStats() {
         _commonStats.filter = bob.obj();
     }
 
-    unique_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_COLLSCAN));
-    ret->specific.reset(new CollectionScanStats(_specificStats));
-    return ret.release();
+    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COLLSCAN);
+    ret->specific = make_unique<CollectionScanStats>(_specificStats);
+    return ret;
 }
 
 const CommonStats* CollectionScan::getCommonStats() const {

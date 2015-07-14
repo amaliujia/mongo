@@ -33,7 +33,8 @@
 #include "mongo/s/catalog/legacy/config_upgrade.h"
 
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/type_config_version.h"
+#include "mongo/s/catalog/config_server_version.h"
+#include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 

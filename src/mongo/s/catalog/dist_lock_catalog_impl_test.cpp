@@ -33,7 +33,6 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/json.h"
-#include "mongo/client/remote_command_runner_mock.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
@@ -44,9 +43,10 @@
 #include "mongo/executor/network_test_env.h"
 #include "mongo/s/catalog/catalog_manager_mock.h"
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
+#include "mongo/s/catalog/type_lockpings.h"
+#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/type_lockpings.h"
-#include "mongo/s/type_locks.h"
+#include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
@@ -62,6 +62,7 @@ namespace {
 
 const HostAndPort dummyHost("dummy", 123);
 const Milliseconds kWTimeout(100);
+static const stdx::chrono::seconds kFutureTimeout{5};
 
 /**
  * Sets up the mocked out objects for testing the replica-set backed catalog manager.
@@ -90,8 +91,12 @@ public:
         return _distLockCatalog.get();
     }
 
-    ShardRegistry* shardRegistry() {
-        return _shardRegistry.get();
+    // Not thread safe
+    void shutdownShardRegistry() {
+        if (!_shutdownCalled) {
+            _shutdownCalled = true;
+            _shardRegistry->shutdown();
+        }
     }
 
 private:
@@ -107,7 +112,6 @@ private:
 
         _shardRegistry =
             stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryMock>(),
-                                             stdx::make_unique<RemoteCommandRunnerMock>(),
                                              std::move(executor),
                                              network,
                                              &_catalogMgr);
@@ -118,8 +122,10 @@ private:
     }
 
     void tearDown() override {
-        shardRegistry()->shutdown();
+        shutdownShardRegistry();
     }
+
+    bool _shutdownCalled = false;
 
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
 
@@ -164,7 +170,7 @@ TEST_F(DistLockCatalogFixture, BasicPing) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, PingTargetError) {
@@ -173,25 +179,17 @@ TEST_F(DistLockCatalogFixture, PingTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, PingRunnerError) {
-    auto future = launchAsync([this] {
-        auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, PingRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->ping("abcd", Date_t::now());
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, PingCommandError) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -204,13 +202,12 @@ TEST_F(DistLockCatalogFixture, PingCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, PingWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -223,13 +220,12 @@ TEST_F(DistLockCatalogFixture, PingWriteError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, PingWriteConcernError) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -245,18 +241,18 @@ TEST_F(DistLockCatalogFixture, PingWriteConcernError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, PingUnsupportedWriteConcernResponse) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return non numeric code for writeConcernError.code
         return fromjson(R"({
                 ok: 1,
                 value: null,
@@ -267,13 +263,12 @@ TEST_F(DistLockCatalogFixture, PingUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, PingUnsupportedResponseFormat) {
     auto future = launchAsync([this] {
         auto status = catalog()->ping("abcd", Date_t::now());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
     });
 
@@ -282,7 +277,7 @@ TEST_F(DistLockCatalogFixture, PingUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockNoOp) {
@@ -292,7 +287,6 @@ TEST_F(DistLockCatalogFixture, GrabLockNoOp) {
         auto resultStatus =
             catalog()->grabLock("test", myID, "me", "mongos", now, "because").getStatus();
 
-        ASSERT_NOT_OK(resultStatus);
         ASSERT_EQUALS(ErrorCodes::LockStateChangeFailed, resultStatus.code());
     });
 
@@ -323,7 +317,7 @@ TEST_F(DistLockCatalogFixture, GrabLockNoOp) {
         return fromjson("{ ok: 1, value: null }");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockWithNewDoc) {
@@ -385,7 +379,39 @@ TEST_F(DistLockCatalogFixture, GrabLockWithNewDoc) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(DistLockCatalogFixture, GrabLockWithBadLockDoc) {
+    auto future = launchAsync([this] {
+        Date_t now(dateFromISOString("2015-05-22T19:17:18.098Z").getValue());
+        auto resultStatus = catalog()->grabLock("test", OID(), "", "", now, "").getStatus();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, resultStatus.code());
+    });
+
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // Return an invalid lock document on value. This is theoretically impossible because
+        // the vital parts of the resulting doc are derived from the update request.
+        return fromjson(R"({
+                lastErrorObject: {
+                    updatedExisting: false,
+                    n: 1,
+                    upserted: 1
+                },
+                value: {
+                    _id: "test",
+                    ts: ObjectId("555f80be366c194b13fb0372"),
+                    state: "x",
+                    who: "me",
+                    process: "mongos",
+                    when: { $date: "2015-05-22T19:17:18.098Z" },
+                    why: "because"
+                },
+                ok: 1
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockTargetError) {
@@ -394,25 +420,17 @@ TEST_F(DistLockCatalogFixture, GrabLockTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, GrabLockRunnerError) {
-    auto future = launchAsync([this] {
-        auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, GrabLockRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockCommandError) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -425,13 +443,12 @@ TEST_F(DistLockCatalogFixture, GrabLockCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -444,13 +461,12 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -466,18 +482,53 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
-TEST_F(DistLockCatalogFixture, GrabLockUnsupportedWriteConcernResponse) {
+TEST_F(DistLockCatalogFixture, GrabLockWriteConcernErrorBadType) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::TypeMismatch, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
+
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return invalid non-object type for writeConcernError.
+        return fromjson(R"({
+                ok: 1,
+                value: null,
+                writeConcernError: "unexpected"
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(DistLockCatalogFixture, GrabLockResponseMissingValueField) {
+    auto future = launchAsync([this] {
+        auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        return fromjson(R"({
+                ok: 1
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(DistLockCatalogFixture, GrabLockUnsupportedWriteConcernResponse) {
+    auto future = launchAsync([this] {
+        auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
+        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
+
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return non numeric code for writeConcernError.code
         return fromjson(R"({
                 ok: 1,
                 value: null,
@@ -488,13 +539,12 @@ TEST_F(DistLockCatalogFixture, GrabLockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockUnsupportedResponseFormat) {
     auto future = launchAsync([this] {
         auto status = catalog()->grabLock("", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
     });
 
@@ -503,7 +553,7 @@ TEST_F(DistLockCatalogFixture, GrabLockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockNoOp) {
@@ -516,7 +566,6 @@ TEST_F(DistLockCatalogFixture, OvertakeLockNoOp) {
                 ->overtakeLock("test", myID, currentOwner, "me", "mongos", now, "because")
                 .getStatus();
 
-        ASSERT_NOT_OK(resultStatus);
         ASSERT_EQUALS(ErrorCodes::LockStateChangeFailed, resultStatus.code());
     });
 
@@ -551,7 +600,7 @@ TEST_F(DistLockCatalogFixture, OvertakeLockNoOp) {
         return fromjson("{ ok: 1, value: null }");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockWithNewDoc) {
@@ -619,7 +668,40 @@ TEST_F(DistLockCatalogFixture, OvertakeLockWithNewDoc) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(DistLockCatalogFixture, OvertakeLockWithBadLockDoc) {
+    auto future = launchAsync([this] {
+        Date_t now(dateFromISOString("2015-05-22T19:17:18.098Z").getValue());
+        auto resultStatus =
+            catalog()->overtakeLock("test", OID(), OID(), "", "", now, "").getStatus();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, resultStatus.code());
+    });
+
+    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // Return an invalid lock document on value. This is theoretically impossible because
+        // the vital parts of the resulting doc are derived from the update request.
+        return fromjson(R"({
+                lastErrorObject: {
+                    updatedExisting: false,
+                    n: 1,
+                    upserted: 1
+                },
+                value: {
+                    _id: "test",
+                    ts: ObjectId("555f80be366c194b13fb0372"),
+                    state: "x",
+                    who: "me",
+                    process: "mongos",
+                    when: { $date: "2015-05-22T19:17:18.098Z" },
+                    why: "because"
+                },
+                ok: 1
+            })");
+    });
+
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockTargetError) {
@@ -628,27 +710,18 @@ TEST_F(DistLockCatalogFixture, OvertakeLockTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, OvertakeLockRunnerError) {
-    auto future = launchAsync([this] {
-        auto status =
-            catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, OvertakeLockRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockCommandError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -661,14 +734,13 @@ TEST_F(DistLockCatalogFixture, OvertakeLockCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockWriteError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -681,14 +753,13 @@ TEST_F(DistLockCatalogFixture, OvertakeLockWriteError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockWriteConcernError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -704,19 +775,19 @@ TEST_F(DistLockCatalogFixture, OvertakeLockWriteConcernError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockUnsupportedWriteConcernResponse) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return non numeric code for writeConcernError.code
         return fromjson(R"({
                 ok: 1,
                 value: null,
@@ -727,14 +798,13 @@ TEST_F(DistLockCatalogFixture, OvertakeLockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockUnsupportedResponseFormat) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->overtakeLock("", OID(), OID(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
     });
 
@@ -743,7 +813,7 @@ TEST_F(DistLockCatalogFixture, OvertakeLockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicUnlock) {
@@ -775,7 +845,7 @@ TEST_F(DistLockCatalogFixture, BasicUnlock) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockWithNoNewDoc) {
@@ -803,7 +873,7 @@ TEST_F(DistLockCatalogFixture, UnlockWithNoNewDoc) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockTargetError) {
@@ -812,25 +882,17 @@ TEST_F(DistLockCatalogFixture, UnlockTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, UnlockRunnerError) {
-    auto future = launchAsync([this] {
-        auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, UnlockRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->unlock(OID());
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, UnlockCommandError) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -843,13 +905,12 @@ TEST_F(DistLockCatalogFixture, UnlockCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -862,13 +923,12 @@ TEST_F(DistLockCatalogFixture, UnlockWriteError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockWriteConcernError) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -884,18 +944,18 @@ TEST_F(DistLockCatalogFixture, UnlockWriteConcernError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockUnsupportedWriteConcernResponse) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return non numeric code for writeConcernError.code
         return fromjson(R"({
                 ok: 1,
                 value: null,
@@ -906,13 +966,12 @@ TEST_F(DistLockCatalogFixture, UnlockUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, UnlockUnsupportedResponseFormat) {
     auto future = launchAsync([this] {
         auto status = catalog()->unlock(OID());
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
     });
 
@@ -921,7 +980,7 @@ TEST_F(DistLockCatalogFixture, UnlockUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicGetServerInfo) {
@@ -951,7 +1010,7 @@ TEST_F(DistLockCatalogFixture, BasicGetServerInfo) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetServerTargetError) {
@@ -960,25 +1019,17 @@ TEST_F(DistLockCatalogFixture, GetServerTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, GetServerRunnerError) {
-    auto future = launchAsync([this] {
-        auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, GetServerRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->getServerInfo().getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, GetServerCommandError) {
     auto future = launchAsync([this] {
         auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -991,18 +1042,18 @@ TEST_F(DistLockCatalogFixture, GetServerCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetServerBadElectionId) {
     auto future = launchAsync([this] {
         auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return invalid non-oid electionId
         return fromjson(R"({
                 localTime: { $date: "2015-05-26T13:06:27.293Z" },
                 $gleStats: {
@@ -1013,18 +1064,18 @@ TEST_F(DistLockCatalogFixture, GetServerBadElectionId) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetServerBadLocalTime) {
     auto future = launchAsync([this] {
         auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return invalid non date type for localTime field.
         return fromjson(R"({
                 localTime: "2015-05-26T13:06:27.293Z",
                 $gleStats: {
@@ -1035,13 +1086,12 @@ TEST_F(DistLockCatalogFixture, GetServerBadLocalTime) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetServerNoGLEStats) {
     auto future = launchAsync([this] {
         auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1053,13 +1103,12 @@ TEST_F(DistLockCatalogFixture, GetServerNoGLEStats) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetServerNoElectionId) {
     auto future = launchAsync([this] {
         auto status = catalog()->getServerInfo().getStatus();
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1075,7 +1124,7 @@ TEST_F(DistLockCatalogFixture, GetServerNoElectionId) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicStopPing) {
@@ -1106,7 +1155,7 @@ TEST_F(DistLockCatalogFixture, BasicStopPing) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, StopPingTargetError) {
@@ -1115,25 +1164,17 @@ TEST_F(DistLockCatalogFixture, StopPingTargetError) {
     ASSERT_NOT_OK(status);
 }
 
-TEST_F(DistLockCatalogFixture, StopPingRunnerError) {
-    auto future = launchAsync([this] {
-        auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
-        ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
+TEST_F(DistLockCatalogFixture, StopPingRunCmdError) {
+    shutdownShardRegistry();
 
-    onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->stopPing("");
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, StopPingCommandError) {
     auto future = launchAsync([this] {
         auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1146,13 +1187,12 @@ TEST_F(DistLockCatalogFixture, StopPingCommandError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, StopPingWriteError) {
     auto future = launchAsync([this] {
         auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::Unauthorized, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1165,13 +1205,12 @@ TEST_F(DistLockCatalogFixture, StopPingWriteError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, StopPingWriteConcernError) {
     auto future = launchAsync([this] {
         auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
@@ -1187,18 +1226,18 @@ TEST_F(DistLockCatalogFixture, StopPingWriteConcernError) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, StopPingUnsupportedWriteConcernResponse) {
     auto future = launchAsync([this] {
         auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
     onCommand([](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        // return non numeric code for writeConcernError.code
         return fromjson(R"({
                 ok: 1,
                 value: null,
@@ -1209,13 +1248,12 @@ TEST_F(DistLockCatalogFixture, StopPingUnsupportedWriteConcernResponse) {
             })");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, StopPingUnsupportedResponseFormat) {
     auto future = launchAsync([this] {
         auto status = catalog()->stopPing("");
-        ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UnsupportedFormat, status.code());
     });
 
@@ -1224,20 +1262,19 @@ TEST_F(DistLockCatalogFixture, StopPingUnsupportedResponseFormat) {
                          << "NaN");
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicGetPing) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            Date_t ping(dateFromISOString("2015-05-26T13:06:27.293Z").getValue());
-                            auto resultStatus = catalog()->getPing("test");
-                            ASSERT_OK(resultStatus.getStatus());
+    auto future = launchAsync([this] {
+        Date_t ping(dateFromISOString("2015-05-26T13:06:27.293Z").getValue());
+        auto resultStatus = catalog()->getPing("test");
+        ASSERT_OK(resultStatus.getStatus());
 
-                            const auto& pingDoc = resultStatus.getValue();
-                            ASSERT_EQUALS("test", pingDoc.getProcess());
-                            ASSERT_EQUALS(ping, pingDoc.getPing());
-                        });
+        const auto& pingDoc = resultStatus.getValue();
+        ASSERT_EQUALS("test", pingDoc.getProcess());
+        ASSERT_EQUALS(ping, pingDoc.getPing());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
         ASSERT_EQUALS(dummyHost, request.target);
@@ -1262,57 +1299,45 @@ TEST_F(DistLockCatalogFixture, BasicGetPing) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetPingTargetError) {
     targeter()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"});
     auto status = catalog()->getPing("").getStatus();
-    ASSERT_NOT_OK(status);
     ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
 }
 
-TEST_F(DistLockCatalogFixture, GetPingRunnerError) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getPing("").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+TEST_F(DistLockCatalogFixture, GetPingRunCmdError) {
+    shutdownShardRegistry();
 
-    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->getPing("").getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, GetPingNotFound) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getPing("").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getPing("").getStatus();
+        ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request)
                       -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetPingUnsupportedFormat) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getPing("test").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getPing("test").getStatus();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        // return non-date type for ping.
         BSONObj pingDoc(fromjson(R"({
             _id: "test",
             ping: "bad"
@@ -1324,20 +1349,19 @@ TEST_F(DistLockCatalogFixture, GetPingUnsupportedFormat) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicGetLockByTS) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            OID ts("555f99712c99a78c5b083358");
-                            auto resultStatus = catalog()->getLockByTS(ts);
-                            ASSERT_OK(resultStatus.getStatus());
+    auto future = launchAsync([this] {
+        OID ts("555f99712c99a78c5b083358");
+        auto resultStatus = catalog()->getLockByTS(ts);
+        ASSERT_OK(resultStatus.getStatus());
 
-                            const auto& lockDoc = resultStatus.getValue();
-                            ASSERT_EQUALS("test", lockDoc.getName());
-                            ASSERT_EQUALS(ts, lockDoc.getLockID());
-                        });
+        const auto& lockDoc = resultStatus.getValue();
+        ASSERT_EQUALS("test", lockDoc.getName());
+        ASSERT_EQUALS(ts, lockDoc.getLockID());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
         ASSERT_EQUALS(dummyHost, request.target);
@@ -1362,57 +1386,44 @@ TEST_F(DistLockCatalogFixture, BasicGetLockByTS) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByTSTargetError) {
     targeter()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"});
     auto status = catalog()->getLockByTS(OID()).getStatus();
-    ASSERT_NOT_OK(status);
     ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
 }
 
-TEST_F(DistLockCatalogFixture, GetLockByTSRunnerError) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByTS(OID()).getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
-
-    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+TEST_F(DistLockCatalogFixture, GetLockByTSRunCmdError) {
+    shutdownShardRegistry();
+    auto status = catalog()->getLockByTS(OID()).getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByTSNotFound) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByTS(OID()).getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::LockNotFound, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getLockByTS(OID()).getStatus();
+        ASSERT_EQUALS(ErrorCodes::LockNotFound, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request)
                       -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByTSUnsupportedFormat) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByTS(OID()).getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getLockByTS(OID()).getStatus();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        // return invalid non-numeric type for state.
         BSONObj lockDoc(fromjson(R"({
             _id: "test",
             state: "bad"
@@ -1424,20 +1435,19 @@ TEST_F(DistLockCatalogFixture, GetLockByTSUnsupportedFormat) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, BasicGetLockByName) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            OID ts("555f99712c99a78c5b083358");
-                            auto resultStatus = catalog()->getLockByName("abc");
-                            ASSERT_OK(resultStatus.getStatus());
+    auto future = launchAsync([this] {
+        OID ts("555f99712c99a78c5b083358");
+        auto resultStatus = catalog()->getLockByName("abc");
+        ASSERT_OK(resultStatus.getStatus());
 
-                            const auto& lockDoc = resultStatus.getValue();
-                            ASSERT_EQUALS("abc", lockDoc.getName());
-                            ASSERT_EQUALS(ts, lockDoc.getLockID());
-                        });
+        const auto& lockDoc = resultStatus.getValue();
+        ASSERT_EQUALS("abc", lockDoc.getName());
+        ASSERT_EQUALS(ts, lockDoc.getLockID());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
         ASSERT_EQUALS(dummyHost, request.target);
@@ -1462,57 +1472,45 @@ TEST_F(DistLockCatalogFixture, BasicGetLockByName) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByNameTargetError) {
     targeter()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"});
     auto status = catalog()->getLockByName("x").getStatus();
-    ASSERT_NOT_OK(status);
     ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
 }
 
-TEST_F(DistLockCatalogFixture, GetLockByNameRunnerError) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByName("x").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::InternalError, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+TEST_F(DistLockCatalogFixture, GetLockByNameRunCmdError) {
+    shutdownShardRegistry();
 
-    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
-        return {ErrorCodes::InternalError, "Bad"};
-    });
-
-    future.get();
+    auto status = catalog()->getLockByName("x").getStatus();
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
+    ASSERT_FALSE(status.reason().empty());
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByNameNotFound) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByName("x").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::LockNotFound, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getLockByName("x").getStatus();
+        ASSERT_EQUALS(ErrorCodes::LockNotFound, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request)
                       -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByNameUnsupportedFormat) {
-    auto future = async(std::launch::async,
-                        [this] {
-                            auto status = catalog()->getLockByName("x").getStatus();
-                            ASSERT_NOT_OK(status);
-                            ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
-                            ASSERT_FALSE(status.reason().empty());
-                        });
+    auto future = launchAsync([this] {
+        auto status = catalog()->getLockByName("x").getStatus();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
+        ASSERT_FALSE(status.reason().empty());
+    });
 
     onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        // Return non-numeric type for state.
         BSONObj lockDoc(fromjson(R"({
             _id: "x",
             state: "bad"
@@ -1524,7 +1522,7 @@ TEST_F(DistLockCatalogFixture, GetLockByNameUnsupportedFormat) {
         return result;
     });
 
-    future.get();
+    future.timed_get(kFutureTimeout);
 }
 
 }  // unnamed namespace

@@ -198,6 +198,9 @@ void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result)
     // TODO
 }
 
+void ReplicationCoordinatorMock::processReplicationMetadata(
+    const ReplicationMetadata& replMetadata) {}
+
 Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder* result) {
     return Status::OK();
 }
@@ -344,9 +347,11 @@ long long ReplicationCoordinatorMock::getTerm() {
     return OpTime::kDefaultTerm;
 }
 
-bool ReplicationCoordinatorMock::updateTerm(long long term) {
-    return false;
+Status ReplicationCoordinatorMock::updateTerm(long long term) {
+    return Status::OK();
 }
+
+void ReplicationCoordinatorMock::onSnapshotCreate(OpTime timeOfSnapshot) {}
 
 }  // namespace repl
 }  // namespace mongo

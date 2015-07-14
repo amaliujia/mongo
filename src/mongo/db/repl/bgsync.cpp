@@ -66,6 +66,7 @@ const int BatchIsSmallish = 40000;  // bytes
 }  // namespace
 
 MONGO_FP_DECLARE(rsBgSyncProduce);
+MONGO_FP_DECLARE(stepDownWhileDrainingFailPoint);
 
 BackgroundSync* BackgroundSync::s_instance = 0;
 stdx::mutex BackgroundSync::s_mutex;
@@ -106,7 +107,6 @@ BackgroundSync::BackgroundSync()
     : _buffer(bufferMaxSizeGauge, &getSize),
       _lastOpTimeFetched(Timestamp(std::numeric_limits<int>::max(), 0),
                          std::numeric_limits<long long>::max()),
-      _lastAppliedHash(0),
       _lastFetchedHash(0),
       _pause(true),
       _appliedBuffer(true),
@@ -145,13 +145,13 @@ void BackgroundSync::notify(OperationContext* txn) {
     }
 }
 
-void BackgroundSync::producerThread() {
+void BackgroundSync::producerThread(executor::TaskExecutor* taskExecutor) {
     Client::initThread("rsBackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization();
 
     while (!inShutdown()) {
         try {
-            _producerThread();
+            _producerThread(taskExecutor);
         } catch (const DBException& e) {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
@@ -163,7 +163,7 @@ void BackgroundSync::producerThread() {
     }
 }
 
-void BackgroundSync::_producerThread() {
+void BackgroundSync::_producerThread(executor::TaskExecutor* taskExecutor) {
     const MemberState state = _replCoord->getMemberState();
     // we want to pause when the state changes to primary
     if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
@@ -193,10 +193,10 @@ void BackgroundSync::_producerThread() {
         start(&txn);
     }
 
-    produce(&txn);
+    _produce(&txn, taskExecutor);
 }
 
-void BackgroundSync::produce(OperationContext* txn) {
+void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* taskExecutor) {
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
     {
@@ -209,11 +209,8 @@ void BackgroundSync::produce(OperationContext* txn) {
             return;
         }
 
-        // Wait until we've applied the ops we have before we choose a sync target
-        while (!_appliedBuffer && !inShutdownStrict()) {
-            _appliedBufferCondition.wait(lock);
-        }
-        if (inShutdownStrict()) {
+        if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary() ||
+            inShutdownStrict()) {
             return;
         }
     }
@@ -230,43 +227,43 @@ void BackgroundSync::produce(OperationContext* txn) {
         lastOpTimeFetched = _lastOpTimeFetched;
         _syncSourceHost = HostAndPort();
     }
-    _syncSourceReader.resetConnection();
-    _syncSourceReader.connectToSyncSource(txn, lastOpTimeFetched, _replCoord);
+    OplogReader syncSourceReader;
+    syncSourceReader.connectToSyncSource(txn, lastOpTimeFetched, _replCoord);
 
     {
         stdx::unique_lock<stdx::mutex> lock(_mutex);
         // no server found
-        if (_syncSourceReader.getHost().empty()) {
+        if (syncSourceReader.getHost().empty()) {
             lock.unlock();
             sleepsecs(1);
             // if there is no one to sync from
             return;
         }
         lastOpTimeFetched = _lastOpTimeFetched;
-        _syncSourceHost = _syncSourceReader.getHost();
+        _syncSourceHost = syncSourceReader.getHost();
         _replCoord->signalUpstreamUpdater();
     }
 
-    _syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched.getTimestamp());
+    syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched.getTimestamp());
 
     // if target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor
-    if (!_syncSourceReader.haveCursor()) {
+    if (!syncSourceReader.haveCursor()) {
         return;
     }
 
-    if (_rollbackIfNeeded(txn, _syncSourceReader)) {
+    if (_rollbackIfNeeded(txn, syncSourceReader)) {
         stop();
         return;
     }
 
     while (!inShutdown()) {
-        if (!_syncSourceReader.moreInCurrentBatch()) {
+        if (!syncSourceReader.moreInCurrentBatch()) {
             // Check some things periodically
             // (whenever we run out of items in the
             // current cursor batch)
 
-            int bs = _syncSourceReader.currentBatchMessageSize();
+            int bs = syncSourceReader.currentBatchMessageSize();
             if (bs > 0 && bs < BatchIsSmallish) {
                 // on a very low latency network, if we don't wait a little, we'll be
                 // getting ops to write almost one at a time.  this will both be expensive
@@ -287,7 +284,7 @@ void BackgroundSync::produce(OperationContext* txn) {
             }
 
             // re-evaluate quality of sync target
-            if (shouldChangeSyncSource()) {
+            if (_shouldChangeSyncSource(syncSourceReader.getHost())) {
                 return;
             }
 
@@ -297,11 +294,11 @@ void BackgroundSync::produce(OperationContext* txn) {
 
                 // This calls receiveMore() on the oplogreader cursor.
                 // It can wait up to five seconds for more data.
-                _syncSourceReader.more();
+                syncSourceReader.more();
             }
-            networkByteStats.increment(_syncSourceReader.currentBatchMessageSize());
+            networkByteStats.increment(syncSourceReader.currentBatchMessageSize());
 
-            if (!_syncSourceReader.moreInCurrentBatch()) {
+            if (!syncSourceReader.moreInCurrentBatch()) {
                 // If there is still no data from upstream, check a few more things
                 // and then loop back for another pass at getting more data
                 {
@@ -311,8 +308,8 @@ void BackgroundSync::produce(OperationContext* txn) {
                     }
                 }
 
-                _syncSourceReader.tailCheck();
-                if (!_syncSourceReader.haveCursor()) {
+                syncSourceReader.tailCheck();
+                if (!syncSourceReader.haveCursor()) {
                     LOG(1) << "replSet end syncTail pass";
                     return;
                 }
@@ -330,8 +327,12 @@ void BackgroundSync::produce(OperationContext* txn) {
 
         // At this point, we are guaranteed to have at least one thing to read out
         // of the oplogreader cursor.
-        BSONObj o = _syncSourceReader.nextSafe().getOwned();
+        BSONObj o = syncSourceReader.nextSafe().getOwned();
         opsReadStats.increment();
+
+        if (MONGO_FAIL_POINT(stepDownWhileDrainingFailPoint)) {
+            sleepsecs(20);
+        }
 
         {
             stdx::unique_lock<stdx::mutex> lock(_mutex);
@@ -355,15 +356,15 @@ void BackgroundSync::produce(OperationContext* txn) {
     }
 }
 
-bool BackgroundSync::shouldChangeSyncSource() {
+bool BackgroundSync::_shouldChangeSyncSource(const HostAndPort& syncSource) {
     // is it even still around?
-    if (getSyncTarget().empty() || _syncSourceReader.getHost().empty()) {
+    if (getSyncTarget().empty() || syncSource.empty()) {
         return true;
     }
 
     // check other members: is any member's optime more than MaxSyncSourceLag seconds
     // ahead of the current sync source?
-    return _replCoord->shouldChangeSyncSource(_syncSourceReader.getHost());
+    return _replCoord->shouldChangeSyncSource(syncSource);
 }
 
 
@@ -461,9 +462,8 @@ void BackgroundSync::start(OperationContext* txn) {
     _pause = false;
 
     // reset _last fields with current oplog data
-    _lastAppliedHash = updatedLastAppliedHash;
     _lastOpTimeFetched = _replCoord->getMyLastOptime();
-    _lastFetchedHash = _lastAppliedHash;
+    _lastFetchedHash = updatedLastAppliedHash;
 
     LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
 }
@@ -475,24 +475,8 @@ void BackgroundSync::waitUntilPaused() {
     }
 }
 
-long long BackgroundSync::getLastAppliedHash() const {
-    stdx::lock_guard<stdx::mutex> lck(_mutex);
-    return _lastAppliedHash;
-}
-
 void BackgroundSync::clearBuffer() {
     _buffer.clear();
-}
-
-void BackgroundSync::setLastAppliedHash(long long newHash) {
-    stdx::lock_guard<stdx::mutex> lck(_mutex);
-    _lastAppliedHash = newHash;
-}
-
-void BackgroundSync::loadLastAppliedHash(OperationContext* txn) {
-    long long result = _readLastAppliedHash(txn);
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _lastAppliedHash = result;
 }
 
 long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {

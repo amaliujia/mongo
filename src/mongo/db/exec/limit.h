@@ -44,7 +44,7 @@ namespace mongo {
  */
 class LimitStage : public PlanStage {
 public:
-    LimitStage(int limit, WorkingSet* ws, PlanStage* child);
+    LimitStage(long long limit, WorkingSet* ws, PlanStage* child);
     virtual ~LimitStage();
 
     virtual bool isEOF();
@@ -60,7 +60,7 @@ public:
         return STAGE_LIMIT;
     }
 
-    virtual PlanStageStats* getStats();
+    virtual std::unique_ptr<PlanStageStats> getStats();
 
     virtual const CommonStats* getCommonStats() const;
 
@@ -73,7 +73,7 @@ private:
     std::unique_ptr<PlanStage> _child;
 
     // We only return this many results.
-    int _numToReturn;
+    long long _numToReturn;
 
     // Stats
     CommonStats _commonStats;

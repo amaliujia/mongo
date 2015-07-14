@@ -42,13 +42,14 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/query/cursor_responses.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/s/d_state.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -82,6 +83,10 @@ public:
 
     bool adminOnly() const override {
         return false;
+    }
+
+    bool supportsReadMajority() const final {
+        return true;
     }
 
     void help(std::stringstream& help) const override {
@@ -202,8 +207,18 @@ public:
 
         auto& lpq = lpqStatus.getValue();
 
+        // Validate term, if provided.
+        if (auto term = lpq->getReplicationTerm()) {
+            auto replCoord = repl::ReplicationCoordinator::get(txn);
+            Status status = replCoord->updateTerm(*term);
+            // Note: updateTerm returns ok if term stayed the same.
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+        }
+
         // Fill out curop information.
-        int ntoreturn = lpq->getBatchSize().value_or(0);
+        long long ntoreturn = lpq->getBatchSize().value_or(0);
         beginQueryOp(txn, nss, cmdObj, ntoreturn, lpq->getSkip());
 
         // 1b) Finish the parsing step by using the LiteParsedQuery to create a CanonicalQuery.
@@ -249,7 +264,7 @@ public:
         if (!collection) {
             // No collection. Just fill out curop indicating that there were zero results and
             // there is no ClientCursor id, and then return.
-            const int numResults = 0;
+            const long long numResults = 0;
             const CursorId cursorId = 0;
             endQueryOp(txn, *exec, dbProfilingLevel, numResults, cursorId);
             appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
@@ -285,7 +300,7 @@ public:
         BSONArrayBuilder firstBatch;
         BSONObj obj;
         PlanExecutor::ExecState state;
-        int numResults = 0;
+        long long numResults = 0;
         while (!enoughForFirstBatch(pq, numResults, firstBatch.len()) &&
                PlanExecutor::ADVANCED == (state = cursorExec->getNext(&obj, NULL))) {
             // If adding this object will cause us to exceed the BSON size limit, then we stash
