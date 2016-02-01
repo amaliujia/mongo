@@ -45,9 +45,9 @@ namespace repl {
 namespace {
 
 using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 using unittest::assertGet;
-
-using RemoteCommandRequest = RemoteCommandRequest;
 
 bool stringContains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
@@ -58,21 +58,22 @@ class VoteRequesterTest : public mongo::unittest::Test {
 public:
     virtual void setUp() {
         ReplicaSetConfig config;
-        ASSERT_OK(config.initialize(BSON("_id"
-                                         << "rs0"
-                                         << "version" << 2 << "members"
-                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                  << "host0")
-                                                       << BSON("_id" << 1 << "host"
-                                                                     << "host1")
-                                                       << BSON("_id" << 2 << "host"
-                                                                     << "host2")
-                                                       << BSON("_id" << 3 << "host"
-                                                                     << "host3"
-                                                                     << "votes" << 0)
-                                                       << BSON("_id" << 4 << "host"
-                                                                     << "host4"
-                                                                     << "votes" << 0)))));
+        ASSERT_OK(
+            config.initialize(BSON("_id"
+                                   << "rs0"
+                                   << "version" << 2 << "members"
+                                   << BSON_ARRAY(
+                                          BSON("_id" << 0 << "host"
+                                                     << "host0")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "host1") << BSON("_id" << 2 << "host"
+                                                                                  << "host2")
+                                          << BSON("_id" << 3 << "host"
+                                                        << "host3"
+                                                        << "votes" << 0 << "priority" << 0)
+                                          << BSON("_id" << 4 << "host"
+                                                        << "host4"
+                                                        << "votes" << 0 << "priority" << 0)))));
         ASSERT_OK(config.validate());
         long long candidateId = 0;
         long long term = 2;
@@ -104,7 +105,11 @@ protected:
         _requester->processResponse(request, response);
     }
 
-    VoteRequester::VoteRequestResult getResult() {
+    int getNumResponders() {
+        return _requester->getResponders().size();
+    }
+
+    VoteRequester::Result getResult() {
         return _requester->getResult();
     }
 
@@ -121,7 +126,6 @@ protected:
 
     ResponseStatus votedYes() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(true);
         response.setTerm(1);
         return ResponseStatus(
@@ -130,7 +134,6 @@ protected:
 
     ResponseStatus votedNoBecauseConfigVersionDoesNotMatch() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's config version differs from mine");
@@ -140,7 +143,6 @@ protected:
 
     ResponseStatus votedNoBecauseSetNameDiffers() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's set name differs from mine");
@@ -150,7 +152,6 @@ protected:
 
     ResponseStatus votedNoBecauseLastOpTimeIsGreater() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's data is staler than mine");
@@ -160,7 +161,6 @@ protected:
 
     ResponseStatus votedNoBecauseTermIsGreater() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(false);
         response.setTerm(3);
         response.setReason("candidate's term is lower than mine");
@@ -170,7 +170,6 @@ protected:
 
     ResponseStatus votedNoBecauseAlreadyVoted() {
         ReplSetRequestVotesResponse response;
-        response.setOk(true);
         response.setVoteGranted(false);
         response.setTerm(2);
         response.setReason("already voted for another candidate this term");
@@ -185,21 +184,22 @@ class VoteRequesterDryRunTest : public VoteRequesterTest {
 public:
     virtual void setUp() {
         ReplicaSetConfig config;
-        ASSERT_OK(config.initialize(BSON("_id"
-                                         << "rs0"
-                                         << "version" << 2 << "members"
-                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                  << "host0")
-                                                       << BSON("_id" << 1 << "host"
-                                                                     << "host1")
-                                                       << BSON("_id" << 2 << "host"
-                                                                     << "host2")
-                                                       << BSON("_id" << 3 << "host"
-                                                                     << "host3"
-                                                                     << "votes" << 0)
-                                                       << BSON("_id" << 4 << "host"
-                                                                     << "host4"
-                                                                     << "votes" << 0)))));
+        ASSERT_OK(
+            config.initialize(BSON("_id"
+                                   << "rs0"
+                                   << "version" << 2 << "members"
+                                   << BSON_ARRAY(
+                                          BSON("_id" << 0 << "host"
+                                                     << "host0")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "host1") << BSON("_id" << 2 << "host"
+                                                                                  << "host2")
+                                          << BSON("_id" << 3 << "host"
+                                                        << "host3"
+                                                        << "votes" << 0 << "priority" << 0)
+                                          << BSON("_id" << 4 << "host"
+                                                        << "host4"
+                                                        << "votes" << 0 << "priority" << 0)))));
         ASSERT_OK(config.validate());
         long long candidateId = 0;
         long long term = 2;
@@ -217,7 +217,8 @@ TEST_F(VoteRequesterTest, ImmediateGoodResponseWinElection) {
     ASSERT_FALSE(hasReceivedSufficientResponses());
     processResponse(requestFrom("host1"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
 }
 
 TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
@@ -228,7 +229,8 @@ TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -240,7 +242,8 @@ TEST_F(VoteRequesterTest, SetNameDiffersWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -252,7 +255,8 @@ TEST_F(VoteRequesterTest, LastOpTimeIsGreaterWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -264,7 +268,8 @@ TEST_F(VoteRequesterTest, FailedToContactWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -276,7 +281,8 @@ TEST_F(VoteRequesterTest, AlreadyVotedWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -286,7 +292,8 @@ TEST_F(VoteRequesterTest, StaleTermLoseElection) {
     processResponse(requestFrom("host1"), votedNoBecauseTermIsGreater());
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::StaleTerm, getResult());
+    ASSERT(VoteRequester::Result::kStaleTerm == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -299,7 +306,8 @@ TEST_F(VoteRequesterTest, NotEnoughVotesLoseElection) {
     processResponse(requestFrom("host2"), badResponseStatus());
     ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host2"));
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::InsufficientVotes, getResult());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -307,7 +315,8 @@ TEST_F(VoteRequesterDryRunTest, ImmediateGoodResponseWinElection) {
     ASSERT_FALSE(hasReceivedSufficientResponses());
     processResponse(requestFrom("host1"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
 }
 
 TEST_F(VoteRequesterDryRunTest, BadConfigVersionWinElection) {
@@ -318,7 +327,8 @@ TEST_F(VoteRequesterDryRunTest, BadConfigVersionWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -330,7 +340,8 @@ TEST_F(VoteRequesterDryRunTest, SetNameDiffersWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -342,7 +353,8 @@ TEST_F(VoteRequesterDryRunTest, LastOpTimeIsGreaterWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -354,7 +366,8 @@ TEST_F(VoteRequesterDryRunTest, FailedToContactWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -366,7 +379,8 @@ TEST_F(VoteRequesterDryRunTest, AlreadyVotedWinElection) {
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     processResponse(requestFrom("host2"), votedYes());
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::SuccessfullyElected, getResult());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -376,7 +390,8 @@ TEST_F(VoteRequesterDryRunTest, StaleTermLoseElection) {
     processResponse(requestFrom("host1"), votedNoBecauseTermIsGreater());
     ASSERT_EQUALS(1, countLogLinesContaining("Got no vote from host1"));
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::StaleTerm, getResult());
+    ASSERT(VoteRequester::Result::kStaleTerm == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 
@@ -389,7 +404,8 @@ TEST_F(VoteRequesterDryRunTest, NotEnoughVotesLoseElection) {
     processResponse(requestFrom("host2"), badResponseStatus());
     ASSERT_EQUALS(1, countLogLinesContaining("Got failed response from host2"));
     ASSERT_TRUE(hasReceivedSufficientResponses());
-    ASSERT_EQUALS(VoteRequester::InsufficientVotes, getResult());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
     stopCapturingLogMessages();
 }
 

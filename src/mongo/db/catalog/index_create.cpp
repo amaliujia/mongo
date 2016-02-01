@@ -44,6 +44,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/operation_context.h"
@@ -208,10 +209,6 @@ Status MultiIndexBlock::init(const std::vector<BSONObj>& indexSpecs) {
         _indexes.push_back(std::move(index));
     }
 
-    // this is so that operations examining the list of indexes know there are more keys to look
-    // at when doing things like in place updates, etc...
-    _collection->infoCache()->addedIndex(_txn);
-
     if (_buildInBackground)
         _backgroundOperation.reset(new BackgroundOperation(ns));
 
@@ -230,8 +227,8 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
 
     unsigned long long n = 0;
 
-    unique_ptr<PlanExecutor> exec(
-        InternalPlanner::collectionScan(_txn, _collection->ns().ns(), _collection));
+    unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
+        _txn, _collection->ns().ns(), _collection, PlanExecutor::YIELD_MANUAL));
     if (_buildInBackground) {
         invariant(_allowInterruption);
         exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
@@ -286,19 +283,14 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
             // around call to abandonSnapshot.
             exec->saveState();
             _txn->recoveryUnit()->abandonSnapshot();
-            exec->restoreState(_txn);  // Handles any WCEs internally.
+            exec->restoreState();  // Handles any WCEs internally.
         }
     }
 
-    if (state != PlanExecutor::IS_EOF) {
-        // If the plan executor was killed, this means the DB/collection was dropped and so it
-        // is not safe to cleanup the in-progress indexes.
-        if (state == PlanExecutor::DEAD) {
-            abortWithoutCleanup();
-        }
-
-        uasserted(28550, "Unable to complete index build as the collection is no longer readable");
-    }
+    uassert(28550,
+            "Unable to complete index build due to collection scan failure: " +
+                WorkingSetCommon::toStatusString(objToIndex.value()),
+            state == PlanExecutor::IS_EOF);
 
     progress->finished();
 
@@ -360,9 +352,6 @@ void MultiIndexBlock::commit() {
     for (size_t i = 0; i < _indexes.size(); i++) {
         _indexes[i].block->success();
     }
-
-    // this one is so operations examining the list of indexes know that the index is finished
-    _collection->infoCache()->addedIndex(_txn);
 
     _txn->recoveryUnit()->registerChange(new SetNeedToCleanupOnRollback(this));
     _needToCleanup = false;

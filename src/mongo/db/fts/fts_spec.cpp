@@ -73,18 +73,26 @@ FTSSpec::FTSSpec(const BSONObj& indexInfo) {
             "found invalid spec for text index, expected number for textIndexVersion",
             textIndexVersionElt.isNumber());
 
-    // We currently support TEXT_INDEX_VERSION_1 (deprecated) and TEXT_INDEX_VERSION_2.
+    // We currently support TEXT_INDEX_VERSION_1 (deprecated), TEXT_INDEX_VERSION_2, and
+    // TEXT_INDEX_VERSION_3.
     // Reject all other values.
-    massert(17364,
-            str::stream() << "attempt to use unsupported textIndexVersion "
-                          << textIndexVersionElt.numberInt() << "; versions supported: "
-                          << TEXT_INDEX_VERSION_2 << ", " << TEXT_INDEX_VERSION_1,
-            textIndexVersionElt.numberInt() == TEXT_INDEX_VERSION_2 ||
-                textIndexVersionElt.numberInt() == TEXT_INDEX_VERSION_1);
-
-    _textIndexVersion = (textIndexVersionElt.numberInt() == TEXT_INDEX_VERSION_2)
-        ? TEXT_INDEX_VERSION_2
-        : TEXT_INDEX_VERSION_1;
+    switch (textIndexVersionElt.numberInt()) {
+        case TEXT_INDEX_VERSION_3:
+            _textIndexVersion = TEXT_INDEX_VERSION_3;
+            break;
+        case TEXT_INDEX_VERSION_2:
+            _textIndexVersion = TEXT_INDEX_VERSION_2;
+            break;
+        case TEXT_INDEX_VERSION_1:
+            _textIndexVersion = TEXT_INDEX_VERSION_1;
+            break;
+        default:
+            msgasserted(17364,
+                        str::stream() << "attempt to use unsupported textIndexVersion "
+                                      << textIndexVersionElt.numberInt()
+                                      << "; versions supported: " << TEXT_INDEX_VERSION_3 << ", "
+                                      << TEXT_INDEX_VERSION_2 << ", " << TEXT_INDEX_VERSION_1);
+    }
 
     // Initialize _defaultLanguage.  Note that the FTSLanguage constructor requires
     // textIndexVersion, since language parsing is version-specific.
@@ -155,7 +163,7 @@ const FTSLanguage* FTSSpec::_getLanguageToUseV2(const BSONObj& userDoc,
     uassert(17261,
             "found language override field in document with non-string type",
             e.type() == mongo::String);
-    StatusWithFTSLanguage swl = FTSLanguage::make(e.String(), TEXT_INDEX_VERSION_2);
+    StatusWithFTSLanguage swl = FTSLanguage::make(e.String(), getTextIndexVersion());
     uassert(17262, "language override unsupported: " + e.String(), swl.getStatus().isOK());
     return swl.getValue();
 }
@@ -182,7 +190,7 @@ void FTSSpec::_scoreStringV2(FTSTokenizer* tokenizer,
 
     unsigned numTokens = 0;
 
-    tokenizer->reset(raw.rawData(), FTSTokenizer::FilterStopWords);
+    tokenizer->reset(raw.rawData(), FTSTokenizer::kFilterStopWords);
 
     while (tokenizer->moveNext()) {
         string term = tokenizer->get().toString();
@@ -350,6 +358,8 @@ BSONObj FTSSpec::fixSpec(const BSONObj& spec) {
         uasserted(17284, "text index option 'weights' must be an object");
     }
 
+    uassert(28823, "text index option 'weights' must specify fields or the wildcard", !m.empty());
+
     BSONObj weights;
     {
         BSONObjBuilder b;
@@ -384,7 +394,7 @@ BSONObj FTSSpec::fixSpec(const BSONObj& spec) {
     }
     uassert(17264,
             "default_language is not valid",
-            FTSLanguage::make(default_language, TEXT_INDEX_VERSION_2).getStatus().isOK());
+            FTSLanguage::make(default_language, TEXT_INDEX_VERSION_3).getStatus().isOK());
 
     BSONElement language_override_elt = spec["language_override"];
     string language_override(language_override_elt.str());
@@ -397,7 +407,7 @@ BSONObj FTSSpec::fixSpec(const BSONObj& spec) {
     }
 
     int version = -1;
-    int textIndexVersion = TEXT_INDEX_VERSION_2;
+    int textIndexVersion = TEXT_INDEX_VERSION_3;  // default text index version
 
     BSONObjBuilder b;
     BSONObjIterator i(spec);
@@ -421,7 +431,9 @@ BSONObj FTSSpec::fixSpec(const BSONObj& spec) {
             textIndexVersion = e.numberInt();
             uassert(16730,
                     str::stream() << "bad textIndexVersion: " << textIndexVersion,
-                    textIndexVersion == TEXT_INDEX_VERSION_2);
+                    textIndexVersion == TEXT_INDEX_VERSION_2 ||
+                        textIndexVersion == TEXT_INDEX_VERSION_3);  // supported indexes
+
         } else {
             b.append(e);
         }

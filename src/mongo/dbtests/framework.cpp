@@ -34,75 +34,27 @@
 
 #include <string>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/dbtests/config_server_fixture.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
+#include "mongo/s/grid.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/background.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
-
-namespace {
-
-stdx::mutex globalCurrentTestNameMutex;
-std::string globalCurrentTestName;
-
-class TestWatchDog : public BackgroundJob {
-public:
-    virtual std::string name() const {
-        return "TestWatchDog";
-    }
-
-    virtual void run() {
-        int minutesRunning = 0;
-        std::string lastRunningTestName, currentTestName;
-
-        {
-            stdx::lock_guard<stdx::mutex> lk(globalCurrentTestNameMutex);
-            lastRunningTestName = globalCurrentTestName;
-        }
-
-        while (true) {
-            sleepsecs(60);
-            minutesRunning++;
-
-            {
-                stdx::lock_guard<stdx::mutex> lk(globalCurrentTestNameMutex);
-                currentTestName = globalCurrentTestName;
-            }
-
-            if (currentTestName != lastRunningTestName) {
-                minutesRunning = 0;
-                lastRunningTestName = currentTestName;
-            }
-
-            if (minutesRunning > 30) {
-                log() << currentTestName << " has been running for more than 30 minutes. aborting.";
-                ::abort();
-            } else if (minutesRunning > 1) {
-                warning() << currentTestName << " has been running for more than "
-                          << minutesRunning - 1 << " minutes.";
-
-                // See what is stuck
-                getGlobalLockManager()->dump();
-            }
-        }
-    }
-};
-
-}  // namespace
-
 namespace dbtests {
 
 int runDbTests(int argc, char** argv) {
@@ -113,23 +65,21 @@ int runDbTests(int argc, char** argv) {
     Client::initThread("testsuite");
 
     srand((unsigned)frameworkGlobalParams.seed);
-    printGitVersion();
-    printOpenSSLVersion();
+    printBuildInfo();
 
+    checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
     getGlobalServiceContext()->initializeGlobalStorageEngine();
 
-    // Initialize the sharding state so we can run starding tests in isolation
-    shardingState.initialize("$dummy:10000");
+    {
+        auto txn = cc().makeOperationContext();
 
-    // Note: ShardingState::initialize also initializes the distLockMgr.
-    auto distLockMgr =
-        dynamic_cast<LegacyDistLockManager*>(grid.catalogManager()->getDistLockManager());
-    if (distLockMgr) {
-        distLockMgr->enablePinger(false);
+        // Initialize the sharding state so we can run sharding tests in isolation
+        auto connectHook = stdx::make_unique<CustomConnectHook>(txn.get());
+        ConnectionString::setConnectionHook(connectHook.get());
+        ON_BLOCK_EXIT([] { ConnectionString::setConnectionHook(nullptr); });
+        LegacyDistLockManager::disablePinger();
+        ShardingState::get(txn.get())->initialize(txn.get(), "$dummy:10000");
     }
-
-    TestWatchDog twd;
-    twd.go();
 
     int ret = unittest::Suite::run(frameworkGlobalParams.suites,
                                    frameworkGlobalParams.filter,
@@ -141,15 +91,6 @@ int runDbTests(int argc, char** argv) {
 }
 
 }  // namespace dbtests
-
-namespace unittest {
-
-void onCurrentTestNameChange(const std::string& testName) {
-    stdx::lock_guard<stdx::mutex> lk(globalCurrentTestNameMutex);
-    globalCurrentTestName = testName;
-}
-
-}  // namespace unittest
 
 #ifdef _WIN32
 namespace ntservice {

@@ -54,32 +54,29 @@ const size_t AndHashStage::kLookAheadWorks = 10;
 // static
 const char* AndHashStage::kStageType = "AND_HASH";
 
-AndHashStage::AndHashStage(WorkingSet* ws, const Collection* collection)
-    : _collection(collection),
+AndHashStage::AndHashStage(OperationContext* opCtx, WorkingSet* ws, const Collection* collection)
+    : PlanStage(kStageType, opCtx),
+      _collection(collection),
       _ws(ws),
       _hashingChildren(true),
       _currentChild(0),
-      _commonStats(kStageType),
       _memUsage(0),
       _maxMemUsage(kDefaultMaxMemUsageBytes) {}
 
-AndHashStage::AndHashStage(WorkingSet* ws, const Collection* collection, size_t maxMemUsage)
-    : _collection(collection),
+AndHashStage::AndHashStage(OperationContext* opCtx,
+                           WorkingSet* ws,
+                           const Collection* collection,
+                           size_t maxMemUsage)
+    : PlanStage(kStageType, opCtx),
+      _collection(collection),
       _ws(ws),
       _hashingChildren(true),
       _currentChild(0),
-      _commonStats(kStageType),
       _memUsage(0),
       _maxMemUsage(maxMemUsage) {}
 
-AndHashStage::~AndHashStage() {
-    for (size_t i = 0; i < _children.size(); ++i) {
-        delete _children[i];
-    }
-}
-
 void AndHashStage::addChild(PlanStage* child) {
-    _children.push_back(child);
+    _children.emplace_back(child);
 }
 
 size_t AndHashStage::getMemUsage() const {
@@ -110,12 +107,7 @@ bool AndHashStage::isEOF() {
         _children[_children.size() - 1]->isEOF();
 }
 
-PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -137,8 +129,9 @@ PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
         // a result.  If it's EOF this whole stage will be EOF.  If it produces a
         // result we cache it for later.
         for (size_t i = 0; i < _children.size(); ++i) {
-            PlanStage* child = _children[i];
+            auto& child = _children[i];
             for (size_t j = 0; j < kLookAheadWorks; ++j) {
+                // Cache the result in _lookAheadResults[i].
                 StageState childStatus = child->work(&_lookAheadResults[i]);
 
                 if (PlanStage::IS_EOF == childStatus) {
@@ -147,9 +140,10 @@ PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
                     _dataMap.clear();
                     return PlanStage::IS_EOF;
                 } else if (PlanStage::ADVANCED == childStatus) {
-                    // We have a result cached in _lookAheadResults[i].  Stop looking at this
-                    // child.
-                    break;
+                    // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we
+                    // yield.
+                    _ws->get(_lookAheadResults[i])->makeObjOwnedIfNeeded();
+                    break;  // Stop looking at this child.
                 } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
                     // Propage error to parent.
                     *out = _lookAheadResults[i];
@@ -234,7 +228,6 @@ PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
     if (_dataMap.end() == it) {
         // Child's output wasn't in every previous child.  Throw it out.
         _ws->free(*out);
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else {
         // Child's output was in every previous child.  Merge any key data in
@@ -245,7 +238,6 @@ PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
         AndCommon::mergeFrom(_ws, hashID, *member);
         _ws->free(*out);
 
-        ++_commonStats.advanced;
         *out = hashID;
         return PlanStage::ADVANCED;
     }
@@ -282,14 +274,15 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
             // happen if we're seeing a newer copy of the same doc in a more recent snapshot.
             // Throw out the newer copy of the doc.
             _ws->free(id);
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
+
+        // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+        member->makeObjOwnedIfNeeded();
 
         // Update memory stats.
         _memUsage += member->getMemUsage();
 
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == childStatus) {
         // Done reading child 0.
@@ -301,7 +294,6 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
             return PlanStage::IS_EOF;
         }
 
-        ++_commonStats.needTime;
         _specificStats.mapAfterChild.push_back(_dataMap.size());
 
         return PlanStage::NEED_TIME;
@@ -318,10 +310,7 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
         }
         return childStatus;
     } else {
-        if (PlanStage::NEED_TIME == childStatus) {
-            ++_commonStats.needTime;
-        } else if (PlanStage::NEED_YIELD == childStatus) {
-            ++_commonStats.needYield;
+        if (PlanStage::NEED_YIELD == childStatus) {
             *out = id;
         }
 
@@ -361,7 +350,6 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
             _memUsage += olderMember->getMemUsage() - memUsageBefore;
         }
         _ws->free(id);
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == childStatus) {
         // Finished with a child.
@@ -402,7 +390,6 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
             _hashingChildren = false;
         }
 
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
         *out = id;
@@ -417,10 +404,7 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
         }
         return childStatus;
     } else {
-        if (PlanStage::NEED_TIME == childStatus) {
-            ++_commonStats.needTime;
-        } else if (PlanStage::NEED_YIELD == childStatus) {
-            ++_commonStats.needYield;
+        if (PlanStage::NEED_YIELD == childStatus) {
             *out = id;
         }
 
@@ -428,31 +412,10 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
     }
 }
 
-void AndHashStage::saveState() {
-    ++_commonStats.yields;
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->saveState();
-    }
-}
-
-void AndHashStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->restoreState(opCtx);
-    }
-}
-
-void AndHashStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-
+void AndHashStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
+    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
     if (isEOF()) {
         return;
-    }
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->invalidate(txn, dl, type);
     }
 
     // Invalidation can happen to our warmup results.  If that occurs just
@@ -500,10 +463,6 @@ void AndHashStage::invalidate(OperationContext* txn, const RecordId& dl, Invalid
     }
 }
 
-vector<PlanStage*> AndHashStage::getChildren() const {
-    return _children;
-}
-
 unique_ptr<PlanStageStats> AndHashStage::getStats() {
     _commonStats.isEOF = isEOF();
 
@@ -513,14 +472,10 @@ unique_ptr<PlanStageStats> AndHashStage::getStats() {
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_AND_HASH);
     ret->specific = make_unique<AndHashStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
-        ret->children.push_back(_children[i]->getStats().release());
+        ret->children.emplace_back(_children[i]->getStats());
     }
 
     return ret;
-}
-
-const CommonStats* AndHashStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* AndHashStage::getSpecificStats() const {

@@ -35,6 +35,7 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/external_key_generator.h"
+#include "mongo/platform/random.h"
 #include "mongo/shell/bench.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
@@ -57,7 +58,7 @@ extern const JSFile servers;
 extern const JSFile shardingtest;
 extern const JSFile servers_misc;
 extern const JSFile replsettest;
-extern const JSFile replsetbridge;
+extern const JSFile bridge;
 }
 
 namespace shell_utils {
@@ -94,15 +95,6 @@ const char* getUserDir() {
 
 // real methods
 
-BSONObj Quit(const BSONObj& args, void* data) {
-    // If no arguments are given first element will be EOO, which
-    // converts to the integer value 0.
-    goingAwaySoon();
-    int exit_code = int(args.firstElement().number());
-    quickExit(exit_code);
-    return undefinedReturn;
-}
-
 BSONObj JSGetMemInfo(const BSONObj& args, void* data) {
     ProcessInfo pi;
     uassert(10258, "processinfo not supported", pi.supported());
@@ -122,16 +114,21 @@ ThreadLocalValue<unsigned int> _randomSeed;
 #endif
 
 BSONObj JSSrand(const BSONObj& a, void* data) {
-    uassert(12518,
-            "srand requires a single numeric argument",
-            a.nFields() == 1 && a.firstElement().isNumber());
+    unsigned int seed;
+    // grab the least significant bits of either the supplied argument or
+    // a random number from SecureRandom.
+    if (a.nFields() == 1 && a.firstElement().isNumber())
+        seed = static_cast<unsigned int>(a.firstElement().numberLong());
+    else {
+        std::unique_ptr<SecureRandom> rand(SecureRandom::create());
+        seed = static_cast<unsigned int>(rand->nextInt64());
+    }
 #if !defined(_WIN32)
-    _randomSeed.set(
-        static_cast<unsigned int>(a.firstElement().numberLong()));  // grab least significant digits
+    _randomSeed.set(seed);
 #else
-    srand(static_cast<unsigned int>(a.firstElement().numberLong()));
+    srand(seed);
 #endif
-    return undefinedReturn;
+    return BSON("" << static_cast<double>(seed));
 }
 
 BSONObj JSRand(const BSONObj& a, void* data) {
@@ -231,7 +228,6 @@ BSONObj interpreterVersion(const BSONObj& a, void* data) {
 }
 
 void installShellUtils(Scope& scope) {
-    scope.injectNative("quit", Quit);
     scope.injectNative("getMemInfo", JSGetMemInfo);
     scope.injectNative("_replMonitorStats", replMonitorStats);
     scope.injectNative("_srand", JSSrand);
@@ -261,7 +257,7 @@ void initScope(Scope& scope) {
     scope.execSetup(JSFiles::shardingtest);
     scope.execSetup(JSFiles::servers_misc);
     scope.execSetup(JSFiles::replsettest);
-    scope.execSetup(JSFiles::replsetbridge);
+    scope.execSetup(JSFiles::bridge);
 
     scope.injectNative("benchRun", BenchRunner::benchRunSync);
     scope.injectNative("benchRunSync", BenchRunner::benchRunSync);

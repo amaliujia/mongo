@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,13 +13,13 @@
  *	Return if the file exists.
  */
 int
-__wt_exist(WT_SESSION_IMPL *session, const char *filename, int *existp)
+__wt_exist(WT_SESSION_IMPL *session, const char *filename, bool *existp)
 {
 	struct stat sb;
 	WT_DECL_RET;
 	char *path;
 
-	*existp = 0;
+	*existp = false;
 
 	WT_RET(__wt_filename(session, filename, &path));
 
@@ -28,7 +28,7 @@ __wt_exist(WT_SESSION_IMPL *session, const char *filename, int *existp)
 	__wt_free(session, path);
 
 	if (ret == 0) {
-		*existp = 1;
+		*existp = true;
 		return (0);
 	}
 	if (ret == ENOENT)

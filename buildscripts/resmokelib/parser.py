@@ -17,20 +17,28 @@ from .. import resmokeconfig
 # Mapping of the attribute of the parsed arguments (dest) to its key as it appears in the options
 # YAML configuration file. Most should only be converting from snake_case to camelCase.
 DEST_TO_CONFIG = {
+    "base_port": "basePort",
     "buildlogger_url": "buildloggerUrl",
     "continue_on_failure": "continueOnFailure",
     "dbpath_prefix": "dbpathPrefix",
     "dbtest_executable": "dbtest",
     "dry_run": "dryRun",
+    "exclude_with_all_tags": "excludeWithAllTags",
+    "exclude_with_any_tags": "excludeWithAnyTags",
+    "include_with_all_tags": "includeWithAllTags",
+    "include_with_any_tags": "includeWithAnyTags",
     "jobs": "jobs",
     "mongo_executable": "mongo",
     "mongod_executable": "mongod",
+    "mongod_parameters": "mongodSetParameters",
     "mongos_executable": "mongos",
+    "mongos_parameters": "mongosSetParameters",
     "no_journal": "nojournal",
-    "no_prealloc_journal": "nopreallocj",
+    "prealloc_journal": "preallocJournal",
     "repeat": "repeat",
     "report_file": "reportFile",
     "seed": "seed",
+    "shell_read_mode": "shellReadMode",
     "shell_write_mode": "shellWriteMode",
     "shuffle": "shuffle",
     "storage_engine": "storageEngine",
@@ -68,6 +76,11 @@ def parse_command_line():
     parser.add_option("--options", dest="options_file", metavar="OPTIONS",
                       help="A YAML file that specifies global options to resmoke.py.")
 
+    parser.add_option("--basePort", dest="base_port", metavar="PORT",
+                      help=("The starting port number to use for mongod and mongos processes"
+                            " spawned by resmoke.py or the tests themselves. Each fixture and Job"
+                            " allocates a contiguous range of ports."))
+
     parser.add_option("--buildloggerUrl", action="store", dest="buildlogger_url", metavar="URL",
                       help="The root url of the buildlogger server.")
 
@@ -75,11 +88,28 @@ def parse_command_line():
                       help="Executes all tests in all suites, even if some of them fail.")
 
     parser.add_option("--dbpathPrefix", dest="dbpath_prefix", metavar="PATH",
-                      help=("The directory which will contain the dbpaths of any mongod's started "
+                      help=("The directory which will contain the dbpaths of any mongod's started"
                             " by resmoke.py or the tests themselves."))
 
     parser.add_option("--dbtest", dest="dbtest_executable", metavar="PATH",
                       help="The path to the dbtest executable for resmoke to use.")
+
+    parser.add_option("--excludeWithAllTags", dest="exclude_with_all_tags", metavar="TAG1,TAG2",
+                      help=("Comma separated list of tags. Any jstest that contains all of the"
+                            " specified tags will be excluded from any suites that are run."))
+
+    parser.add_option("--excludeWithAnyTags", dest="exclude_with_any_tags", metavar="TAG1,TAG2",
+                      help=("Comma separated list of tags. Any jstest that contains any of the"
+                            " specified tags will be excluded from any suites that are run."))
+
+    parser.add_option("--includeWithAllTags", dest="include_with_all_tags", metavar="TAG1,TAG2",
+                      help=("Comma separated list of tags. For the jstest portion of the suite(s),"
+                            " only tests which have all of the specified tags will be run."))
+
+    parser.add_option("--includeWithAnyTags", dest="include_with_any_tags", metavar="TAG1,TAG2",
+                      help=("Comma separated list of tags. For the jstest portion of the suite(s),"
+                            " only tests which have at least one of the specified tags will be"
+                            " run."))
 
     parser.add_option("-n", action="store_const", const="tests", dest="dry_run",
                       help=("Output the tests that would be run."))
@@ -103,14 +133,31 @@ def parse_command_line():
     parser.add_option("--mongod", dest="mongod_executable", metavar="PATH",
                       help="The path to the mongod executable for resmoke.py to use.")
 
+    parser.add_option("--mongodSetParameters", dest="mongod_parameters",
+                      metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+                      help=("Pass one or more --setParameter options to all mongod processes"
+                            " started by resmoke.py. The argument is specified as bracketed YAML -"
+                            " i.e. JSON with support for single quoted and unquoted keys."))
+
     parser.add_option("--mongos", dest="mongos_executable", metavar="PATH",
                       help="The path to the mongos executable for resmoke.py to use.")
+
+    parser.add_option("--mongosSetParameters", dest="mongos_parameters",
+                      metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
+                      help=("Pass one or more --setParameter options to all mongos processes"
+                            " started by resmoke.py. The argument is specified as bracketed YAML -"
+                            " i.e. JSON with support for single quoted and unquoted keys."))
 
     parser.add_option("--nojournal", action="store_true", dest="no_journal",
                       help="Disable journaling for all mongod's.")
 
-    parser.add_option("--nopreallocj", action="store_true", dest="no_prealloc_journal",
-                      help="Disable preallocation of journal files for all mongod's.")
+    parser.add_option("--nopreallocj", action="store_const", const="off", dest="prealloc_journal",
+                      help="Disable preallocation of journal files for all mongod processes.")
+
+    parser.add_option("--preallocJournal", type="choice", action="store", dest="prealloc_journal",
+                      choices=("on", "off"), metavar="ON|OFF",
+                      help=("Enable or disable preallocation of journal files for all mongod"
+                            " processes. Defaults to %default."))
 
     parser.add_option("--repeat", type="int", dest="repeat", metavar="N",
                       help="Repeat the given suite(s) N times, or until one fails.")
@@ -121,6 +168,10 @@ def parse_command_line():
     parser.add_option("--seed", type="int", dest="seed", metavar="SEED",
                       help=("Seed for the random number generator. Useful in combination with the"
                             " --shuffle option for producing a consistent test execution order."))
+
+    parser.add_option("--shellReadMode", type="choice", action="store", dest="shell_read_mode",
+                      choices=("commands", "compatibility", "legacy"), metavar="READ_MODE",
+                      help="The read mode used by the mongo shell.")
 
     parser.add_option("--shellWriteMode", type="choice", action="store", dest="shell_write_mode",
                       choices=("commands", "compatibility", "legacy"), metavar="WRITE_MODE",
@@ -144,7 +195,8 @@ def parse_command_line():
     parser.set_defaults(executor_file="with_server",
                         logger_file="console",
                         dry_run="off",
-                        list_suites=False)
+                        list_suites=False,
+                        prealloc_journal="off")
 
     return parser.parse_args()
 
@@ -167,20 +219,28 @@ def update_config_vars(values):
         if values[dest] is not None:
             config[config_var] = values[dest]
 
+    _config.BASE_PORT = int(config.pop("basePort"))
     _config.BUILDLOGGER_URL = config.pop("buildloggerUrl")
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpathPrefix"))
     _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest"))
     _config.DRY_RUN = config.pop("dryRun")
+    _config.EXCLUDE_WITH_ALL_TAGS = config.pop("excludeWithAllTags")
+    _config.EXCLUDE_WITH_ANY_TAGS = config.pop("excludeWithAnyTags")
     _config.FAIL_FAST = not config.pop("continueOnFailure")
+    _config.INCLUDE_WITH_ALL_TAGS = config.pop("includeWithAllTags")
+    _config.INCLUDE_WITH_ANY_TAGS = config.pop("includeWithAnyTags")
     _config.JOBS = config.pop("jobs")
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo"))
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod"))
+    _config.MONGOD_SET_PARAMETERS = config.pop("mongodSetParameters")
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos"))
+    _config.MONGOS_SET_PARAMETERS = config.pop("mongosSetParameters")
     _config.NO_JOURNAL = config.pop("nojournal")
-    _config.NO_PREALLOC_JOURNAL = config.pop("nopreallocj")
+    _config.NO_PREALLOC_JOURNAL = config.pop("preallocJournal") == "off"
     _config.RANDOM_SEED = config.pop("seed")
     _config.REPEAT = config.pop("repeat")
     _config.REPORT_FILE = config.pop("reportFile")
+    _config.SHELL_READ_MODE = config.pop("shellReadMode")
     _config.SHELL_WRITE_MODE = config.pop("shellWriteMode")
     _config.SHUFFLE = config.pop("shuffle")
     _config.STORAGE_ENGINE = config.pop("storageEngine")

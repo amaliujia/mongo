@@ -50,11 +50,13 @@ public:
     LegacyDistLockPinger() = default;
 
     /**
-     * Starts pinging the process id for the given lock.
-     * Note: this pinger does not support calling startPing on a lock that has previously
-     * been stopped by a call to stopPing on its underlying processId.
+     * Starts the pinger thread for a given processID.
+     * Note: this pinger does not support being started up after it was stopped, either by a call
+     * to stopPing or shutdown.
      */
-    Status startPing(const DistributedLock& lock, Milliseconds sleepTime);
+    Status startup(const ConnectionString& configServerConnectionString,
+                   const std::string& processID,
+                   Milliseconds sleepTime);
 
     /**
      * Adds a distributed lock that has the given id to the unlock list. The unlock list
@@ -76,7 +78,7 @@ public:
     /**
      * Kills all ping threads and wait for them to cleanup.
      */
-    void shutdown();
+    void shutdown(bool allowNetworking);
 
 private:
     /**
@@ -136,6 +138,7 @@ private:
     // Contains all lock ids to keeping on retrying to unlock until success.
     std::list<DistLockHandle> _unlockList;  // (M)
 
-    bool _inShutdown = false;  // (M)
+    bool _inShutdown = false;                // (M)
+    bool _allowNetworkingInShutdown = true;  // (M)
 };
 }

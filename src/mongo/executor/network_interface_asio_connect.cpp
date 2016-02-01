@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -34,6 +34,13 @@
 
 #include <utility>
 
+#include "mongo/base/system_error.h"
+#include "mongo/config.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/executor/async_stream.h"
+#include "mongo/executor/async_stream_factory.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
 
@@ -42,39 +49,34 @@ namespace executor {
 
 using asio::ip::tcp;
 
-namespace {
-const auto kCanceledStatus = Status(ErrorCodes::CallbackCanceled, "Callback canceled");
-}  // namespace
-
-NetworkInterfaceASIO::AsyncConnection::AsyncConnection(asio::ip::tcp::socket&& sock,
+NetworkInterfaceASIO::AsyncConnection::AsyncConnection(std::unique_ptr<AsyncStreamInterface> stream,
                                                        rpc::ProtocolSet protocols)
-    : AsyncConnection(std::move(sock), protocols, boost::none) {}
-
-NetworkInterfaceASIO::AsyncConnection::AsyncConnection(
-    asio::ip::tcp::socket&& sock,
-    rpc::ProtocolSet protocols,
-    boost::optional<ConnectionPool::ConnectionPtr>&& bootstrapConn)
-    : _sock(std::move(sock)),
+    : _stream(std::move(stream)),
       _serverProtocols(protocols),
-      _bootstrapConn(std::move(bootstrapConn)) {}
+      _clientProtocols(rpc::computeProtocolSet(WireSpec::instance().minWireVersionOutgoing,
+                                               WireSpec::instance().maxWireVersionOutgoing)) {}
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 NetworkInterfaceASIO::AsyncConnection::AsyncConnection(AsyncConnection&& other)
-    : _sock(std::move(other._sock)),
+    : _stream(std::move(other._stream)),
       _serverProtocols(other._serverProtocols),
       _clientProtocols(other._clientProtocols) {}
 
 NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncConnection::operator=(
     AsyncConnection&& other) {
-    _sock = std::move(other._sock);
+    _stream = std::move(other._stream);
     _serverProtocols = other._serverProtocols;
     _clientProtocols = other._clientProtocols;
     return *this;
 }
 #endif
 
-asio::ip::tcp::socket& NetworkInterfaceASIO::AsyncConnection::sock() {
-    return _sock;
+AsyncStreamInterface& NetworkInterfaceASIO::AsyncConnection::stream() {
+    return *_stream;
+}
+
+void NetworkInterfaceASIO::AsyncConnection::cancel() {
+    _stream->cancel();
 }
 
 rpc::ProtocolSet NetworkInterfaceASIO::AsyncConnection::serverProtocols() const {
@@ -85,84 +87,41 @@ rpc::ProtocolSet NetworkInterfaceASIO::AsyncConnection::clientProtocols() const 
     return _clientProtocols;
 }
 
-void NetworkInterfaceASIO::_connectASIO(AsyncOp* op) {
+void NetworkInterfaceASIO::AsyncConnection::setServerProtocols(rpc::ProtocolSet protocols) {
+    _serverProtocols = protocols;
+}
+
+void NetworkInterfaceASIO::_connect(AsyncOp* op) {
+    LOG(1) << "Connecting to " << op->request().target.toString();
+
     tcp::resolver::query query(op->request().target.host(),
                                std::to_string(op->request().target.port()));
     // TODO: Investigate how we might hint or use shortcuts to resolve when possible.
-    _resolver.async_resolve(
-        query,
-        [this, op](std::error_code ec, asio::ip::basic_resolver_iterator<tcp> endpoints) {
-            if (ec) {
-                LOG(3) << "could not resolve address " << op->request().target.host() << ":"
-                       << std::to_string(op->request().target.port()) << ", " << ec.message();
-                return _networkErrorCallback(op, ec);
-            }
-
-            if (op->canceled())
-                return _completeOperation(op, kCanceledStatus);
-
-            _setupSocket(op, endpoints);
-        });
-}
-
-void NetworkInterfaceASIO::_connectWithDBClientConnection(AsyncOp* op) {
-    // connect in a separate thread to avoid blocking the rest of the system
-    stdx::thread t([this, op]() {
-        try {
-            // The call to connect() will throw if:
-            // - we cannot get a new connection from the pool
-            // - we get a connection from the pool, but cannot use it
-            // - we fail to transfer the connection's socket to an ASIO wrapper
-            op->connect(_connPool.get(), &_io_service, now());
-        } catch (...) {
-            LOG(3) << "failed to connect, posting mock completion";
-
-            if (inShutdown()) {
-                return;
-            }
-
-            auto status = exceptionToStatus();
-
-            asio::post(_io_service,
-                       [this, op, status]() {
-
-                           if (op->canceled()) {
-                               return _completeOperation(op, kCanceledStatus);
-                           }
-
-                           return _completeOperation(op, status);
-                       });
-            return;
+    const auto thenConnect = [this, op](std::error_code ec, tcp::resolver::iterator endpoints) {
+        if (endpoints == tcp::resolver::iterator()) {
+            // Workaround a bug in ASIO returning an invalid resolver iterator (with a non-error
+            // std::error_code) when file descriptors are exhausted.
+            ec = make_error_code(ErrorCodes::HostUnreachable);
         }
-
-        // send control back to main thread(pool)
-        asio::post(_io_service, [this, op]() { _beginCommunication(op); });
-    });
-
-    t.detach();
+        _validateAndRun(
+            op, ec, [this, op, endpoints]() { _setupSocket(op, std::move(endpoints)); });
+    };
+    op->resolver().async_resolve(query, op->_strand.wrap(std::move(thenConnect)));
 }
 
-void NetworkInterfaceASIO::_setupSocket(AsyncOp* op, const tcp::resolver::iterator& endpoints) {
-    tcp::socket sock(_io_service);
-    AsyncConnection conn(std::move(sock), rpc::supports::kOpQueryOnly);
-
+void NetworkInterfaceASIO::_setupSocket(AsyncOp* op, tcp::resolver::iterator endpoints) {
     // TODO: Consider moving this call to post-auth so we only assign completed connections.
-    op->setConnection(std::move(conn));
+    {
+        auto stream = _streamFactory->makeStream(&op->strand(), op->request().target);
+        op->setConnection({std::move(stream), rpc::supports::kOpQueryOnly});
+    }
 
-    asio::async_connect(op->connection()->sock(),
-                        std::move(endpoints),
-                        [this, op](std::error_code ec, tcp::resolver::iterator iter) {
-                            if (ec) {
-                                LOG(3) << "could not connect to host at " << iter->host_name()
-                                       << ":" << iter->endpoint().port() << ", " << ec.message();
-                                return _networkErrorCallback(op, ec);
-                            }
+    auto& stream = op->connection().stream();
 
-                            if (op->canceled())
-                                return _completeOperation(op, kCanceledStatus);
-
-                            _sslHandshake(op);
-                        });
+    stream.connect(std::move(endpoints),
+                   [this, op](std::error_code ec) {
+                       _validateAndRun(op, ec, [this, op]() { _runIsMaster(op); });
+                   });
 }
 
 }  // namespace executor

@@ -45,38 +45,19 @@ using stdx::make_unique;
 
 const char* TextMatchStage::kStageType = "TEXT_MATCH";
 
-TextMatchStage::TextMatchStage(unique_ptr<PlanStage> child,
-                               const FTSQuery& query,
+TextMatchStage::TextMatchStage(OperationContext* opCtx,
+                               unique_ptr<PlanStage> child,
+                               const FTSQueryImpl& query,
                                const FTSSpec& spec,
                                WorkingSet* ws)
-    : _ftsMatcher(query, spec), _ws(ws), _child(std::move(child)), _commonStats(kStageType) {}
+    : PlanStage(kStageType, opCtx), _ftsMatcher(query, spec), _ws(ws) {
+    _children.emplace_back(std::move(child));
+}
 
 TextMatchStage::~TextMatchStage() {}
 
 bool TextMatchStage::isEOF() {
-    return _child->isEOF();
-}
-
-void TextMatchStage::saveState() {
-    ++_commonStats.yields;
-
-    _child->saveState();
-}
-
-void TextMatchStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-
-    _child->restoreState(opCtx);
-}
-
-void TextMatchStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-
-    _child->invalidate(txn, dl, type);
-}
-
-vector<PlanStage*> TextMatchStage::getChildren() const {
-    return {_child.get()};
+    return child()->isEOF();
 }
 
 std::unique_ptr<PlanStageStats> TextMatchStage::getStats() {
@@ -84,31 +65,22 @@ std::unique_ptr<PlanStageStats> TextMatchStage::getStats() {
 
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_MATCH);
     ret->specific = make_unique<TextMatchStats>(_specificStats);
-    ret->children.push_back(_child->getStats().release());
+    ret->children.emplace_back(child()->getStats());
 
     return ret;
-}
-
-const CommonStats* TextMatchStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* TextMatchStage::getSpecificStats() const {
     return &_specificStats;
 }
 
-PlanStage::StageState TextMatchStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState TextMatchStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
 
     // Retrieve fetched document from child.
-    StageState stageState = _child->work(out);
+    StageState stageState = child()->work(out);
 
     if (stageState == PlanStage::ADVANCED) {
         // We just successfully retrieved a fetched doc.
@@ -131,21 +103,6 @@ PlanStage::StageState TextMatchStage::work(WorkingSetID* out) {
             Status status(ErrorCodes::InternalError, ss);
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
-    }
-
-    // Increment common stats counters that are specific to the return value of work().
-    switch (stageState) {
-        case PlanStage::ADVANCED:
-            ++_commonStats.advanced;
-            break;
-        case PlanStage::NEED_TIME:
-            ++_commonStats.needTime;
-            break;
-        case PlanStage::NEED_YIELD:
-            ++_commonStats.needYield;
-            break;
-        default:
-            break;
     }
 
     return stageState;

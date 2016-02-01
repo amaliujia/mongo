@@ -141,16 +141,15 @@ public:
      *
      * @param conn address of config(s) server(s)
      * @param name identifier for the lock
+     * @param processId this process's distributed lock process ID
      * @param lockTimeout how long can the log go "unpinged" before a new attempt to lock steals it
      *                   (in minutes).
-     * @param lockPing how long to wait between lock pings
-     * @param legacy use legacy logic
      *
      */
     DistributedLock(const ConnectionString& conn,
                     const std::string& name,
-                    unsigned long long lockTimeout = 0,
-                    bool asProcess = false);
+                    const std::string& processId,
+                    unsigned long long lockTimeout = 0);
     ~DistributedLock(){};
 
     /**
@@ -158,12 +157,16 @@ public:
      * holder. Please consider using the dist_lock_try construct to acquire this lock in an
      * exception safe way.
      *
+     * @param lockID the lockID to use for acquiring the lock.
      * @param why human readable description of why the lock is being taken (used to log)
      * @param other configdb's lock document that is currently holding the lock, if lock is taken,
      * or our own lock details if not
      * @return true if it managed to grab the lock
      */
-    bool lock_try(const std::string& why, BSONObj* other = 0, double timeout = 0.0);
+    bool lock_try(const OID& lockID,
+                  const std::string& why,
+                  BSONObj* other = 0,
+                  double timeout = 0.0);
 
     /**
      * Returns OK if this lock is held (but does not guarantee that this owns it) and
@@ -177,11 +180,11 @@ public:
      */
     bool unlock(const OID& lockID);
 
-    Date_t getRemoteTime() const;
-
     bool isRemoteTimeSkewed() const;
 
     const std::string& getProcessId() const;
+
+    const std::string& getDistLockId() const;
 
     const ConnectionString& getRemoteConnection() const;
 
@@ -213,6 +216,7 @@ public:
     const ConnectionString _conn;
     const std::string _name;
     const std::string _processId;
+    const std::string _lockId;
 
     // Timeout for lock, usually LOCK_TIMEOUT
     const unsigned long long _lockTimeout;

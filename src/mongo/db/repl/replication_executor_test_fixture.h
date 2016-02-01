@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/stdx/memory.h"
+#include "mongo/db/repl/replication_executor.h"
 #include "mongo/executor/task_executor_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
@@ -59,7 +60,7 @@ protected:
 
 private:
     std::unique_ptr<executor::TaskExecutor> makeTaskExecutor(
-        std::unique_ptr<executor::NetworkInterface> net) override;
+        std::unique_ptr<executor::NetworkInterfaceMock> net) override;
 
     StorageInterfaceMock* _storage{nullptr};
 

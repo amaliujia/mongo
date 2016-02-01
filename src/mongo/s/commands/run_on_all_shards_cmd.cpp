@@ -36,9 +36,9 @@
 #include <set>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/client/parallel.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
@@ -62,7 +62,8 @@ BSONObj RunOnAllShardsCommand::specialErrorHandler(const std::string& server,
     return originalResult;
 }
 
-void RunOnAllShardsCommand::getShardIds(const std::string& db,
+void RunOnAllShardsCommand::getShardIds(OperationContext* txn,
+                                        const std::string& db,
                                         BSONObj& cmdObj,
                                         std::vector<ShardId>& shardIds) {
     grid.shardRegistry()->getAllShardIds(&shardIds);
@@ -77,15 +78,15 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
     LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
 
     if (_implicitCreateDb) {
-        uassertStatusOK(grid.implicitCreateDb(dbName));
+        uassertStatusOK(grid.implicitCreateDb(txn, dbName));
     }
 
     std::vector<ShardId> shardIds;
-    getShardIds(dbName, cmdObj, shardIds);
+    getShardIds(txn, dbName, cmdObj, shardIds);
 
     std::list<std::shared_ptr<Future::CommandResult>> futures;
     for (const ShardId& shardId : shardIds) {
-        const auto shard = grid.shardRegistry()->getShard(shardId);
+        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
         if (!shard) {
             continue;
         }
@@ -108,7 +109,7 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
          ++futuresit, ++shardIdsIt) {
         std::shared_ptr<Future::CommandResult> res = *futuresit;
 
-        if (res->join()) {
+        if (res->join(txn)) {
             // success :)
             BSONObj result = res->result();
             results.emplace_back(*shardIdsIt, result);
@@ -121,8 +122,8 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
         if (result["errmsg"].type() || result["code"].numberInt() != 0) {
             result = specialErrorHandler(res->getServer(), dbName, cmdObj, result);
 
-            BSONElement errmsg = result["errmsg"];
-            if (errmsg.eoo() || errmsg.String().empty()) {
+            BSONElement errmsgObj = result["errmsg"];
+            if (errmsgObj.eoo() || errmsgObj.String().empty()) {
                 // it was fixed!
                 results.emplace_back(*shardIdsIt, result);
                 subobj.append(res->getServer(), result);

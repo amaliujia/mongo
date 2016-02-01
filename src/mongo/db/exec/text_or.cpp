@@ -59,12 +59,11 @@ TextOrStage::TextOrStage(OperationContext* txn,
                          WorkingSet* ws,
                          const MatchExpression* filter,
                          IndexDescriptor* index)
-    : _ftsSpec(ftsSpec),
+    : PlanStage(kStageType, txn),
+      _ftsSpec(ftsSpec),
       _ws(ws),
       _scoreIterator(_scores.end()),
-      _commonStats(kStageType),
       _filter(filter),
-      _txn(txn),
       _idRetrying(WorkingSet::INVALID_ID),
       _index(index) {}
 
@@ -78,41 +77,29 @@ bool TextOrStage::isEOF() {
     return _internalState == State::kDone;
 }
 
-void TextOrStage::saveState() {
-    _txn = NULL;
-    ++_commonStats.yields;
-
-    for (auto& child : _children) {
-        child->saveState();
-    }
-
+void TextOrStage::doSaveState() {
     if (_recordCursor) {
         _recordCursor->saveUnpositioned();
     }
 }
 
-void TextOrStage::restoreState(OperationContext* opCtx) {
-    invariant(_txn == NULL);
-    _txn = opCtx;
-    ++_commonStats.unyields;
-
-    for (auto& child : _children) {
-        child->restoreState(opCtx);
-    }
-
+void TextOrStage::doRestoreState() {
     if (_recordCursor) {
-        invariant(_recordCursor->restore(opCtx));
+        invariant(_recordCursor->restore());
     }
 }
 
-void TextOrStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
+void TextOrStage::doDetachFromOperationContext() {
+    if (_recordCursor)
+        _recordCursor->detachFromOperationContext();
+}
 
-    // Propagate invalidate to children.
-    for (auto& child : _children) {
-        child->invalidate(txn, dl, type);
-    }
+void TextOrStage::doReattachToOperationContext() {
+    if (_recordCursor)
+        _recordCursor->reattachToOperationContext(getOpCtx());
+}
 
+void TextOrStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
     // Remove the RecordID from the ScoreMap.
     ScoreMap::iterator scoreIt = _scores.find(dl);
     if (scoreIt != _scores.end()) {
@@ -121,14 +108,6 @@ void TextOrStage::invalidate(OperationContext* txn, const RecordId& dl, Invalida
         }
         _scores.erase(scoreIt);
     }
-}
-
-vector<PlanStage*> TextOrStage::getChildren() const {
-    std::vector<PlanStage*> vec;
-    for (auto& child : _children) {
-        vec.push_back(child.get());
-    }
-    return vec;
 }
 
 std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
@@ -143,27 +122,18 @@ std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
     ret->specific = make_unique<TextOrStats>(_specificStats);
 
-    for (auto& child : _children) {
-        ret->children.push_back(child->getStats().release());
+    for (auto&& child : _children) {
+        ret->children.emplace_back(child->getStats());
     }
 
     return ret;
-}
-
-const CommonStats* TextOrStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* TextOrStage::getSpecificStats() const {
     return &_specificStats;
 }
 
-PlanStage::StageState TextOrStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -186,28 +156,13 @@ PlanStage::StageState TextOrStage::work(WorkingSetID* out) {
             break;
     }
 
-    // Increment common stats counters.
-    switch (stageState) {
-        case PlanStage::ADVANCED:
-            ++_commonStats.advanced;
-            break;
-        case PlanStage::NEED_TIME:
-            ++_commonStats.needTime;
-            break;
-        case PlanStage::NEED_YIELD:
-            ++_commonStats.needYield;
-            break;
-        default:
-            break;
-    }
-
     return stageState;
 }
 
 PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
     *out = WorkingSet::INVALID_ID;
     try {
-        _recordCursor = _index->getCollection()->getCursor(_txn);
+        _recordCursor = _index->getCollection()->getCursor(getOpCtx());
         _internalState = State::kReadingTerms;
         return PlanStage::NEED_TIME;
     } catch (const WriteConflictException& wce) {
@@ -306,7 +261,7 @@ public:
                           const BSONObj& key,
                           WorkingSet* ws,
                           WorkingSetID id,
-                          unowned_ptr<RecordCursor> recordCursor)
+                          unowned_ptr<SeekableRecordCursor> recordCursor)
         : _txn(txn),
           _recordCursor(recordCursor),
           _keyPattern(keyPattern),
@@ -318,7 +273,7 @@ public:
         return getObj();
     }
 
-    virtual ElementIterator* allocateIterator(const ElementPath* path) const {
+    ElementIterator* allocateIterator(const ElementPath* path) const final {
         WorkingSetMember* member = _ws->get(_id);
         if (!member->hasObj()) {
             // Try to look in the key.
@@ -344,7 +299,7 @@ public:
         return new BSONElementIterator(path, getObj());
     }
 
-    virtual void releaseIterator(ElementIterator* iterator) const {
+    void releaseIterator(ElementIterator* iterator) const final {
         delete iterator;
     }
 
@@ -359,12 +314,12 @@ private:
         WorkingSetMember* member = _ws->get(_id);
 
         // Make it owned since we are buffering results.
-        member->obj.setValue(member->obj.value().getOwned());
+        member->makeObjOwnedIfNeeded();
         return member->obj.value();
     }
 
     OperationContext* _txn;
-    unowned_ptr<RecordCursor> _recordCursor;
+    unowned_ptr<SeekableRecordCursor> _recordCursor;
     BSONObj _keyPattern;
     BSONObj _key;
     WorkingSet* _ws;
@@ -376,24 +331,34 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
     invariant(wsm->getState() == WorkingSetMember::LOC_AND_IDX);
     invariant(1 == wsm->keyData.size());
     const IndexKeyDatum newKeyData = wsm->keyData.back();  // copy to keep it around.
-
     TextRecordData* textRecordData = &_scores[wsm->loc];
-    double* documentAggregateScore = &textRecordData->score;
+
+    if (textRecordData->score < 0) {
+        // We have already rejected this document for not matching the filter.
+        invariant(WorkingSet::INVALID_ID == textRecordData->wsid);
+        _ws->free(wsid);
+        return NEED_TIME;
+    }
 
     if (WorkingSet::INVALID_ID == textRecordData->wsid) {
-        // We haven't seen this RecordId before. Keep the working set member around (it may be
-        // force-fetched on saveState()).
-        textRecordData->wsid = wsid;
-
+        // We haven't seen this RecordId before.
+        invariant(textRecordData->score == 0);
+        bool shouldKeep = true;
         if (_filter) {
             // We have not seen this document before and need to apply a filter.
-            bool shouldKeep;
             bool wasDeleted = false;
             try {
-                TextMatchableDocument tdoc(
-                    _txn, newKeyData.indexKeyPattern, newKeyData.keyData, _ws, wsid, _recordCursor);
+                TextMatchableDocument tdoc(getOpCtx(),
+                                           newKeyData.indexKeyPattern,
+                                           newKeyData.keyData,
+                                           _ws,
+                                           wsid,
+                                           _recordCursor);
                 shouldKeep = _filter->matches(&tdoc);
             } catch (const WriteConflictException& wce) {
+                // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may
+                // be freed when we yield.
+                wsm->makeObjOwnedIfNeeded();
                 _idRetrying = wsid;
                 *out = WorkingSet::INVALID_ID;
                 return NEED_YIELD;
@@ -404,18 +369,35 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
                 wasDeleted = true;
             }
 
-            if (!shouldKeep) {
-                if (wasDeleted || wsm->hasObj()) {
-                    // We had to fetch but we're not going to return it.
-                    ++_specificStats.fetches;
-                }
-                _ws->free(textRecordData->wsid);
-                textRecordData->wsid = WorkingSet::INVALID_ID;
-                *documentAggregateScore = -1;
-                return NEED_TIME;
+            if (wasDeleted || wsm->hasObj()) {
+                ++_specificStats.fetches;
             }
         }
 
+        if (shouldKeep && !wsm->hasObj()) {
+            // Our parent expects LOC_AND_OBJ members, so we fetch the document here if we haven't
+            // already.
+            try {
+                shouldKeep = WorkingSetCommon::fetch(getOpCtx(), _ws, wsid, _recordCursor);
+                ++_specificStats.fetches;
+            } catch (const WriteConflictException& wce) {
+                wsm->makeObjOwnedIfNeeded();
+                _idRetrying = wsid;
+                *out = WorkingSet::INVALID_ID;
+                return NEED_YIELD;
+            }
+        }
+
+        if (!shouldKeep) {
+            _ws->free(wsid);
+            textRecordData->score = -1;
+            return NEED_TIME;
+        }
+
+        textRecordData->wsid = wsid;
+
+        // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+        wsm->makeObjOwnedIfNeeded();
     } else {
         // We already have a working set member for this RecordId. Free the new WSM and retrieve the
         // old one. Note that since we don't keep all index keys, we could get a score that doesn't
@@ -424,11 +406,6 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
         invariant(wsid != textRecordData->wsid);
         _ws->free(wsid);
         wsm = _ws->get(textRecordData->wsid);
-    }
-
-    if (*documentAggregateScore < 0) {
-        // We have already rejected this document for not matching the filter.
-        return NEED_TIME;
     }
 
     // Locate score within possibly compound key: {prefix,term,score,suffix}.
@@ -443,7 +420,7 @@ PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out)
     double documentTermScore = scoreElement.number();
 
     // Aggregate relevance score, term keys.
-    *documentAggregateScore += documentTermScore;
+    textRecordData->score += documentTermScore;
     return NEED_TIME;
 }
 

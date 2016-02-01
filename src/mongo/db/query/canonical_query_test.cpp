@@ -29,6 +29,8 @@
 #include "mongo/db/query/canonical_query.h"
 
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/unittest/unittest.h"
 
@@ -46,7 +48,7 @@ static const NamespaceString nss("testdb.testcoll");
  * and return the MatchExpression*.
  */
 MatchExpression* parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, ExtensionsCallbackNoop());
     if (!status.isOK()) {
         mongoutils::str::stream ss;
         ss << "failed to parse query: " << obj.toString()
@@ -399,6 +401,30 @@ TEST(CanonicalQueryTest, IsValidTextAndSnapshot) {
     ASSERT_NOT_OK(isValid("{$text: {$search: 's'}}", *lpq));
 }
 
+TEST(CanonicalQueryTest, IsValidSortKeyMetaProjection) {
+    // Passing a sortKey meta-projection without a sort is an error.
+    {
+        const bool isExplain = false;
+        auto lpq = assertGet(LiteParsedQuery::makeFromFindCommand(
+            nss, fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}}"), isExplain));
+        auto cq =
+            CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackDisallowExtensions());
+        ASSERT_NOT_OK(cq.getStatus());
+    }
+
+    // Should be able to successfully create a CQ when there is a sort.
+    {
+        const bool isExplain = false;
+        auto lpq = assertGet(LiteParsedQuery::makeFromFindCommand(
+            nss,
+            fromjson("{find: 'testcoll', projection: {foo: {$meta: 'sortKey'}}, sort: {bar: 1}}"),
+            isExplain));
+        auto cq =
+            CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackDisallowExtensions());
+        ASSERT_OK(cq.getStatus());
+    }
+}
+
 //
 // Tests for CanonicalQuery::sortTree
 //
@@ -460,7 +486,8 @@ TEST(CanonicalQueryTest, SortTreeNumChildrenComparison) {
  */
 unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
     BSONObj queryObj = fromjson(queryStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(nss.ns(), queryObj);
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -471,7 +498,8 @@ std::unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj queryObj = fromjson(queryStr);
     BSONObj sortObj = fromjson(sortStr);
     BSONObj projObj = fromjson(projStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(nss.ns(), queryObj, sortObj, projObj);
+    auto statusWithCQ = CanonicalQuery::canonicalize(
+        nss, queryObj, sortObj, projObj, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -514,16 +542,17 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQuery) {
     const std::string cmdStr =
         "{find:'bogusns', filter:{$or:[{a:1,b:1},{a:1,c:1}]}, projection:{a:1}, sort:{b:1}}";
     auto lpq = assertGet(LiteParsedQuery::makeFromFindCommand(nss, fromjson(cmdStr), isExplain));
-    auto baseCq = assertGet(CanonicalQuery::canonicalize(lpq.release()));
+    auto baseCq = assertGet(
+        CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackDisallowExtensions()));
 
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
-    auto childCq = assertGet(CanonicalQuery::canonicalize(*baseCq, firstClauseExpr));
+    auto childCq = assertGet(CanonicalQuery::canonicalize(
+        *baseCq, firstClauseExpr, ExtensionsCallbackDisallowExtensions()));
 
-    BSONObjBuilder expectedFilterBuilder;
-    firstClauseExpr->toBSON(&expectedFilterBuilder);
-    BSONObj expectedFilter = expectedFilterBuilder.obj();
+    // Descriptive test. The childCq's filter should be the relevant $or clause, rather than the
+    // entire query predicate.
+    ASSERT_EQ(childCq->getParsed().getFilter(), baseCq->getParsed().getFilter());
 
-    ASSERT_EQ(childCq->getParsed().getFilter(), expectedFilter);
     ASSERT_EQ(childCq->getParsed().getProj(), baseCq->getParsed().getProj());
     ASSERT_EQ(childCq->getParsed().getSort(), baseCq->getParsed().getSort());
     ASSERT_TRUE(childCq->getParsed().isExplain());

@@ -195,12 +195,15 @@ enum WorkingSetComputedDataType {
     // What's the distance from a geoNear query point to the document?
     WSM_COMPUTED_GEO_DISTANCE = 1,
 
-    // The index key used to retrieve the document, for $returnKey query option.
+    // The index key used to retrieve the document, for returnKey query option.
     WSM_INDEX_KEY = 2,
 
     // What point (of several possible points) was used to compute the distance to the document
     // via geoNear?
     WSM_GEO_NEAR_POINT = 3,
+
+    // Comparison key for sorting.
+    WSM_SORT_KEY = 4,
 
     // Must be last.
     WSM_COMPUTED_NUM_TYPES,
@@ -288,10 +291,12 @@ public:
     bool hasOwnedObj() const;
 
     /**
-     * Ensures that 'obj' is owned BSON. Only valid to call on a working set member in LOC_AND_OBJ
-     * state. No-op if 'obj' is already owned.
+     * Ensures that 'obj' of a WSM in the LOC_AND_OBJ state is owned BSON. It is a no-op if the WSM
+     * is in a different state or if 'obj' is already owned.
+     *
+     * It is also a no-op if the active storage engine doesn't support document-level concurrency.
      */
-    void makeObjOwned();
+    void makeObjOwnedIfNeeded();
 
     //
     // Computed data

@@ -32,6 +32,7 @@
 
 #include <set>
 
+#include "mongo/bson/json.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/sasl_client_authenticate.h"
@@ -40,7 +41,7 @@
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/logger/parse_log_component_settings.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -580,20 +581,15 @@ public:
     }
 } clusterAuthModeSetting;
 
-ExportedServerParameter<bool> QuietSetting(
-    ServerParameterSet::getGlobal(), "quiet", &serverGlobalParams.quiet, true, true);
+ExportedServerParameter<bool, ServerParameterType::kStartupAndRuntime> QuietSetting(
+    ServerParameterSet::getGlobal(), "quiet", &serverGlobalParams.quiet);
 
-ExportedServerParameter<int> MaxConsecutiveFailedChecksSetting(
+ExportedServerParameter<int, ServerParameterType::kRuntimeOnly> MaxConsecutiveFailedChecksSetting(
     ServerParameterSet::getGlobal(),
     "replMonitorMaxFailedChecks",
-    &ReplicaSetMonitor::maxConsecutiveFailedChecks,
-    false,  // allowedToChangeAtStartup
-    true);  // allowedToChangeAtRuntime
+    &ReplicaSetMonitor::maxConsecutiveFailedChecks);
 
-ExportedServerParameter<bool> TraceExceptionsSetting(ServerParameterSet::getGlobal(),
-                                                     "traceExceptions",
-                                                     &DBException::traceExceptions,
-                                                     false,  // allowedToChangeAtStartup
-                                                     true);  // allowedToChangeAtRuntime
+ExportedServerParameter<bool, ServerParameterType::kRuntimeOnly> TraceExceptionsSetting(
+    ServerParameterSet::getGlobal(), "traceExceptions", &DBException::traceExceptions);
 }
 }

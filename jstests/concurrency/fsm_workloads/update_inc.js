@@ -49,16 +49,23 @@ var $config = (function() {
                 }
             }
 
-            ++this.count;
+            // The $inc operator always modifies the matched document, so if we matched something,
+            // then we must have updated it.
+            this.count += (res.nMatched >= 1);
         },
 
         find: function find(db, collName) {
             var docs = db[collName].find().toArray();
             assertWhenOwnColl.eq(1, docs.length);
-            assertWhenOwnColl((function() {
+            assertWhenOwnColl(() => {
+                // If the document hasn't been updated at all, then the field won't exist.
                 var doc = docs[0];
-                assertWhenOwnColl.eq(this.count, doc[this.fieldName]);
-            }).bind(this));
+                if (doc.hasOwnProperty(this.fieldName)) {
+                    assertWhenOwnColl.eq(this.count, doc[this.fieldName]);
+                } else {
+                    assertWhenOwnColl.eq(this.count, 0);
+                }
+            });
         }
     };
 
@@ -69,7 +76,13 @@ var $config = (function() {
     };
 
     function setup(db, collName, cluster) {
-        db[collName].insert({ _id: this.id });
+        var doc = { _id: this.id };
+
+        // Pre-populate the fields we need to avoid size change for capped collections.
+        for (var i = 0; i < this.threadCount; ++i) {
+            doc['t' + i] = 0;
+        }
+        db[collName].insert(doc);
     }
 
     return {

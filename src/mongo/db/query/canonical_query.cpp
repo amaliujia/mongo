@@ -102,21 +102,20 @@ bool matchExpressionLessThan(const MatchExpression* lhs, const MatchExpression* 
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
-    const BSONObj& query,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
+    NamespaceString nss, const BSONObj& query, const ExtensionsCallback& extensionsCallback) {
     const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(ns, query, emptyObj, emptyObj, 0, 0, whereCallback);
+    return CanonicalQuery::canonicalize(
+        std::move(nss), query, emptyObj, emptyObj, 0, 0, extensionsCallback);
 }
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
+    NamespaceString nss,
     const BSONObj& query,
     bool explain,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
+    const ExtensionsCallback& extensionsCallback) {
     const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(ns,
+    return CanonicalQuery::canonicalize(std::move(nss),
                                         query,
                                         emptyObj,  // sort
                                         emptyObj,  // projection
@@ -127,56 +126,58 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                                         emptyObj,  // max
                                         false,     // snapshot
                                         explain,
-                                        whereCallback);
+                                        extensionsCallback);
 }
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
+    NamespaceString nss,
     const BSONObj& query,
     long long skip,
     long long limit,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(ns, query, emptyObj, emptyObj, skip, limit, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    return CanonicalQuery::canonicalize(ns, query, sort, proj, 0, 0, whereCallback);
-}
-
-// static
-StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
-    const BSONObj& query,
-    const BSONObj& sort,
-    const BSONObj& proj,
-    long long skip,
-    long long limit,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
+    const ExtensionsCallback& extensionsCallback) {
     const BSONObj emptyObj;
     return CanonicalQuery::canonicalize(
-        ns, query, sort, proj, skip, limit, emptyObj, whereCallback);
+        std::move(nss), query, emptyObj, emptyObj, skip, limit, extensionsCallback);
 }
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
+    NamespaceString nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    const BSONObj& proj,
+    const ExtensionsCallback& extensionsCallback) {
+    return CanonicalQuery::canonicalize(
+        std::move(nss), query, sort, proj, 0, 0, extensionsCallback);
+}
+
+// static
+StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
+    NamespaceString nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    const BSONObj& proj,
+    long long skip,
+    long long limit,
+    const ExtensionsCallback& extensionsCallback) {
+    const BSONObj emptyObj;
+    return CanonicalQuery::canonicalize(
+        std::move(nss), query, sort, proj, skip, limit, emptyObj, extensionsCallback);
+}
+
+// static
+StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
+    NamespaceString nss,
     const BSONObj& query,
     const BSONObj& sort,
     const BSONObj& proj,
     long long skip,
     long long limit,
     const BSONObj& hint,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
+    const ExtensionsCallback& extensionsCallback) {
     const BSONObj emptyObj;
-    return CanonicalQuery::canonicalize(ns,
+    return CanonicalQuery::canonicalize(std::move(nss),
                                         query,
                                         sort,
                                         proj,
@@ -187,7 +188,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                                         emptyObj,
                                         false,  // snapshot
                                         false,  // explain
-                                        whereCallback);
+                                        extensionsCallback);
 }
 
 //
@@ -196,24 +197,24 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const QueryMessage& qm, const MatchExpressionParser::WhereCallback& whereCallback) {
+    const QueryMessage& qm, const ExtensionsCallback& extensionsCallback) {
     // Make LiteParsedQuery.
     auto lpqStatus = LiteParsedQuery::fromLegacyQueryMessage(qm);
     if (!lpqStatus.isOK()) {
         return lpqStatus.getStatus();
     }
 
-    return CanonicalQuery::canonicalize(lpqStatus.getValue().release(), whereCallback);
+    return CanonicalQuery::canonicalize(lpqStatus.getValue().release(), extensionsCallback);
 }
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    LiteParsedQuery* lpq, const MatchExpressionParser::WhereCallback& whereCallback) {
+    LiteParsedQuery* lpq, const ExtensionsCallback& extensionsCallback) {
     std::unique_ptr<LiteParsedQuery> autoLpq(lpq);
 
     // Make MatchExpression.
     StatusWithMatchExpression statusWithMatcher =
-        MatchExpressionParser::parse(autoLpq->getFilter(), whereCallback);
+        MatchExpressionParser::parse(autoLpq->getFilter(), extensionsCallback);
     if (!statusWithMatcher.isOK()) {
         return statusWithMatcher.getStatus();
     }
@@ -222,7 +223,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
 
-    Status initStatus = cq->init(autoLpq.release(), whereCallback, me.release());
+    Status initStatus = cq->init(autoLpq.release(), extensionsCallback, me.release());
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -234,20 +235,15 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     const CanonicalQuery& baseQuery,
     MatchExpression* root,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
-    // Obtain filter for our LPQ by serializing the new match expression root.
-    BSONObjBuilder bob;
-    root->toBSON(&bob);
-    BSONObj filter = bob.obj();
-
-    // Pass empty sort and projection.
+    const ExtensionsCallback& extensionsCallback) {
+    // TODO: we should be passing the filter corresponding to 'root' to the LPQ rather than the base
+    // query's filter, baseQuery.getParsed().getFilter().
     BSONObj emptyObj;
-
     auto lpqStatus = LiteParsedQuery::makeAsOpQuery(baseQuery.nss(),
                                                     0,  // ntoskip
                                                     0,  // ntoreturn
                                                     0,  // queryOptions
-                                                    filter,
+                                                    baseQuery.getParsed().getFilter(),
                                                     baseQuery.getParsed().getProj(),
                                                     baseQuery.getParsed().getSort(),
                                                     emptyObj,  // hint
@@ -261,8 +257,8 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
-    Status initStatus =
-        cq->init(lpqStatus.getValue().release(), whereCallback, root->shallowClone().release());
+    Status initStatus = cq->init(
+        lpqStatus.getValue().release(), extensionsCallback, root->shallowClone().release());
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -272,7 +268,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
 // static
 StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
-    const std::string& ns,
+    NamespaceString nss,
     const BSONObj& query,
     const BSONObj& sort,
     const BSONObj& proj,
@@ -283,22 +279,12 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     const BSONObj& maxObj,
     bool snapshot,
     bool explain,
-    const MatchExpressionParser::WhereCallback& whereCallback) {
+    const ExtensionsCallback& extensionsCallback) {
     // Pass empty sort and projection.
     BSONObj emptyObj;
 
-    auto lpqStatus = LiteParsedQuery::makeAsOpQuery(NamespaceString(ns),
-                                                    skip,
-                                                    limit,
-                                                    0,
-                                                    query,
-                                                    proj,
-                                                    sort,
-                                                    hint,
-                                                    minObj,
-                                                    maxObj,
-                                                    snapshot,
-                                                    explain);
+    auto lpqStatus = LiteParsedQuery::makeAsOpQuery(
+        std::move(nss), skip, limit, 0, query, proj, sort, hint, minObj, maxObj, snapshot, explain);
     if (!lpqStatus.isOK()) {
         return lpqStatus.getStatus();
     }
@@ -307,7 +293,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
     // Build a parse tree from the BSONObj in the parsed query.
     StatusWithMatchExpression statusWithMatcher =
-        MatchExpressionParser::parse(lpq->getFilter(), whereCallback);
+        MatchExpressionParser::parse(lpq->getFilter(), extensionsCallback);
     if (!statusWithMatcher.isOK()) {
         return statusWithMatcher.getStatus();
     }
@@ -315,7 +301,7 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
-    Status initStatus = cq->init(lpq.release(), whereCallback, me.release());
+    Status initStatus = cq->init(lpq.release(), extensionsCallback, me.release());
 
     if (!initStatus.isOK()) {
         return initStatus;
@@ -324,9 +310,11 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
 }
 
 Status CanonicalQuery::init(LiteParsedQuery* lpq,
-                            const MatchExpressionParser::WhereCallback& whereCallback,
+                            const ExtensionsCallback& extensionsCallback,
                             MatchExpression* root) {
     _pq.reset(lpq);
+
+    _hasNoopExtensions = extensionsCallback.hasNoopExtensions();
 
     // Normalize, sort and validate tree.
     root = normalizeTree(root);
@@ -341,11 +329,16 @@ Status CanonicalQuery::init(LiteParsedQuery* lpq,
     // Validate the projection if there is one.
     if (!_pq->getProj().isEmpty()) {
         ParsedProjection* pp;
-        Status projStatus = ParsedProjection::make(_pq->getProj(), _root.get(), &pp, whereCallback);
+        Status projStatus =
+            ParsedProjection::make(_pq->getProj(), _root.get(), &pp, extensionsCallback);
         if (!projStatus.isOK()) {
             return projStatus;
         }
         _proj.reset(pp);
+    }
+
+    if (_proj && _proj->wantSortKey() && _pq->getSort().isEmpty()) {
+        return Status(ErrorCodes::BadValue, "cannot use sortKey $meta projection without a sort");
     }
 
     return Status::OK();
@@ -583,7 +576,13 @@ std::string CanonicalQuery::toString() const {
         ss << " limit=" << *_pq->getLimit();
     }
 
-    ss << " skip=" << _pq->getSkip() << "\n";
+    if (_pq->getSkip()) {
+        ss << " skip=" << *_pq->getSkip();
+    }
+
+    if (_pq->getNToReturn()) {
+        ss << " ntoreturn=" << *_pq->getNToReturn() << '\n';
+    }
 
     // The expression tree puts an endl on for us.
     ss << "Tree: " << _root->toString();
@@ -595,7 +594,7 @@ std::string CanonicalQuery::toString() const {
 std::string CanonicalQuery::toStringShort() const {
     str::stream ss;
     ss << "query: " << _pq->getFilter().toString() << " sort: " << _pq->getSort().toString()
-       << " projection: " << _pq->getProj().toString() << " skip: " << _pq->getSkip();
+       << " projection: " << _pq->getProj().toString();
 
     if (_pq->getBatchSize()) {
         ss << " batchSize: " << *_pq->getBatchSize();
@@ -603,6 +602,14 @@ std::string CanonicalQuery::toStringShort() const {
 
     if (_pq->getLimit()) {
         ss << " limit: " << *_pq->getLimit();
+    }
+
+    if (_pq->getSkip()) {
+        ss << " skip: " << *_pq->getSkip();
+    }
+
+    if (_pq->getNToReturn()) {
+        ss << " ntoreturn=" << *_pq->getNToReturn();
     }
 
     return ss;

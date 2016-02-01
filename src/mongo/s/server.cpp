@@ -52,22 +52,23 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/startup_warnings_common.h"
-#include "mongo/executor/network_interface_factory.h"
-#include "mongo/executor/task_executor.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
-#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/s/catalog/forwarding_catalog_manager.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
-#include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/mongos_options.h"
+#include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/request.h"
+#include "mongo/s/sharding_initialization.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -77,6 +78,7 @@
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -88,6 +90,8 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/static_observer.h"
 #include "mongo/util/stringutils.h"
+#include "mongo/util/system_clock_source.h"
+#include "mongo/util/system_tick_source.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
@@ -108,11 +112,6 @@ bool dbexitCalled = false;
 
 bool inShutdown() {
     return dbexitCalled;
-}
-
-bool haveLocalShardingInfo(Client* client, const string& ns) {
-    verify(0);
-    return false;
 }
 
 static BSONObj buildErrReply(const DBException& ex) {
@@ -136,15 +135,16 @@ public:
     virtual void process(Message& m, AbstractMessagingPort* p) {
         verify(p);
         Request r(m, p);
+        auto txn = cc().makeOperationContext();
 
         try {
-            r.init();
-            r.process();
+            r.init(txn.get());
+            r.process(txn.get());
         } catch (const AssertionException& ex) {
             LOG(ex.isUserAssertion() ? 1 : 0) << "Assertion failed"
-                                              << " while processing " << opToString(m.operation())
-                                              << " op"
-                                              << " for " << r.getns() << causedBy(ex);
+                                              << " while processing "
+                                              << networkOpToString(m.operation()) << " op"
+                                              << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
                 m.header().setId(r.id());
@@ -155,8 +155,8 @@ public:
             LastError::get(cc()).setLastError(ex.getCode(), ex.what());
         } catch (const DBException& ex) {
             log() << "Exception thrown"
-                  << " while processing " << opToString(m.operation()) << " op"
-                  << " for " << r.getns() << causedBy(ex);
+                  << " while processing " << networkOpToString(m.operation()) << " op"
+                  << " for " << r.getnsIfPresent() << causedBy(ex);
 
             if (r.expectResponse()) {
                 m.header().setId(r.id());
@@ -170,22 +170,11 @@ public:
         // Release connections back to pool, if any still cached
         ShardConnection::releaseMyConnections();
     }
+
+    virtual void close() {
+        Client::destroy();
+    }
 };
-
-void start(const MessageServer::Options& opts) {
-    balancer.go();
-    cursorCache.startTimeoutThread();
-    UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
-    cacheInvalidatorThread.go();
-
-    PeriodicTask::startRunningPeriodicTasks();
-
-    ShardedMessageHandler handler;
-    MessageServer* server = createServer(opts, &handler);
-    server->setAsTimeTracker();
-    server->setupSockets();
-    server->run();
-}
 
 DBClientBase* createDirectClient(OperationContext* txn) {
     uassert(10197, "createDirectClient not implemented for sharding yet", 0);
@@ -196,18 +185,45 @@ DBClientBase* createDirectClient(OperationContext* txn) {
 
 using namespace mongo;
 
-static ExitCode runMongosServer(bool doUpgrade) {
-    setThreadName("mongosMain");
+static Status initializeSharding(OperationContext* txn) {
+    Status status = initializeGlobalShardingState(txn, mongosGlobalParams.configdbs, true);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    auto catalogManager = grid.catalogManager(txn);
+    status = catalogManager->initConfigVersion(txn);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
+
+static void _initWireSpec() {
+    WireSpec& spec = WireSpec::instance();
+    // accept from any version
+    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
+    spec.maxWireVersionIncoming = FIND_COMMAND;
+    // connect to version supporting Find Command only
+    spec.minWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionOutgoing = FIND_COMMAND;
+}
+
+static ExitCode runMongosServer() {
+    Client::initThread("mongosMain");
     printShardingVersionInfo(false);
+
+    _initWireSpec();
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHook(false));
     shardConnectionPool.addHook(new ShardingConnectionHook(true));
 
-    // Mongos shouldn't lazily kill cursors, otherwise we can end up with extras from migration
-    DBClientConnection::setLazyKillCursor(false);
-
-    ReplicaSetMonitor::setConfigChangeHook(&ConfigServer::replicaSetChange);
+    ReplicaSetMonitor::setAsynchronousConfigChangeHook(
+        &ConfigServer::replicaSetChangeConfigServerUpdateHook);
+    ReplicaSetMonitor::setSynchronousConfigChangeHook(
+        &ConfigServer::replicaSetChangeShardRegistryUpdateHook);
 
     // Mongos connection pools already takes care of authenticating new connections so the
     // replica set connection shouldn't need to.
@@ -217,45 +233,21 @@ static ExitCode runMongosServer(bool doUpgrade) {
         dbexit(EXIT_BADOPTIONS);
     }
 
-    auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
-
     {
-        Status statusCatalogManagerInit = catalogManager->init(mongosGlobalParams.configdbs);
-        if (!statusCatalogManagerInit.isOK()) {
-            error() << "couldn't initialize catalog manager " << statusCatalogManagerInit;
+        auto txn = cc().makeOperationContext();
+        Status status = initializeSharding(txn.get());
+        if (!status.isOK()) {
+            if (status == ErrorCodes::CallbackCanceled) {
+                invariant(inShutdown());
+                log() << "Shutdown called before mongos finished starting up";
+                return EXIT_CLEAN;
+            }
+            error() << "Error initializing sharding system: " << status;
             return EXIT_SHARDING_ERROR;
         }
+
+        ConfigServer::reloadSettings(txn.get());
     }
-
-    auto shardRegistry(stdx::make_unique<ShardRegistry>(
-        stdx::make_unique<RemoteCommandTargeterFactoryImpl>(),
-        stdx::make_unique<repl::ReplicationExecutor>(
-            executor::makeNetworkInterface().release(), nullptr, 0),
-        nullptr,
-        catalogManager.get()));
-    shardRegistry->startup();
-
-    grid.init(std::move(catalogManager), std::move(shardRegistry));
-
-    {
-        auto upgradeStatus = grid.catalogManager()->checkAndUpgrade(!doUpgrade);
-        if (!upgradeStatus.isOK()) {
-            error() << causedBy(upgradeStatus);
-            return EXIT_SHARDING_ERROR;
-        }
-
-        if (doUpgrade) {
-            return EXIT_CLEAN;
-        }
-
-        Status startupStatus = grid.catalogManager()->startup();
-        if (!startupStatus.isOK()) {
-            error() << "Mongos catalog manager startup failed: " << startupStatus;
-            return EXIT_SHARDING_ERROR;
-        }
-    }
-
-    ConfigServer::reloadSettings();
 
 #if !defined(_WIN32)
     mongo::signalForkSuccess();
@@ -270,19 +262,40 @@ static ExitCode runMongosServer(bool doUpgrade) {
         web.detach();
     }
 
+    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
+
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {
         error() << "Initializing authorization data failed: " << status;
         return EXIT_SHARDING_ERROR;
     }
 
+    balancer.go();
+    clusterCursorCleanupJob.go();
+
+    UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
+    {
+        auto txn = cc().makeOperationContext();
+        cacheInvalidatorThread.initialize(txn.get());
+        cacheInvalidatorThread.go();
+    }
+
+    PeriodicTask::startRunningPeriodicTasks();
+
     MessageServer::Options opts;
     opts.port = serverGlobalParams.port;
     opts.ipList = serverGlobalParams.bind_ip;
-    start(opts);
 
-    // listen() will return when exit code closes its socket.
-    return EXIT_NET_ERROR;
+    ShardedMessageHandler handler;
+    MessageServer* server = createServer(opts, &handler);
+    server->setAsTimeTracker();
+    if (!server->setupSockets()) {
+        return EXIT_NET_ERROR;
+    }
+    server->run();
+
+    // MessageServer::run will return when exit code closes its socket
+    return inShutdown() ? EXIT_CLEAN : EXIT_NET_ERROR;
 }
 
 MONGO_INITIALIZER_GENERAL(ForkServer,
@@ -337,15 +350,7 @@ static int _main() {
     }
 #endif
 
-    ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
-
-    // To maintain backwards compatibility, we exit with EXIT_NET_ERROR if the listener loop
-    // returns.
-    if (exitCode == EXIT_NET_ERROR) {
-        dbexit(EXIT_NET_ERROR);
-    }
-
-    return (exitCode == EXIT_CLEAN) ? 0 : 1;
+    return runMongosServer();
 }
 
 #if defined(_WIN32)
@@ -354,11 +359,7 @@ static ExitCode initService() {
     ntservice::reportStatus(SERVICE_RUNNING);
     log() << "Service running";
 
-    ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
-
-    // ignore EXIT_NET_ERROR on clean shutdown since we return this when the listening socket
-    // is closed
-    return (exitCode == EXIT_NET_ERROR && inShutdown()) ? EXIT_CLEAN : exitCode;
+    return runMongosServer();
 }
 }  // namespace mongo
 #endif
@@ -375,6 +376,8 @@ MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* c
 
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+    getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
+    getGlobalServiceContext()->setClockSource(stdx::make_unique<SystemClockSource>());
     return Status::OK();
 }
 
@@ -393,7 +396,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     if (argc < 1)
         return EXIT_FAILURE;
 
-    setupSignalHandlers(false);
+    setupSignalHandlers();
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
@@ -404,7 +407,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     startupConfigActions(std::vector<std::string>(argv, argv + argc));
     cmdline_utils::censorArgvArray(argc, argv);
 
-    mongo::logCommonStartupWarnings();
+    mongo::logCommonStartupWarnings(serverGlobalParams);
 
     try {
         int exitCode = _main();
@@ -447,7 +450,21 @@ void mongo::signalShutdown() {
 
 void mongo::exitCleanly(ExitCode code) {
     // TODO: do we need to add anything?
-    grid.catalogManager()->shutDown();
+    {
+        Client& client = cc();
+        ServiceContext::UniqueOperationContext uniqueTxn;
+        OperationContext* txn = client.getOperationContext();
+        if (!txn) {
+            uniqueTxn = client.makeOperationContext();
+            txn = uniqueTxn.get();
+        }
+
+        auto cursorManager = grid.getCursorManager();
+        cursorManager->shutdown();
+        grid.shardRegistry()->shutdown();
+        grid.catalogManager(txn)->shutDown(txn);
+    }
+
     mongo::dbexit(code);
 }
 

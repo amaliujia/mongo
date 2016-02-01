@@ -31,17 +31,17 @@
 
 #include "mongo/s/catalog/legacy/distlock.h"
 
-#include "mongo/db/server_options.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/connpool.h"
 #include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/catalog/type_lockpings.h"
-#include "mongo/util/concurrency/thread_name.h"
-#include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+MONGO_FP_DECLARE(setSCCCDistLockTimeout);
 
 using std::endl;
 using std::list;
@@ -53,48 +53,6 @@ using std::vector;
 
 LabeledLevel DistributedLock::logLvl(1);
 DistributedLock::LastPings DistributedLock::lastPings;
-
-ThreadLocalValue<string> distLockIds("");
-
-/* ==================
- * Module initialization
- */
-
-static SimpleMutex _cachedProcessMutex;
-static string* _cachedProcessString = NULL;
-
-static void initModule() {
-    stdx::lock_guard<SimpleMutex> lk(_cachedProcessMutex);
-    if (_cachedProcessString) {
-        // someone got the lock before us
-        return;
-    }
-
-    // cache process string
-    stringstream ss;
-    ss << getHostName() << ":" << serverGlobalParams.port << ":" << time(0) << ":" << rand();
-    _cachedProcessString = new string(ss.str());
-}
-
-/* =================== */
-
-string getDistLockProcess() {
-    if (!_cachedProcessString)
-        initModule();
-    verify(_cachedProcessString);
-    return *_cachedProcessString;
-}
-
-string getDistLockId() {
-    string s = distLockIds.get();
-    if (s.empty()) {
-        stringstream ss;
-        ss << getDistLockProcess() << ":" << getThreadName() << ":" << rand();
-        s = ss.str();
-        distLockIds.set(s);
-    }
-    return s;
-}
 
 LockException::LockException(StringData msg, int code) : LockException(msg, code, OID()) {}
 
@@ -111,18 +69,19 @@ DistLockHandle LockException::getMustUnlockID() const {
  */
 DistributedLock::DistributedLock(const ConnectionString& conn,
                                  const string& name,
-                                 unsigned long long lockTimeout,
-                                 bool asProcess)
+                                 const std::string& processId,
+                                 unsigned long long lockTimeout)
     : _conn(conn),
       _name(name),
-      _processId(asProcess ? getDistLockId() : getDistLockProcess()),
+      _processId(processId),
+      _lockId(str::stream() << _processId << ":" << getThreadName() << ":" << rand()),
       _lockTimeout(lockTimeout == 0 ? LOCK_TIMEOUT : lockTimeout),
       _maxClockSkew(_lockTimeout / LOCK_SKEW_FACTOR),
       _maxNetSkew(_maxClockSkew),
       _lockPing(_maxClockSkew) {
     LOG(logLvl) << "created new distributed lock for " << name << " on " << conn
                 << " ( lock timeout : " << _lockTimeout << ", ping interval : " << _lockPing
-                << ", process : " << asProcess << " )" << endl;
+                << ", processId: " << _processId << ", lockId: " << _lockId << " )";
 }
 
 DistLockPingInfo DistributedLock::LastPings::getLastPing(const ConnectionString& conn,
@@ -138,10 +97,6 @@ void DistributedLock::LastPings::setLastPing(const ConnectionString& conn,
     _lastPings[std::make_pair(conn.toString(), lockName)] = pd;
 }
 
-Date_t DistributedLock::getRemoteTime() const {
-    return DistributedLock::remoteTime(_conn, _maxNetSkew);
-}
-
 bool DistributedLock::isRemoteTimeSkewed() const {
     return !DistributedLock::checkSkew(_conn, NUM_LOCK_SKEW_CHECKS, _maxClockSkew, _maxNetSkew);
 }
@@ -152,6 +107,10 @@ const ConnectionString& DistributedLock::getRemoteConnection() const {
 
 const string& DistributedLock::getProcessId() const {
     return _processId;
+}
+
+const string& DistributedLock::getDistLockId() const {
+    return _lockId;
 }
 
 /**
@@ -242,10 +201,10 @@ bool DistributedLock::checkSkew(const ConnectionString& cluster,
             // Remote time can be delayed by at most MAX_NET_SKEW
 
             // Skew is how much time we'd have to add to local to get to remote
-            avgSkews[s] += (remote - local).count();
+            avgSkews[s] += durationCount<Milliseconds>(remote - local);
 
             LOG(logLvl + 1) << "skew from remote server " << server
-                            << " found: " << (remote - local).count();
+                            << " found: " << (remote - local);
         }
     }
 
@@ -299,7 +258,7 @@ Status DistributedLock::checkStatus(double timeout) {
                                     << " exists in the locks collection");
     }
 
-    if (lockObj[LocksType::state()].numberInt() < 2) {
+    if (lockObj[LocksType::state()].numberInt() < LocksType::LOCKED) {
         return Status(ErrorCodes::LockFailed,
                       str::stream() << "lock " << _name << " current state is not held ("
                                     << lockObj[LocksType::state()].numberInt() << ")");
@@ -330,12 +289,20 @@ static void logErrMsgOrWarn(StringData messagePrefix,
 // Semantics of this method are basically that if the lock cannot be acquired, returns false,
 // can be retried. If the lock should not be tried again (some unexpected error),
 // a LockException is thrown.
-bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout) {
+bool DistributedLock::lock_try(const OID& lockID,
+                               const string& why,
+                               BSONObj* other,
+                               double timeout) {
     // This should always be true, if not, we are using the lock incorrectly.
     verify(_name != "");
 
+    auto lockTimeout = _lockTimeout;
+    MONGO_FAIL_POINT_BLOCK(setSCCCDistLockTimeout, customTimeout) {
+        const BSONObj& data = customTimeout.getData();
+        lockTimeout = data["timeoutMs"].numberInt();
+    }
     LOG(logLvl) << "trying to acquire new distributed lock for " << _name << " on " << _conn
-                << " ( lock timeout : " << _lockTimeout << ", ping interval : " << _lockPing
+                << " ( lock timeout : " << lockTimeout << ", ping interval : " << _lockPing
                 << ", process : " << _processId << " )" << endl;
 
     // write to dummy if 'other' is null
@@ -347,7 +314,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
 
     BSONObjBuilder queryBuilder;
     queryBuilder.append(LocksType::name(), _name);
-    queryBuilder.append(LocksType::state(), 0);
+    queryBuilder.append(LocksType::state(), LocksType::UNLOCKED);
 
     {
         // make sure its there so we can use simple update logic below
@@ -359,7 +326,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                 LOG(logLvl) << "inserting initial doc in " << LocksType::ConfigNS << " for lock "
                             << _name << endl;
                 conn->insert(LocksType::ConfigNS,
-                             BSON(LocksType::name(_name) << LocksType::state(0)
+                             BSON(LocksType::name(_name) << LocksType::state(LocksType::UNLOCKED)
                                                          << LocksType::who("")
                                                          << LocksType::lockID(OID())));
             } catch (UserException& e) {
@@ -369,7 +336,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
         }
 
         // Case 2: A set lock that we might be able to force
-        else if (o[LocksType::state()].numberInt() > 0) {
+        else if (o[LocksType::state()].numberInt() > LocksType::UNLOCKED) {
             string lockName =
                 o[LocksType::name()].String() + string("/") + o[LocksType::process()].String();
 
@@ -384,7 +351,8 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
             }
 
             unsigned long long elapsed = 0;
-            unsigned long long takeover = _lockTimeout;
+            unsigned long long takeover = lockTimeout;
+
             DistLockPingInfo lastPingEntry = getLastPing();
 
             LOG(logLvl) << "checking last ping for lock '" << lockName << "' against process "
@@ -399,7 +367,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                 // Timeout the elapsed time using comparisons of remote clock
                 // For non-finalized locks, timeout 15 minutes since last seen (ts)
                 // For finalized locks, timeout 15 minutes since last ping
-                bool recPingChange = o[LocksType::state()].numberInt() == 2 &&
+                bool recPingChange = o[LocksType::state()].numberInt() == LocksType::LOCKED &&
                     (lastPingEntry.processId != pingDocProcessId ||
                      lastPingEntry.lastPing != pingDocPingValue);
                 bool recTSChange = lastPingEntry.lockSessionId != o[LocksType::lockID()].OID();
@@ -418,7 +386,8 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                     if (lastPingEntry.configLocalTime >= remote)
                         elapsed = 0;
                     else
-                        elapsed = (remote - lastPingEntry.configLocalTime).count();
+                        elapsed =
+                            durationCount<Milliseconds>(remote - lastPingEntry.configLocalTime);
                 }
             } catch (LockException& e) {
                 // Remote server cannot be found / is not responsive
@@ -461,9 +430,9 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                     // we can overwrite a new lock inserted in the meantime.
                     conn->update(LocksType::ConfigNS,
                                  BSON(LocksType::name(_name)
-                                      << LocksType::state(o[LocksType::state()].numberInt())
+                                      << LocksType::state() << o[LocksType::state()].numberInt()
                                       << LocksType::lockID(o[LocksType::lockID()].OID())),
-                                 BSON("$set" << BSON(LocksType::state(0))));
+                                 BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
 
                     BSONObj err = conn->getLastErrorDetailed();
                     string errMsg = DBClientWithCommands::getLastErrorString(err);
@@ -507,9 +476,9 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                     // Test the lock with the correct "ts" (OID) value
                     conn->update(LocksType::ConfigNS,
                                  BSON(LocksType::name(_name)
-                                      << LocksType::state(2)
+                                      << LocksType::state(LocksType::LOCKED)
                                       << LocksType::lockID(o[LocksType::lockID()].OID())),
-                                 BSON("$set" << BSON(LocksType::state(2))));
+                                 BSON("$set" << BSON(LocksType::state(LocksType::LOCKED))));
 
                     BSONObj err = conn->getLastErrorDetailed();
                     string errMsg = DBClientWithCommands::getLastErrorString(err);
@@ -566,9 +535,9 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
     BSONObj currLock;
 
     BSONObj lockDetails =
-        BSON(LocksType::state(1) << LocksType::who(getDistLockId())
-                                 << LocksType::process(_processId) << LocksType::when(jsTime())
-                                 << LocksType::why(why) << LocksType::lockID(OID::gen()));
+        BSON(LocksType::state(LocksType::LOCK_PREP)
+             << LocksType::who(getDistLockId()) << LocksType::process(_processId)
+             << LocksType::when(jsTime()) << LocksType::why(why) << LocksType::lockID(lockID));
     BSONObj whatIWant = BSON("$set" << lockDetails);
 
     BSONObj query = queryBuilder.obj();
@@ -614,23 +583,21 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
 
             try {
                 indUpdate = indDB->findOne(LocksType::ConfigNS, BSON(LocksType::name(_name)));
-
+                const auto currentLockID = indUpdate[LocksType::lockID()].OID();
                 // If we override this lock in any way, grab and protect it.
                 // We assume/ensure that if a process does not have all lock documents, it is no
                 // longer holding the lock.
                 // Note - finalized locks may compete too, but we know they've won already if
                 // competing in this round.  Cleanup of crashes during finalizing may take a few
                 // tries.
-                if (indUpdate[LocksType::lockID()] < lockDetails[LocksType::lockID()] ||
-                    indUpdate[LocksType::state()].numberInt() == 0) {
+                if (currentLockID < lockID ||
+                    indUpdate[LocksType::state()].numberInt() == LocksType::UNLOCKED) {
                     BSONObj grabQuery =
-                        BSON(LocksType::name(_name)
-                             << LocksType::lockID(indUpdate[LocksType::lockID()].OID()));
+                        BSON(LocksType::name(_name) << LocksType::lockID(currentLockID));
 
                     // Change ts so we won't be forced, state so we won't be relocked
                     BSONObj grabChanges =
-                        BSON(LocksType::lockID(lockDetails[LocksType::lockID()].OID())
-                             << LocksType::state(1));
+                        BSON(LocksType::lockID(lockID) << LocksType::state(LocksType::LOCK_PREP));
 
                     // Either our update will succeed, and we'll grab the lock, or it will fail b/c
                     // some other process grabbed the lock (which will change the ts), but the lock
@@ -643,7 +610,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                     // One case this could happen is when the LockPinger processes old
                     // entries from addUnlockOID. See SERVER-10688 for more detailed
                     // description of race.
-                    if (indUpdate[LocksType::state()].numberInt() <= 0) {
+                    if (indUpdate[LocksType::state()].numberInt() <= LocksType::UNLOCKED) {
                         LOG(logLvl - 1) << "lock tournament interrupted, "
                                         << "so no lock was taken; "
                                         << "new state of lock: " << indUpdate << endl;
@@ -664,7 +631,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
                 string msg(str::stream() << "distributed lock " << lockName
                                          << " had errors communicating with individual server "
                                          << up[1].first << causedBy(e));
-                throw LockException(msg, 13661);
+                throw LockException(msg, 13661, lockID);
             }
 
             verify(!indUpdate.isEmpty());
@@ -680,7 +647,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
 
         // Locks on all servers are now set and safe until forcing
 
-        if (currLock[LocksType::lockID()] == lockDetails[LocksType::lockID()]) {
+        if (currLock[LocksType::lockID()].OID() == lockID) {
             LOG(logLvl - 1) << "lock update won, completing lock propagation for '" << lockName
                             << "'" << endl;
             gotLock = true;
@@ -693,7 +660,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
         conn.done();
         string msg(str::stream() << "exception creating distributed lock " << lockName
                                  << causedBy(e));
-        throw LockException(msg, 13663);
+        throw LockException(msg, 13663, lockID);
     }
 
     // Complete lock propagation
@@ -710,13 +677,14 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
             while (bi.more()) {
                 BSONElement el = bi.next();
                 if ((string)(el.fieldName()) == LocksType::state())
-                    finalLockDetails.append(LocksType::state(), 2);
+                    finalLockDetails.append(LocksType::state(), LocksType::LOCKED);
                 else
                     finalLockDetails.append(el);
             }
 
             conn->update(LocksType::ConfigNS,
-                         BSON(LocksType::name(_name)),
+                         BSON(LocksType::name(_name) << LocksType::state()
+                                                     << BSON("$eq" << LocksType::LOCK_PREP)),
                          BSON("$set" << finalLockDetails.obj()));
 
             BSONObj err = conn->getLastErrorDetailed();
@@ -724,10 +692,11 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
 
             currLock = conn->findOne(LocksType::ConfigNS, BSON(LocksType::name(_name)));
 
-            if (!errMsg.empty() || !err["n"].type() || err["n"].numberInt() < 1) {
+            if (!errMsg.empty() || !err["n"].type() || err["n"].numberInt() < 1 ||
+                currLock[LocksType::lockID()].OID() != lockID) {
                 warning() << "could not finalize winning lock " << lockName
                           << (!errMsg.empty() ? causedBy(errMsg) : " (did not update lock) ")
-                          << endl;
+                          << ", winning lock: " << currLock;
                 gotLock = false;
             } else {
                 // SUCCESS!
@@ -738,7 +707,7 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
             conn.done();
             string msg(str::stream() << "exception finalizing winning lock" << causedBy(e));
             // Inform caller about the potential orphan lock.
-            throw LockException(msg, 13662, lockDetails[LocksType::lockID()].OID());
+            throw LockException(msg, 13662, lockID);
         }
     }
 
@@ -747,10 +716,10 @@ bool DistributedLock::lock_try(const string& why, BSONObj* other, double timeout
 
     // Log our lock results
     if (gotLock)
-        LOG(logLvl - 1) << "distributed lock '" << lockName
-                        << "' acquired, ts : " << currLock[LocksType::lockID()].OID() << endl;
+        LOG(logLvl - 1) << "distributed lock '" << lockName << "' acquired for '" << why
+                        << "', ts : " << currLock[LocksType::lockID()].OID();
     else
-        LOG(logLvl - 1) << "distributed lock '" << lockName << "' was not acquired." << endl;
+        LOG(logLvl - 1) << "distributed lock '" << lockName << "' was not acquired.";
 
     conn.done();
 
@@ -777,7 +746,7 @@ bool DistributedLock::unlock(const DistLockHandle& lockID) {
             // Use ts when updating lock, so that new locks can be sure they won't get trampled.
             conn->update(LocksType::ConfigNS,
                          BSON(LocksType::name(_name) << LocksType::lockID(lockID)),
-                         BSON("$set" << BSON(LocksType::state(0))));
+                         BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
 
             // Check that the lock was actually unlocked... if not, try again
             BSONObj err = conn->getLastErrorDetailed();

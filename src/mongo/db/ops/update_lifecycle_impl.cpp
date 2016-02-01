@@ -36,15 +36,14 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
 namespace {
 
 std::shared_ptr<CollectionMetadata> getMetadata(const NamespaceString& nsString) {
-    if (shardingState.enabled()) {
-        return shardingState.getCollectionMetadata(nsString.ns());
+    if (ShardingState::get(getGlobalServiceContext())->enabled()) {
+        return ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(nsString.ns());
     }
 
     return nullptr;
@@ -69,12 +68,12 @@ bool UpdateLifecycleImpl::canContinue() const {
 
 const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys(OperationContext* opCtx) const {
     if (_collection)
-        return &_collection->infoCache()->indexKeys(opCtx);
+        return &_collection->infoCache()->getIndexKeys(opCtx);
     return NULL;
 }
 
 const std::vector<FieldRef*>* UpdateLifecycleImpl::getImmutableFields() const {
-    CollectionMetadataPtr metadata = getMetadata(_nsString);
+    std::shared_ptr<CollectionMetadata> metadata = getMetadata(_nsString);
     if (metadata) {
         const std::vector<FieldRef*>& fields = metadata->getKeyPatternFields();
         // Return shard-keys as immutable for the update system.

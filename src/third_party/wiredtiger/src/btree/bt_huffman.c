@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -134,7 +134,7 @@ static int __wt_huffman_read(WT_SESSION_IMPL *,
  */
 static int
 __huffman_confchk_file(
-    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *v, int *is_utf8p, FILE **fpp)
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *v, bool *is_utf8p, FILE **fpp)
 {
 	FILE *fp;
 	WT_DECL_RET;
@@ -302,7 +302,7 @@ __wt_huffman_read(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *ip,
 	WT_DECL_RET;
 	int64_t symbol, frequency;
 	u_int entries, lineno;
-	int is_utf8;
+	bool is_utf8;
 
 	*tablep = NULL;
 	*entriesp = *numbytesp = 0;
@@ -332,11 +332,17 @@ __wt_huffman_read(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *ip,
 	for (tp = table, lineno = 1; (ret =
 	    fscanf(fp, "%" SCNi64 " %" SCNi64, &symbol, &frequency)) != EOF;
 	    ++tp, ++lineno) {
-		if (lineno > entries)
+		/*
+		 * Entries is 0-based, that is, there are (entries +1) possible
+		 * values that can be configured. The line number is 1-based, so
+		 * adjust the test for too many entries, and report (entries +1)
+		 * in the error as the maximum possible number of entries.
+		 */
+		if (lineno > entries + 1)
 			WT_ERR_MSG(session, EINVAL,
 			    "Huffman table file %.*s is corrupted, "
 			    "more than %" PRIu32 " entries",
-			    (int)ip->len, ip->str, entries);
+			    (int)ip->len, ip->str, entries + 1);
 		if (ret != 2)
 			WT_ERR_MSG(session, EINVAL,
 			    "line %u of Huffman table file %.*s is corrupted: "

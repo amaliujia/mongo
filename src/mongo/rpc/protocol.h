@@ -36,6 +36,7 @@
 
 namespace mongo {
 class BSONObj;
+class OperationContext;
 namespace rpc {
 
 /**
@@ -77,6 +78,16 @@ const ProtocolSet kAll = kOpQueryOnly | kOpCommandOnly;
 }  // namespace supports
 
 /**
+ * Returns the protocol used to initiate the current operation.
+ */
+Protocol getOperationProtocol(OperationContext* txn);
+
+/**
+ * Sets the protocol used to initiate the current operation.
+ */
+void setOperationProtocol(OperationContext* txn, Protocol protocol);
+
+/**
  * Returns the newest protocol supported by two parties.
  */
 StatusWith<Protocol> negotiate(ProtocolSet fst, ProtocolSet snd);
@@ -100,6 +111,16 @@ StatusWith<ProtocolSet> parseProtocolSet(StringData repr);
  * Determines the ProtocolSet of a remote server from an isMaster reply.
  */
 StatusWith<ProtocolSet> parseProtocolSetFromIsMasterReply(const BSONObj& isMasterReply);
+
+/**
+ * Returns true if wire version supports OP_COMMAND in mongod (not mongos).
+ */
+bool supportsWireVersionForOpCommandInMongod(int minWireVersion, int maxWireVersion);
+
+/**
+  * Computes supported protocols from wire versions.
+  */
+ProtocolSet computeProtocolSet(int minWireVersion, int maxWireVersion);
 
 }  // namespace rpc
 }  // namespace mongo

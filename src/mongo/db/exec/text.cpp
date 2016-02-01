@@ -30,7 +30,6 @@
 
 #include <vector>
 
-#include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/text_or.h"
@@ -60,68 +59,23 @@ TextStage::TextStage(OperationContext* txn,
                      const TextStageParams& params,
                      WorkingSet* ws,
                      const MatchExpression* filter)
-    : _params(params), _textTreeRoot(buildTextTree(txn, ws, filter)), _commonStats(kStageType) {
+    : PlanStage(kStageType, txn), _params(params) {
+    _children.emplace_back(buildTextTree(txn, ws, filter));
     _specificStats.indexPrefix = _params.indexPrefix;
     _specificStats.indexName = _params.index->indexName();
     _specificStats.parsedTextQuery = _params.query.toBSON();
 }
 
-TextStage::~TextStage() {}
-
 bool TextStage::isEOF() {
-    return _textTreeRoot->isEOF();
+    return child()->isEOF();
 }
 
-PlanStage::StageState TextStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState TextStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
 
-    PlanStage::StageState stageState = _textTreeRoot->work(out);
-
-    // Increment common stats counters that are specific to the return value of work().
-    switch (stageState) {
-        case PlanStage::ADVANCED:
-            ++_commonStats.advanced;
-            break;
-        case PlanStage::NEED_TIME:
-            ++_commonStats.needTime;
-            break;
-        case PlanStage::NEED_YIELD:
-            ++_commonStats.needYield;
-            break;
-        default:
-            break;
-    }
-
-    return stageState;
-}
-
-void TextStage::saveState() {
-    ++_commonStats.yields;
-
-    _textTreeRoot->saveState();
-}
-
-void TextStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-
-    _textTreeRoot->restoreState(opCtx);
-}
-
-void TextStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-
-    _textTreeRoot->invalidate(txn, dl, type);
-}
-
-vector<PlanStage*> TextStage::getChildren() const {
-    return {_textTreeRoot.get()};
+    return child()->work(out);
 }
 
 unique_ptr<PlanStageStats> TextStage::getStats() {
@@ -129,12 +83,8 @@ unique_ptr<PlanStageStats> TextStage::getStats() {
 
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_TEXT);
     ret->specific = make_unique<TextStats>(_specificStats);
-    ret->children.push_back(_textTreeRoot->getStats().release());
+    ret->children.emplace_back(child()->getStats());
     return ret;
-}
-
-const CommonStats* TextStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* TextStage::getSpecificStats() const {
@@ -162,10 +112,8 @@ unique_ptr<PlanStage> TextStage::buildTextTree(OperationContext* txn,
         textScorer->addChild(make_unique<IndexScan>(txn, ixparams, ws, nullptr));
     }
 
-    auto fetcher = make_unique<FetchStage>(
-        txn, ws, textScorer.release(), nullptr, _params.index->getCollection());
-
-    auto matcher = make_unique<TextMatchStage>(std::move(fetcher), _params.query, _params.spec, ws);
+    auto matcher =
+        make_unique<TextMatchStage>(txn, std::move(textScorer), _params.query, _params.spec, ws);
 
     unique_ptr<PlanStage> treeRoot = std::move(matcher);
     return treeRoot;

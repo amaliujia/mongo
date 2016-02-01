@@ -263,17 +263,18 @@ bool wasMetadataRefreshed(const ChunkManagerPtr& managerA,
 
 }  // namespace
 
-ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss)
-    : _nss(nss), _needsTargetingRefresh(false) {}
+ChunkManagerTargeter::ChunkManagerTargeter(const NamespaceString& nss, TargeterStats* stats)
+    : _nss(nss), _needsTargetingRefresh(false), _stats(stats) {}
 
-Status ChunkManagerTargeter::init() {
-    auto status = grid.implicitCreateDb(_nss.db().toString());
+
+Status ChunkManagerTargeter::init(OperationContext* txn) {
+    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
 
     shared_ptr<DBConfig> config = status.getValue();
-    config->getChunkManagerOrPrimary(_nss.ns(), _manager, _primary);
+    config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
 
     return Status::OK();
 }
@@ -282,7 +283,9 @@ const NamespaceString& ChunkManagerTargeter::getNS() const {
     return _nss;
 }
 
-Status ChunkManagerTargeter::targetInsert(const BSONObj& doc, ShardEndpoint** endpoint) const {
+Status ChunkManagerTargeter::targetInsert(OperationContext* txn,
+                                          const BSONObj& doc,
+                                          ShardEndpoint** endpoint) const {
     BSONObj shardKey;
 
     if (_manager) {
@@ -310,7 +313,7 @@ Status ChunkManagerTargeter::targetInsert(const BSONObj& doc, ShardEndpoint** en
 
     // Target the shard key or database primary
     if (!shardKey.isEmpty()) {
-        return targetShardKey(shardKey, doc.objsize(), endpoint);
+        return targetShardKey(txn, shardKey, doc.objsize(), endpoint);
     } else {
         if (!_primary) {
             return Status(ErrorCodes::NamespaceNotFound,
@@ -323,7 +326,8 @@ Status ChunkManagerTargeter::targetInsert(const BSONObj& doc, ShardEndpoint** en
     }
 }
 
-Status ChunkManagerTargeter::targetUpdate(const BatchedUpdateDocument& updateDoc,
+Status ChunkManagerTargeter::targetUpdate(OperationContext* txn,
+                                          const BatchedUpdateDocument& updateDoc,
                                           vector<ShardEndpoint*>* endpoints) const {
     //
     // Update targeting may use either the query or the update.  This is to support save-style
@@ -411,17 +415,18 @@ Status ChunkManagerTargeter::targetUpdate(const BatchedUpdateDocument& updateDoc
         // We can't rely on our query targeting to be exact
         ShardEndpoint* endpoint = NULL;
         Status result =
-            targetShardKey(shardKey, (query.objsize() + updateExpr.objsize()), &endpoint);
+            targetShardKey(txn, shardKey, (query.objsize() + updateExpr.objsize()), &endpoint);
         endpoints->push_back(endpoint);
         return result;
     } else if (updateType == UpdateType_OpStyle) {
-        return targetQuery(query, endpoints);
+        return targetQuery(txn, query, endpoints);
     } else {
-        return targetDoc(updateExpr, endpoints);
+        return targetDoc(txn, updateExpr, endpoints);
     }
 }
 
-Status ChunkManagerTargeter::targetDelete(const BatchedDeleteDocument& deleteDoc,
+Status ChunkManagerTargeter::targetDelete(OperationContext* txn,
+                                          const BatchedDeleteDocument& deleteDoc,
                                           vector<ShardEndpoint*>* endpoints) const {
     BSONObj shardKey;
 
@@ -456,22 +461,24 @@ Status ChunkManagerTargeter::targetDelete(const BatchedDeleteDocument& deleteDoc
     if (!shardKey.isEmpty()) {
         // We can't rely on our query targeting to be exact
         ShardEndpoint* endpoint = NULL;
-        Status result = targetShardKey(shardKey, 0, &endpoint);
+        Status result = targetShardKey(txn, shardKey, 0, &endpoint);
         endpoints->push_back(endpoint);
         return result;
     } else {
-        return targetQuery(deleteDoc.getQuery(), endpoints);
+        return targetQuery(txn, deleteDoc.getQuery(), endpoints);
     }
 }
 
-Status ChunkManagerTargeter::targetDoc(const BSONObj& doc,
+Status ChunkManagerTargeter::targetDoc(OperationContext* txn,
+                                       const BSONObj& doc,
                                        vector<ShardEndpoint*>* endpoints) const {
     // NOTE: This is weird and fragile, but it's the way our language works right now -
     // documents are either A) invalid or B) valid equality queries over themselves.
-    return targetQuery(doc, endpoints);
+    return targetQuery(txn, doc, endpoints);
 }
 
-Status ChunkManagerTargeter::targetQuery(const BSONObj& query,
+Status ChunkManagerTargeter::targetQuery(OperationContext* txn,
+                                         const BSONObj& query,
                                          vector<ShardEndpoint*>* endpoints) const {
     if (!_primary && !_manager) {
         return Status(ErrorCodes::NamespaceNotFound,
@@ -482,7 +489,7 @@ Status ChunkManagerTargeter::targetQuery(const BSONObj& query,
     set<ShardId> shardIds;
     if (_manager) {
         try {
-            _manager->getShardIdsForQuery(shardIds, query);
+            _manager->getShardIdsForQuery(txn, query, &shardIds);
         } catch (const DBException& ex) {
             return ex.toStatus();
         }
@@ -498,17 +505,18 @@ Status ChunkManagerTargeter::targetQuery(const BSONObj& query,
     return Status::OK();
 }
 
-Status ChunkManagerTargeter::targetShardKey(const BSONObj& shardKey,
+Status ChunkManagerTargeter::targetShardKey(OperationContext* txn,
+                                            const BSONObj& shardKey,
                                             long long estDataSize,
                                             ShardEndpoint** endpoint) const {
     invariant(NULL != _manager);
 
-    ChunkPtr chunk = _manager->findIntersectingChunk(shardKey);
+    ChunkPtr chunk = _manager->findIntersectingChunk(txn, shardKey);
 
     // Track autosplit stats for sharded collections
     // Note: this is only best effort accounting and is not accurate.
     if (estDataSize > 0) {
-        _stats.chunkSizeDelta[chunk->getMin()] += estDataSize;
+        _stats->chunkSizeDelta[chunk->getMin()] += estDataSize;
     }
 
     *endpoint = new ShardEndpoint(chunk->getShardId(), _manager->getVersion(chunk->getShardId()));
@@ -577,13 +585,12 @@ void ChunkManagerTargeter::noteStaleResponse(const ShardEndpoint& endpoint,
         ChunkVersion& previouslyNotedVersion = it->second;
         if (previouslyNotedVersion.hasEqualEpoch(remoteShardVersion)) {
             if (previouslyNotedVersion.isOlderThan(remoteShardVersion)) {
-                remoteShardVersion.cloneTo(&previouslyNotedVersion);
+                previouslyNotedVersion = remoteShardVersion;
             }
         } else {
-            // Epoch changed midway while applying the batch so set the version to
-            // something unique and non-existent to force a reload when
-            // refreshIsNeeded is called.
-            ChunkVersion::IGNORED().cloneTo(&previouslyNotedVersion);
+            // Epoch changed midway while applying the batch so set the version to something unique
+            // and non-existent to force a reload when refreshIsNeeded is called.
+            previouslyNotedVersion = ChunkVersion::IGNORED();
         }
     }
 }
@@ -593,11 +600,7 @@ void ChunkManagerTargeter::noteCouldNotTarget() {
     _needsTargetingRefresh = true;
 }
 
-const TargeterStats* ChunkManagerTargeter::getStats() const {
-    return &_stats;
-}
-
-Status ChunkManagerTargeter::refreshIfNeeded(bool* wasChanged) {
+Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* txn, bool* wasChanged) {
     bool dummy;
     if (!wasChanged) {
         wasChanged = &dummy;
@@ -620,13 +623,13 @@ Status ChunkManagerTargeter::refreshIfNeeded(bool* wasChanged) {
     ChunkManagerPtr lastManager = _manager;
     ShardPtr lastPrimary = _primary;
 
-    auto status = grid.implicitCreateDb(_nss.db().toString());
+    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
 
     shared_ptr<DBConfig> config = status.getValue();
-    config->getChunkManagerOrPrimary(_nss.ns(), _manager, _primary);
+    config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
 
     // We now have the latest metadata from the cache.
 
@@ -649,7 +652,7 @@ Status ChunkManagerTargeter::refreshIfNeeded(bool* wasChanged) {
         // If didn't already refresh the targeting information, refresh it
         if (!alreadyRefreshed) {
             // To match previous behavior, we just need an incremental refresh here
-            return refreshNow(RefreshType_RefreshChunkManager);
+            return refreshNow(txn, RefreshType_RefreshChunkManager);
         }
 
         *wasChanged = isMetadataDifferent(lastManager, lastPrimary, _manager, _primary);
@@ -665,10 +668,10 @@ Status ChunkManagerTargeter::refreshIfNeeded(bool* wasChanged) {
 
         if (result == CompareResult_Unknown) {
             // Our current shard versions aren't all comparable to the old versions, maybe drop
-            return refreshNow(RefreshType_ReloadDatabase);
+            return refreshNow(txn, RefreshType_ReloadDatabase);
         } else if (result == CompareResult_LT) {
             // Our current shard versions are less than the remote versions, but no drop
-            return refreshNow(RefreshType_RefreshChunkManager);
+            return refreshNow(txn, RefreshType_RefreshChunkManager);
         }
 
         *wasChanged = isMetadataDifferent(lastManager, lastPrimary, _manager, _primary);
@@ -680,8 +683,8 @@ Status ChunkManagerTargeter::refreshIfNeeded(bool* wasChanged) {
     return Status::OK();
 }
 
-Status ChunkManagerTargeter::refreshNow(RefreshType refreshType) {
-    auto status = grid.implicitCreateDb(_nss.db().toString());
+Status ChunkManagerTargeter::refreshNow(OperationContext* txn, RefreshType refreshType) {
+    auto status = grid.implicitCreateDb(txn, _nss.db().toString());
     if (!status.isOK()) {
         return status.getStatus();
     }
@@ -696,22 +699,21 @@ Status ChunkManagerTargeter::refreshNow(RefreshType refreshType) {
         try {
             // Forces a remote check of the collection info, synchronization between threads
             // happens internally.
-            config->getChunkManagerIfExists(_nss.ns(), true);
+            config->getChunkManagerIfExists(txn, _nss.ns(), true);
         } catch (const DBException& ex) {
             return Status(ErrorCodes::UnknownError, ex.toString());
         }
-        config->getChunkManagerOrPrimary(_nss.ns(), _manager, _primary);
+        config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
     } else if (refreshType == RefreshType_ReloadDatabase) {
         try {
             // Dumps the db info, reloads it all, synchronization between threads happens
             // internally.
-            config->reload();
-            config->getChunkManagerIfExists(_nss.ns(), true, true);
+            config->reload(txn);
         } catch (const DBException& ex) {
             return Status(ErrorCodes::UnknownError, ex.toString());
         }
 
-        config->getChunkManagerOrPrimary(_nss.ns(), _manager, _primary);
+        config->getChunkManagerOrPrimary(txn, _nss.ns(), _manager, _primary);
     }
 
     return Status::OK();

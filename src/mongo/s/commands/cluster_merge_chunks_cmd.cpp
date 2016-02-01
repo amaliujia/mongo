@@ -28,7 +28,6 @@
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -39,6 +38,7 @@
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
@@ -138,7 +138,7 @@ public:
                 result, Status(ErrorCodes::InvalidNamespace, "no namespace specified"));
         }
 
-        auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+        auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
@@ -151,7 +151,7 @@ public:
         }
 
         // This refreshes the chunk metadata if stale.
-        ChunkManagerPtr manager = config->getChunkManagerIfExists(nss.ns(), true);
+        ChunkManagerPtr manager = config->getChunkManagerIfExists(txn, nss.ns(), true);
         if (!manager) {
             return appendCommandStatus(
                 result,
@@ -170,21 +170,22 @@ public:
         minKey = manager->getShardKeyPattern().normalizeShardKey(minKey);
         maxKey = manager->getShardKeyPattern().normalizeShardKey(maxKey);
 
-        ChunkPtr firstChunk = manager->findIntersectingChunk(minKey);
+        ChunkPtr firstChunk = manager->findIntersectingChunk(txn, minKey);
         verify(firstChunk);
 
         BSONObjBuilder remoteCmdObjB;
         remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::nsField()]);
         remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::boundsField()]);
         remoteCmdObjB.append(ClusterMergeChunksCommand::configField(),
-                             grid.catalogManager()->connectionString().toString());
+                             grid.shardRegistry()->getConfigServerConnectionString().toString());
         remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(), firstChunk->getShardId());
+
 
         BSONObj remoteResult;
 
         // Throws, but handled at level above.  Don't want to rewrap to preserve exception
         // formatting.
-        const auto shard = grid.shardRegistry()->getShard(firstChunk->getShardId());
+        const auto shard = grid.shardRegistry()->getShard(txn, firstChunk->getShardId());
         if (!shard) {
             return appendCommandStatus(
                 result,
@@ -192,7 +193,7 @@ public:
                        str::stream() << "Can't find shard for chunk: " << firstChunk->toString()));
         }
 
-        ScopedDbConnection conn(shard->getConnString());
+        ShardConnection conn(shard->getConnString(), "");
         bool ok = conn->runCommand("admin", remoteCmdObjB.obj(), remoteResult);
         conn.done();
 

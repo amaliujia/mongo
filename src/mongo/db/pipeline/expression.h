@@ -382,6 +382,23 @@ public:
 template <typename SubClass>
 class ExpressionVariadic : public ExpressionNaryBase<SubClass> {};
 
+/**
+ * Inherit from this class if your expression can take a range of arguments, e.g. if it has some
+ * optional arguments.
+ */
+template <typename SubClass, int MinArgs, int MaxArgs>
+class ExpressionRangedArity : public ExpressionNaryBase<SubClass> {
+public:
+    void validateArguments(const Expression::ExpressionVector& args) const override {
+        uassert(28667,
+                mongoutils::str::stream()
+                    << "Expression " << this->getOpName() << " takes at least " << MinArgs
+                    << " arguments, and at most " << MaxArgs << ", but " << args.size()
+                    << " were passed in.",
+                MinArgs <= args.size() && args.size() <= MaxArgs);
+    }
+};
+
 /// Inherit from this class if your expression takes a fixed number of arguments.
 template <typename SubClass, int NArgs>
 class ExpressionFixedArity : public ExpressionNaryBase<SubClass> {
@@ -395,9 +412,76 @@ public:
     }
 };
 
+/**
+ * Used to make Accumulators available as Expressions, e.g., to make $sum available as an Expression
+ * use "REGISTER_EXPRESSION(sum, ExpressionAccumulator<AccumulatorSum>::parse);".
+ */
+template <typename Accumulator>
+class ExpressionFromAccumulator
+    : public ExpressionVariadic<ExpressionFromAccumulator<Accumulator>> {
+public:
+    Value evaluateInternal(Variables* vars) const final {
+        Accumulator accum;
+        const size_t n = this->vpOperand.size();
+        // If a single array arg is given, loop through it passing each member to the accumulator.
+        // If a single, non-array arg is given, pass it directly to the accumulator.
+        if (n == 1) {
+            Value singleVal = this->vpOperand[0]->evaluateInternal(vars);
+            if (singleVal.getType() == Array) {
+                for (const Value& val : singleVal.getArray()) {
+                    accum.process(val, false);
+                }
+            } else {
+                accum.process(singleVal, false);
+            }
+        } else {
+            // If multiple arguments are given, pass all arguments to the accumulator.
+            for (auto&& argument : this->vpOperand) {
+                accum.process(argument->evaluateInternal(vars), false);
+            }
+        }
+        return accum.getValue(false);
+    }
 
-class ExpressionAbs final : public ExpressionFixedArity<ExpressionAbs, 1> {
-    Value evaluateInternal(Variables* vars) const final;
+    bool isAssociativeAndCommutative() const final {
+        // Return false if a single argument is given to avoid a single array argument being treated
+        // as an array instead of as a list of arguments.
+        if (this->vpOperand.size() == 1) {
+            return false;
+        }
+        return Accumulator().isAssociativeAndCommutative();
+    }
+
+    const char* getOpName() const final {
+        return Accumulator().getOpName();
+    }
+};
+
+/**
+ * Inherit from this class if your expression takes exactly one numeric argument.
+ */
+template <typename SubClass>
+class ExpressionSingleNumericArg : public ExpressionFixedArity<SubClass, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final {
+        Value arg = this->vpOperand[0]->evaluateInternal(vars);
+        if (arg.nullish())
+            return Value(BSONNULL);
+
+        uassert(28765,
+                str::stream() << this->getOpName() << " only supports numeric types, not "
+                              << typeName(arg.getType()),
+                arg.numeric());
+
+        return evaluateNumericArg(arg);
+    }
+
+    virtual Value evaluateNumericArg(const Value& numericArg) const = 0;
+};
+
+
+class ExpressionAbs final : public ExpressionSingleNumericArg<ExpressionAbs> {
+    Value evaluateNumericArg(const Value& numericArg) const final;
     const char* getOpName() const final;
 };
 
@@ -437,9 +521,25 @@ public:
 };
 
 
+class ExpressionArray final : public ExpressionVariadic<ExpressionArray> {
+public:
+    // virtuals from ExpressionNary
+    Value evaluateInternal(Variables* vars) const final;
+    Value serialize(bool explain) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionArrayElemAt final : public ExpressionFixedArity<ExpressionArrayElemAt, 2> {
 public:
     Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionCeil final : public ExpressionSingleNumericArg<ExpressionCeil> {
+public:
+    Value evaluateNumericArg(const Value& numericArg) const final;
     const char* getOpName() const final;
 };
 
@@ -535,7 +635,9 @@ public:
 
       @returns the value
      */
-    Value getValue() const;
+    Value getValue() const {
+        return pValue;
+    }
 
 private:
     explicit ExpressionConstant(const Value& pValue);
@@ -607,6 +709,12 @@ public:
 class ExpressionDivide final : public ExpressionFixedArity<ExpressionDivide, 2> {
 public:
     Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionExp final : public ExpressionSingleNumericArg<ExpressionExp> {
+    Value evaluateNumericArg(const Value& numericArg) const final;
     const char* getOpName() const final;
 };
 
@@ -693,6 +801,13 @@ private:
 };
 
 
+class ExpressionFloor final : public ExpressionSingleNumericArg<ExpressionFloor> {
+public:
+    Value evaluateNumericArg(const Value& numericArg) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionHour final : public ExpressionFixedArity<ExpressionHour, 1> {
 public:
     Value evaluateInternal(Variables* vars) const final;
@@ -738,6 +853,21 @@ private:
     boost::intrusive_ptr<Expression> _subExpression;
 };
 
+class ExpressionLn final : public ExpressionSingleNumericArg<ExpressionLn> {
+    Value evaluateNumericArg(const Value& numericArg) const final;
+    const char* getOpName() const final;
+};
+
+class ExpressionLog final : public ExpressionFixedArity<ExpressionLog, 2> {
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+class ExpressionLog10 final : public ExpressionSingleNumericArg<ExpressionLog10> {
+    Value evaluateNumericArg(const Value& numericArg) const final;
+    const char* getOpName() const final;
+};
+
 class ExpressionMap final : public Expression {
 public:
     boost::intrusive_ptr<Expression> optimize() final;
@@ -767,6 +897,16 @@ public:
     void addDependencies(DepsTracker* deps, std::vector<std::string>* path = NULL) const final;
 
     static boost::intrusive_ptr<Expression> parse(BSONElement expr, const VariablesParseState& vps);
+
+private:
+    enum MetaType {
+        TEXT_SCORE,
+        RAND_VAL,
+    };
+
+    ExpressionMeta(MetaType metaType);
+
+    MetaType _metaType;
 };
 
 class ExpressionMillisecond final : public ExpressionFixedArity<ExpressionMillisecond, 1> {
@@ -881,7 +1021,9 @@ public:
 
       @returns how many fields have been added
      */
-    size_t getFieldCount() const;
+    size_t getFieldCount() const {
+        return _expressions.size();
+    };
 
     /*
       Specialized BSON conversion that allows for writing out a
@@ -939,6 +1081,11 @@ public:
     bool isAssociativeAndCommutative() const final {
         return true;
     }
+};
+
+class ExpressionPow final : public ExpressionFixedArity<ExpressionPow, 2> {
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
 };
 
 
@@ -1001,6 +1148,20 @@ public:
 };
 
 
+class ExpressionSize final : public ExpressionFixedArity<ExpressionSize, 1> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
+class ExpressionSlice final : public ExpressionRangedArity<ExpressionSlice, 2, 3> {
+public:
+    Value evaluateInternal(Variables* vars) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionIsArray final : public ExpressionFixedArity<ExpressionIsArray, 1> {
 public:
     Value evaluateInternal(Variables* vars) const final;
@@ -1008,16 +1169,11 @@ public:
 };
 
 
-class ExpressionSize final : public ExpressionFixedArity<ExpressionSize, 1> {
-public:
-    Value evaluateInternal(Variables* vars) const final;
+class ExpressionSqrt final : public ExpressionSingleNumericArg<ExpressionSqrt> {
+    Value evaluateNumericArg(const Value& numericArg) const final;
     const char* getOpName() const final;
 };
 
-class ExpressionSqrt final : public ExpressionFixedArity<ExpressionSqrt, 1> {
-    Value evaluateInternal(Variables* vars) const final;
-    const char* getOpName() const final;
-};
 
 class ExpressionStrcasecmp final : public ExpressionFixedArity<ExpressionStrcasecmp, 2> {
 public:
@@ -1054,6 +1210,13 @@ public:
 };
 
 
+class ExpressionTrunc final : public ExpressionSingleNumericArg<ExpressionTrunc> {
+public:
+    Value evaluateNumericArg(const Value& numericArg) const final;
+    const char* getOpName() const final;
+};
+
+
 class ExpressionWeek final : public ExpressionFixedArity<ExpressionWeek, 1> {
 public:
     Value evaluateInternal(Variables* vars) const final;
@@ -1073,18 +1236,4 @@ public:
         return tm.tm_year + 1900;
     }
 };
-}
-
-
-/* ======================= INLINED IMPLEMENTATIONS ========================== */
-
-namespace mongo {
-
-inline Value ExpressionConstant::getValue() const {
-    return pValue;
-}
-
-inline size_t ExpressionObject::getFieldCount() const {
-    return _expressions.size();
-}
 }

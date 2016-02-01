@@ -62,6 +62,7 @@
 #include "mongo/logger/syslog_appender.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
@@ -88,10 +89,6 @@ void launchSignal(int sig) {
     }
 }
 
-static void setupLaunchSignals() {
-    verify(signal(SIGUSR2, launchSignal) != SIG_ERR);
-}
-
 void signalForkSuccess() {
     if (serverGlobalParams.doFork) {
         // killing leader will propagate to parent
@@ -111,8 +108,14 @@ static bool forkServer() {
 
         serverGlobalParams.parentProc = ProcessId::getCurrent();
 
+        // We need to make sure that all signals are unmasked so we can signal ourself
+        // that we're fully initialized later on.
+        sigset_t unblockSignalMask;
+        verify(sigemptyset(&unblockSignalMask) == 0);
+        verify(sigprocmask(SIG_SETMASK, &unblockSignalMask, NULL) == 0);
+
         // facilitate clean exit when child starts successfully
-        setupLaunchSignals();
+        verify(signal(SIGUSR2, launchSignal) != SIG_ERR);
 
         cout << "about to fork child process, waiting until server is ready for connections."
              << endl;

@@ -30,7 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -116,7 +115,7 @@ public:
                     result, Status(ErrorCodes::InvalidNamespace, "no namespace specified"));
             }
 
-            auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+            auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
             if (!status.isOK()) {
                 return appendCommandStatus(result, status.getStatus());
             }
@@ -125,7 +124,7 @@ public:
         }
 
         if (!config->isSharded(nss.ns())) {
-            config->reload();
+            config->reload(txn);
 
             if (!config->isSharded(nss.ns())) {
                 return appendCommandStatus(result,
@@ -140,7 +139,7 @@ public:
             return false;
         }
 
-        const auto to = grid.shardRegistry()->getShard(toString);
+        const auto to = grid.shardRegistry()->getShard(txn, toString);
         if (!to) {
             string msg(str::stream() << "Could not move chunk in '" << nss.ns() << "' to shard '"
                                      << toString << "' because that shard does not exist");
@@ -164,7 +163,7 @@ public:
         }
 
         // This refreshes the chunk metadata if stale.
-        ChunkManagerPtr info = config->getChunkManager(nss.ns(), true);
+        ChunkManagerPtr info = config->getChunkManager(txn, nss.ns(), true);
         ChunkPtr chunk;
 
         if (!find.isEmpty()) {
@@ -181,7 +180,7 @@ public:
                 return false;
             }
 
-            chunk = info->findIntersectingChunk(shardKey);
+            chunk = info->findIntersectingChunk(txn, shardKey);
             verify(chunk.get());
         } else {
             // Bounds
@@ -197,7 +196,7 @@ public:
             BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
             BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = info->findIntersectingChunk(minKey);
+            chunk = info->findIntersectingChunk(txn, minKey);
             verify(chunk.get());
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
@@ -208,7 +207,7 @@ public:
         }
 
         {
-            const auto from = grid.shardRegistry()->getShard(chunk->getShardId());
+            const auto from = grid.shardRegistry()->getShard(txn, chunk->getShardId());
             if (from->getId() == to->getId()) {
                 errmsg = "that chunk is already on that shard";
                 return false;
@@ -217,7 +216,8 @@ public:
 
         LOG(0) << "CMD: movechunk: " << cmdObj;
 
-        StatusWith<int> maxTimeMS = LiteParsedQuery::parseMaxTimeMSCommand(cmdObj);
+        StatusWith<int> maxTimeMS =
+            LiteParsedQuery::parseMaxTimeMS(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
 
         if (!maxTimeMS.isOK()) {
             errmsg = maxTimeMS.getStatus().reason();
@@ -238,7 +238,8 @@ public:
         }
 
         BSONObj res;
-        if (!chunk->moveAndCommit(to->getId(),
+        if (!chunk->moveAndCommit(txn,
+                                  to->getId(),
                                   maxChunkSizeBytes,
                                   writeConcern.get(),
                                   cmdObj["_waitForDelete"].trueValue(),

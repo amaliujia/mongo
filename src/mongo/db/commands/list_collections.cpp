@@ -30,8 +30,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <vector>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/database.h"
@@ -41,17 +44,101 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/cursor_responses.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-using std::unique_ptr;
-using std::list;
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
+using std::vector;
+using stdx::make_unique;
+
+namespace {
+/**
+ * Determines if 'matcher' is an exact match on the "name" field. If so, returns a vector of all the
+ * collection names it is matching against. Returns {} if there is no obvious exact match on name.
+ *
+ * Note the collection names returned are not guaranteed to exist, nor are they guaranteed to match
+ * 'matcher'.
+ */
+boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* matcher) {
+    if (!matcher) {
+        return {};
+    }
+
+    MatchExpression::MatchType matchType(matcher->matchType());
+    if (matchType == MatchExpression::EQ) {
+        auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
+        if (eqMatch->path() == "name") {
+            auto& elem = eqMatch->getData();
+            if (elem.type() == String) {
+                return {vector<StringData>{elem.valueStringData()}};
+            } else {
+                return vector<StringData>();
+            }
+        }
+    } else if (matchType == MatchExpression::MATCH_IN) {
+        auto matchIn = checked_cast<const InMatchExpression*>(matcher);
+        const ArrayFilterEntries& entries = matchIn->getData();
+        if (matchIn->path() == "name" && entries.numRegexes() == 0) {
+            vector<StringData> exactMatches;
+            for (auto&& elem : entries.equalities()) {
+                if (elem.type() == String) {
+                    exactMatches.push_back(elem.valueStringData());
+                }
+            }
+            return {std::move(exactMatches)};
+        }
+    }
+    return {};
+}
+
+/**
+ * Uses 'matcher' to determine if the collection's information should be added to 'root'. If so,
+ * allocates a WorkingSetMember containing information about 'collection', and adds it to 'root'.
+ *
+ * Does not add any information about the system.namespaces collection, or non-existent collections.
+ */
+void _addWorkingSetMember(OperationContext* txn,
+                          const Collection* collection,
+                          const MatchExpression* matcher,
+                          WorkingSet* ws,
+                          QueuedDataStage* root) {
+    if (!collection) {
+        return;
+    }
+
+    StringData collectionName = collection->ns().coll();
+    if (collectionName == "system.namespaces") {
+        return;
+    }
+
+    BSONObjBuilder b;
+    b.append("name", collectionName);
+
+    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(txn);
+    b.append("options", options.toBSON());
+
+    BSONObj maybe = b.obj();
+    if (matcher && !matcher->matchesBSON(maybe)) {
+        return;
+    }
+
+    WorkingSetID id = ws->allocate();
+    WorkingSetMember* member = ws->get(id);
+    member->keyData.clear();
+    member->loc = RecordId();
+    member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
+    member->transitionToOwnedObj();
+    root->pushBack(id);
+}
+}  // namespace
 
 class CmdListCollections : public Command {
 public:
@@ -88,7 +175,7 @@ public:
         }
 
         return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "Not authorized to create users on db: " << dbname);
+                      str::stream() << "Not authorized to list collections on db: " << dbname);
     }
 
     CmdListCollections() : Command("listCollections") {}
@@ -99,15 +186,15 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        std::unique_ptr<MatchExpression> matcher;
+        unique_ptr<MatchExpression> matcher;
         BSONElement filterElt = jsobj["filter"];
         if (!filterElt.eoo()) {
             if (filterElt.type() != mongo::Object) {
                 return appendCommandStatus(
                     result, Status(ErrorCodes::BadValue, "\"filter\" must be an object"));
             }
-            StatusWithMatchExpression statusWithMatcher =
-                MatchExpressionParser::parse(filterElt.Obj());
+            StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+                filterElt.Obj(), ExtensionsCallbackDisallowExtensions());
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }
@@ -124,46 +211,23 @@ public:
         ScopedTransaction scopedXact(txn, MODE_IS);
         AutoGetDb autoDb(txn, dbname, MODE_S);
 
-        const Database* d = autoDb.getDb();
-        const DatabaseCatalogEntry* dbEntry = NULL;
+        const Database* db = autoDb.getDb();
 
-        list<string> names;
-        if (d) {
-            dbEntry = d->getDatabaseCatalogEntry();
-            dbEntry->getCollectionNamespaces(&names);
-            names.sort();
-        }
+        auto ws = make_unique<WorkingSet>();
+        auto root = make_unique<QueuedDataStage>(txn, ws.get());
 
-        std::unique_ptr<WorkingSet> ws(new WorkingSet());
-        std::unique_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
-
-        for (std::list<std::string>::const_iterator i = names.begin(); i != names.end(); ++i) {
-            const std::string& ns = *i;
-
-            StringData collection = nsToCollectionSubstring(ns);
-            if (collection == "system.namespaces") {
-                continue;
+        if (db) {
+            if (auto collNames = _getExactNameMatches(matcher.get())) {
+                for (auto&& collName : *collNames) {
+                    auto nss = NamespaceString(db->name(), collName);
+                    _addWorkingSetMember(
+                        txn, db->getCollection(nss), matcher.get(), ws.get(), root.get());
+                }
+            } else {
+                for (auto&& collection : *db) {
+                    _addWorkingSetMember(txn, collection, matcher.get(), ws.get(), root.get());
+                }
             }
-
-            BSONObjBuilder b;
-            b.append("name", collection);
-
-            CollectionOptions options =
-                dbEntry->getCollectionCatalogEntry(ns)->getCollectionOptions(txn);
-            b.append("options", options.toBSON());
-
-            BSONObj maybe = b.obj();
-            if (matcher && !matcher->matchesBSON(maybe)) {
-                continue;
-            }
-
-            WorkingSetID id = ws->allocate();
-            WorkingSetMember* member = ws->get(id);
-            member->keyData.clear();
-            member->loc = RecordId();
-            member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
-            member->transitionToOwnedObj();
-            root->pushBack(id);
         }
 
         std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name;
@@ -175,27 +239,36 @@ public:
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
-        const int byteLimit = MaxBytesToReturnToClientAtOnce;
-        for (long long objCount = 0; objCount < batchSize && firstBatch.len() < byteLimit;
-             objCount++) {
+        for (long long objCount = 0; objCount < batchSize; objCount++) {
             BSONObj next;
             PlanExecutor::ExecState state = exec->getNext(&next, NULL);
             if (state == PlanExecutor::IS_EOF) {
                 break;
             }
             invariant(state == PlanExecutor::ADVANCED);
+
+            // If we can't fit this result inside the current batch, then we stash it for later.
+            if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
+                exec->enqueue(next);
+                break;
+            }
+
             firstBatch.append(next);
         }
 
         CursorId cursorId = 0LL;
         if (!exec->isEOF()) {
             exec->saveState();
-            ClientCursor* cursor = new ClientCursor(
-                CursorManager::getGlobalCursorManager(), exec.release(), cursorNamespace);
+            exec->detachFromOperationContext();
+            ClientCursor* cursor =
+                new ClientCursor(CursorManager::getGlobalCursorManager(),
+                                 exec.release(),
+                                 cursorNamespace,
+                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
             cursorId = cursor->cursorid();
         }
 
@@ -203,6 +276,5 @@ public:
 
         return true;
     }
-
 } cmdListCollections;
 }

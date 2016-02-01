@@ -41,6 +41,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
@@ -49,19 +50,21 @@ namespace ExecutorRegistry {
 
 using std::unique_ptr;
 
+static const NamespaceString nss("unittests.ExecutorRegistryDiskLocInvalidation");
+
 class ExecutorRegistryBase {
 public:
     ExecutorRegistryBase() : _client(&_opCtx) {
-        _ctx.reset(new OldClientWriteContext(&_opCtx, ns()));
-        _client.dropCollection(ns());
+        _ctx.reset(new OldClientWriteContext(&_opCtx, nss.ns()));
+        _client.dropCollection(nss.ns());
 
         for (int i = 0; i < N(); ++i) {
-            _client.insert(ns(), BSON("foo" << i));
+            _client.insert(nss.ns(), BSON("foo" << i));
         }
     }
 
     /**
-     * Return a plan executor that is going over the collection in ns().
+     * Return a plan executor that is going over the collection in nss.ns().
      */
     PlanExecutor* getCollscan() {
         unique_ptr<WorkingSet> ws(new WorkingSet());
@@ -72,7 +75,8 @@ public:
         unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, ws.get(), NULL));
 
         // Create a plan executor to hold it
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns(), BSONObj());
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, BSONObj(), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -81,7 +85,7 @@ public:
                                                          std::move(ws),
                                                          std::move(scan),
                                                          std::move(cq),
-                                                         _ctx->db()->getCollection(ns()),
+                                                         _ctx->db()->getCollection(nss.ns()),
                                                          PlanExecutor::YIELD_MANUAL);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return statusWithPlanExecutor.getValue().release();
@@ -90,7 +94,7 @@ public:
     void registerExecutor(PlanExecutor* exec) {
         WriteUnitOfWork wuow(&_opCtx);
         _ctx->db()
-            ->getOrCreateCollection(&_opCtx, ns())
+            ->getOrCreateCollection(&_opCtx, nss.ns())
             ->getCursorManager()
             ->registerExecutor(exec);
         wuow.commit();
@@ -99,7 +103,7 @@ public:
     void deregisterExecutor(PlanExecutor* exec) {
         WriteUnitOfWork wuow(&_opCtx);
         _ctx->db()
-            ->getOrCreateCollection(&_opCtx, ns())
+            ->getOrCreateCollection(&_opCtx, nss.ns())
             ->getCursorManager()
             ->deregisterExecutor(exec);
         wuow.commit();
@@ -110,11 +114,7 @@ public:
     }
 
     Collection* collection() {
-        return _ctx->db()->getCollection(ns());
-    }
-
-    static const char* ns() {
-        return "unittests.ExecutorRegistryDiskLocInvalidation";
+        return _ctx->db()->getCollection(nss.ns());
     }
 
     // Order of these is important for initialization
@@ -148,8 +148,8 @@ public:
         // stuff going on in the yield.
 
         // Delete some data, namely the next 2 things we'd expect.
-        _client.remove(ns(), BSON("foo" << 10));
-        _client.remove(ns(), BSON("foo" << 11));
+        _client.remove(nss.ns(), BSON("foo" << 10));
+        _client.remove(nss.ns(), BSON("foo" << 11));
 
         // At this point, we're done yielding.  We recover our lock.
 
@@ -157,7 +157,7 @@ public:
         deregisterExecutor(run.get());
 
         // And clean up anything that happened before.
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         // Make sure that the runner moved forward over the deleted data.  We don't see foo==10
         // or foo==11.
@@ -192,7 +192,7 @@ public:
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         ASSERT_EQUALS(PlanExecutor::ADVANCED, run->getNext(&obj, NULL));
         ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -202,11 +202,11 @@ public:
         registerExecutor(run.get());
 
         // Drop our collection.
-        _client.dropCollection(ns());
+        _client.dropCollection(nss.ns());
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         // PlanExecutor was killed.
         ASSERT_EQUALS(PlanExecutor::DEAD, run->getNext(&obj, NULL));
@@ -220,7 +220,7 @@ public:
         unique_ptr<PlanExecutor> run(getCollscan());
         BSONObj obj;
 
-        ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), BSON("foo" << 1)));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), BSON("foo" << 1)));
 
         // Read some of it.
         for (int i = 0; i < 10; ++i) {
@@ -233,11 +233,11 @@ public:
         registerExecutor(run.get());
 
         // Drop all indices.
-        _client.dropIndexes(ns());
+        _client.dropIndexes(nss.ns());
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         // PlanExecutor was killed.
         ASSERT_EQUALS(PlanExecutor::DEAD, run->getNext(&obj, NULL));
@@ -251,7 +251,7 @@ public:
         unique_ptr<PlanExecutor> run(getCollscan());
         BSONObj obj;
 
-        ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), BSON("foo" << 1)));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), BSON("foo" << 1)));
 
         // Read some of it.
         for (int i = 0; i < 10; ++i) {
@@ -264,11 +264,11 @@ public:
         registerExecutor(run.get());
 
         // Drop a specific index.
-        _client.dropIndex(ns(), BSON("foo" << 1));
+        _client.dropIndex(nss.ns(), BSON("foo" << 1));
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         // PlanExecutor was killed.
         ASSERT_EQUALS(PlanExecutor::DEAD, run->getNext(&obj, NULL));
@@ -296,11 +296,11 @@ public:
         // requires a "global write lock."
         _ctx.reset();
         _client.dropDatabase("somesillydb");
-        _ctx.reset(new OldClientWriteContext(&_opCtx, ns()));
+        _ctx.reset(new OldClientWriteContext(&_opCtx, nss.ns()));
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
 
         ASSERT_EQUALS(PlanExecutor::ADVANCED, run->getNext(&obj, NULL));
         ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -312,11 +312,11 @@ public:
         // Drop our DB.  Once again, must give up the lock.
         _ctx.reset();
         _client.dropDatabase("unittests");
-        _ctx.reset(new OldClientWriteContext(&_opCtx, ns()));
+        _ctx.reset(new OldClientWriteContext(&_opCtx, nss.ns()));
 
         // Unregister and restore state.
         deregisterExecutor(run.get());
-        run->restoreState(&_opCtx);
+        run->restoreState();
         _ctx.reset();
 
         // PlanExecutor was killed.

@@ -1,8 +1,7 @@
 // Tests various cases of dropping and recreating collections in the same namespace with multiple mongoses
 
 var st = new ShardingTest({ shards : 3, mongos : 3, verbose : 1 })
-// Stop balancer, it'll interfere
-st.stopBalancer()
+// Balancer is by default stopped, thus it will not interfere
 
 // Use separate mongoses for admin, inserting data, and validating results, so no
 // single-mongos tricks will work
@@ -75,9 +74,13 @@ var getOtherShard = function( shard ){
     }
 }
 
-admin.runCommand({ movePrimary : coll.getDB() + "", 
-                   to : getOtherShard( config.databases.findOne({ _id : coll.getDB() + "" }).primary ) })
-
+var otherShard = getOtherShard(config.databases.findOne({_id: coll.getDB() + ""}).primary);
+assert.commandWorked(admin.runCommand({movePrimary: coll.getDB() + "", to: otherShard}));
+if (st.configRS) {
+    // If we are in CSRS mode need to make sure that staleMongos will actually get
+    // the most recent config data.
+    st.configRS.awaitLastOpCommitted();
+}
 jsTest.log( "moved primary..." )
 
 bulk = insertMongos.getCollection( coll + "" ).initializeUnorderedBulkOp();

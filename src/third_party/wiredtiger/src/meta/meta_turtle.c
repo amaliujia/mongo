@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -55,7 +55,7 @@ __metadata_init(WT_SESSION_IMPL *session)
 	 * We're single-threaded, but acquire the schema lock regardless: the
 	 * lower level code checks that it is appropriately synchronized.
 	 */
-	WT_WITH_SCHEMA_LOCK(session,
+	WT_WITH_SCHEMA_LOCK(session, ret,
 	    ret = __wt_schema_create(session, WT_METAFILE_URI, NULL));
 
 	return (ret);
@@ -72,7 +72,7 @@ __metadata_load_hot_backup(WT_SESSION_IMPL *session)
 	WT_DECL_ITEM(key);
 	WT_DECL_ITEM(value);
 	WT_DECL_RET;
-	int exist;
+	bool exist;
 
 	/* Look for a hot backup file: if we find it, load it. */
 	WT_RET(__wt_exist(session, WT_METADATA_BACKUP, &exist));
@@ -112,7 +112,7 @@ __metadata_load_bulk(WT_SESSION_IMPL *session)
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	uint32_t allocsize;
-	int exist;
+	bool exist;
 	const char *filecfg[] = { WT_CONFIG_BASE(session, file_meta), NULL };
 	const char *key;
 
@@ -120,7 +120,7 @@ __metadata_load_bulk(WT_SESSION_IMPL *session)
 	 * If a file was being bulk-loaded during the hot backup, it will appear
 	 * in the metadata file, but the file won't exist.  Create on demand.
 	 */
-	WT_ERR(__wt_metadata_cursor(session, NULL, &cursor));
+	WT_RET(__wt_metadata_cursor(session, &cursor));
 	while ((ret = cursor->next(cursor)) == 0) {
 		WT_ERR(cursor->get_key(cursor, &key));
 		if (!WT_PREFIX_SKIP(key, "file:"))
@@ -141,9 +141,7 @@ __metadata_load_bulk(WT_SESSION_IMPL *session)
 	}
 	WT_ERR_NOTFOUND_OK(ret);
 
-err:	if (cursor != NULL)
-		WT_TRET(cursor->close(cursor));
-
+err:	WT_TRET(__wt_metadata_cursor_release(session, &cursor));
 	return (ret);
 }
 
@@ -155,7 +153,7 @@ int
 __wt_turtle_init(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
-	int exist, exist_incr;
+	bool exist, exist_incr;
 	char *metaconf;
 
 	metaconf = NULL;
@@ -202,7 +200,10 @@ __wt_turtle_init(WT_SESSION_IMPL *session)
 
 		/* Create the turtle file. */
 		WT_RET(__metadata_config(session, &metaconf));
-		WT_ERR(__wt_turtle_update(session, WT_METAFILE_URI, metaconf));
+		WT_WITH_TURTLE_LOCK(session, ret,
+		    ret = __wt_turtle_update(
+		    session, WT_METAFILE_URI, metaconf));
+		WT_ERR(ret);
 	}
 
 	/* Remove the backup files, we'll never read them again. */
@@ -222,7 +223,7 @@ __wt_turtle_read(WT_SESSION_IMPL *session, const char *key, char **valuep)
 	FILE *fp;
 	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
-	int exist, match;
+	bool exist, match;
 
 	*valuep = NULL;
 
@@ -241,12 +242,12 @@ __wt_turtle_read(WT_SESSION_IMPL *session, const char *key, char **valuep)
 
 	/* Search for the key. */
 	WT_ERR(__wt_scr_alloc(session, 512, &buf));
-	for (match = 0;;) {
+	for (match = false;;) {
 		WT_ERR(__wt_getline(session, buf, fp));
 		if (buf->size == 0)
 			WT_ERR(WT_NOTFOUND);
 		if (strcmp(key, buf->data) == 0)
-			match = 1;
+			match = true;
 
 		/* Key matched: read the subsequent line for the value. */
 		WT_ERR(__wt_getline(session, buf, fp));
@@ -269,8 +270,7 @@ err:	WT_TRET(__wt_fclose(&fp, WT_FHANDLE_READ));
  *	Update the turtle file.
  */
 int
-__wt_turtle_update(
-    WT_SESSION_IMPL *session, const char *key,  const char *value)
+__wt_turtle_update(WT_SESSION_IMPL *session, const char *key, const char *value)
 {
 	WT_FH *fh;
 	WT_DECL_ITEM(buf);
@@ -284,8 +284,8 @@ __wt_turtle_update(
 	 * Create the turtle setup file: we currently re-write it from scratch
 	 * every time.
 	 */
-	WT_RET(__wt_open(
-	    session, WT_METADATA_TURTLE_SET, 1, 1, WT_FILE_TYPE_TURTLE, &fh));
+	WT_RET(__wt_open(session,
+	    WT_METADATA_TURTLE_SET, true, true, WT_FILE_TYPE_TURTLE, &fh));
 
 	version = wiredtiger_version(&vmajor, &vminor, &vpatch);
 	WT_ERR(__wt_scr_alloc(session, 2 * 1024, &buf));
@@ -297,7 +297,7 @@ __wt_turtle_update(
 	WT_ERR(__wt_write(session, fh, 0, buf->size, buf->data));
 
 	/* Flush the handle and rename the file into place. */
-	ret = __wt_sync_and_rename_fh(
+	ret = __wt_fh_sync_and_rename(
 	    session, &fh, WT_METADATA_TURTLE_SET, WT_METADATA_TURTLE);
 
 	/* Close any file handle left open, remove any temporary file. */

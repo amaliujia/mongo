@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,23 +14,23 @@
  */
 static int
 __schema_add_table(WT_SESSION_IMPL *session,
-    const char *name, size_t namelen, int ok_incomplete, WT_TABLE **tablep)
+    const char *name, size_t namelen, bool ok_incomplete, WT_TABLE **tablep)
 {
 	WT_DECL_RET;
 	WT_TABLE *table;
 	uint64_t bucket;
 
 	/* Make sure the metadata is open before getting other locks. */
-	WT_RET(__wt_metadata_open(session));
+	WT_RET(__wt_metadata_cursor(session, NULL));
 
-	WT_WITH_TABLE_LOCK(session,
+	WT_WITH_TABLE_LOCK(session, ret,
 	    ret = __wt_schema_open_table(
 	    session, name, namelen, ok_incomplete, &table));
 	WT_RET(ret);
 
 	bucket = table->name_hash % WT_HASH_ARRAY_SIZE;
-	SLIST_INSERT_HEAD(&session->tables, table, l);
-	SLIST_INSERT_HEAD(&session->tablehash[bucket], table, hashl);
+	TAILQ_INSERT_HEAD(&session->tables, table, q);
+	TAILQ_INSERT_HEAD(&session->tablehash[bucket], table, hashq);
 	*tablep = table;
 
 	return (0);
@@ -51,7 +51,7 @@ __schema_find_table(WT_SESSION_IMPL *session,
 	bucket = __wt_hash_city64(name, namelen) % WT_HASH_ARRAY_SIZE;
 
 restart:
-	SLIST_FOREACH(table, &session->tablehash[bucket], hashl) {
+	TAILQ_FOREACH(table, &session->tablehash[bucket], hashq) {
 		tablename = table->name;
 		(void)WT_PREFIX_SKIP(tablename, "table:");
 		if (WT_STRING_MATCH(tablename, name, namelen)) {
@@ -86,7 +86,7 @@ restart:
  */
 int
 __wt_schema_get_table(WT_SESSION_IMPL *session,
-    const char *name, size_t namelen, int ok_incomplete, WT_TABLE **tablep)
+    const char *name, size_t namelen, bool ok_incomplete, WT_TABLE **tablep)
 {
 	WT_DECL_RET;
 	WT_TABLE *table;
@@ -228,8 +228,8 @@ __wt_schema_remove_table(WT_SESSION_IMPL *session, WT_TABLE *table)
 	WT_ASSERT(session, table->refcnt <= 1);
 
 	bucket = table->name_hash % WT_HASH_ARRAY_SIZE;
-	SLIST_REMOVE(&session->tables, table, __wt_table, l);
-	SLIST_REMOVE(&session->tablehash[bucket], table, __wt_table, hashl);
+	TAILQ_REMOVE(&session->tables, table, q);
+	TAILQ_REMOVE(&session->tablehash[bucket], table, hashq);
 	return (__wt_schema_destroy_table(session, &table));
 }
 
@@ -243,7 +243,7 @@ __wt_schema_close_tables(WT_SESSION_IMPL *session)
 	WT_DECL_RET;
 	WT_TABLE *table;
 
-	while ((table = SLIST_FIRST(&session->tables)) != NULL)
+	while ((table = TAILQ_FIRST(&session->tables)) != NULL)
 		WT_TRET(__wt_schema_remove_table(session, table));
 	return (ret);
 }

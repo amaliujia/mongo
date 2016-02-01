@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -29,7 +29,7 @@ __remove_file_check(WT_SESSION_IMPL *session, const char *name)
 	 * level should have closed it before removing.
 	 */
 	__wt_spin_lock(session, &conn->fh_lock);
-	SLIST_FOREACH(fh, &conn->fhhash[bucket], hashl)
+	TAILQ_FOREACH(fh, &conn->fhhash[bucket], hashq)
 		if (strcmp(name, fh->name) == 0)
 			break;
 	__wt_spin_unlock(session, &conn->fh_lock);

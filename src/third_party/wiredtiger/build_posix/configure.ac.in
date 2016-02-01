@@ -13,7 +13,9 @@ AC_CONFIG_SRCDIR([RELEASE_INFO])
 : ${CFLAGS=-O3 -g}
 : ${CXXFLAGS=-O3 -g}
 
-AM_INIT_AUTOMAKE([1.11 foreign parallel-tests subdir-objects])
+# We rely on some automake features for testing (like AM_TEST_ENVIRONMENT)
+# that didn't work before 1.11.6.
+AM_INIT_AUTOMAKE([1.11.6 foreign parallel-tests subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([no])])
 
 # Configure options.  The AM_OPTIONS and the libtool configuration
@@ -101,7 +103,7 @@ esac
 
 # Linux requires buffers aligned to 4KB boundaries for O_DIRECT to work.
 BUFFER_ALIGNMENT=0
-if test "$ac_cv_func_posix_memalign" = "yes" ; then
+if test "$ax_cv_func_posix_memalign_works" = "yes" ; then
 	case "$host_os" in
 	linux*)	BUFFER_ALIGNMENT=4096 ;;
 	esac

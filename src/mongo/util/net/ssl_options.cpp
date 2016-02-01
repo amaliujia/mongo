@@ -86,10 +86,11 @@ Status addSSLServerOptions(moe::OptionSection* options) {
                                moe::String,
                                "OpenSSL cipher configuration string").hidden();
 
-    options->addOptionChaining("net.ssl.disabledProtocols",
-                               "sslDisabledProtocols",
-                               moe::String,
-                               "Comma separated list of disabled protocols").hidden();
+    options->addOptionChaining(
+        "net.ssl.disabledProtocols",
+        "sslDisabledProtocols",
+        moe::String,
+        "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]");
 
     options->addOptionChaining("net.ssl.weakCertificateValidation",
                                "sslWeakCertificateValidation",
@@ -142,13 +143,6 @@ Status addSSLClientOptions(moe::OptionSection* options) {
         .requires("ssl")
         .requires("ssl.CAFile");
 
-    options->addOptionChaining("net.ssl.disabledProtocols",
-                               "sslDisabledProtocols",
-                               moe::String,
-                               "Comma separated list of disabled protocols")
-        .requires("ssl")
-        .hidden();
-
     options->addOptionChaining("net.ssl.allowInvalidHostnames",
                                "sslAllowInvalidHostnames",
                                moe::Switch,
@@ -162,8 +156,7 @@ Status addSSLClientOptions(moe::OptionSection* options) {
         .requires("ssl");
 
     options->addOptionChaining(
-                 "ssl.FIPSMode", "sslFIPSMode", moe::Switch, "activate FIPS 140-2 mode at startup")
-        .requires("ssl");
+        "ssl.FIPSMode", "sslFIPSMode", moe::Switch, "activate FIPS 140-2 mode at startup");
 
     return Status::OK();
 }
@@ -268,13 +261,22 @@ Status storeSSLServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.ssl.disabledProtocols")) {
+        // The disabledProtocols field is composed of a comma separated list of protocols to
+        // disable. First, tokenize the field.
         std::vector<std::string> tokens =
             StringSplitter::split(params["net.ssl.disabledProtocols"].as<string>(), ",");
 
+        // All accepted tokens, and their corresponding enum representation. The noTLS* tokens
+        // exist for backwards compatibility.
         const std::map<std::string, SSLParams::Protocols> validConfigs{
+            {"TLS1_0", SSLParams::Protocols::TLS1_0},
             {"noTLS1_0", SSLParams::Protocols::TLS1_0},
+            {"TLS1_1", SSLParams::Protocols::TLS1_1},
             {"noTLS1_1", SSLParams::Protocols::TLS1_1},
+            {"TLS1_2", SSLParams::Protocols::TLS1_2},
             {"noTLS1_2", SSLParams::Protocols::TLS1_2}};
+
+        // Map the tokens to their enum values, and push them onto the list of disabled protocols.
         for (const std::string& token : tokens) {
             auto mappedToken = validConfigs.find(token);
             if (mappedToken != validConfigs.end()) {
@@ -332,7 +334,7 @@ Status storeSSLServerOptions(const moe::Environment& params) {
                sslGlobalParams.sslCAFile.size() || sslGlobalParams.sslCRLFile.size() ||
                sslGlobalParams.sslCipherConfig.size() ||
                sslGlobalParams.sslDisabledProtocols.size() ||
-               sslGlobalParams.sslWeakCertificateValidation || sslGlobalParams.sslFIPSMode) {
+               sslGlobalParams.sslWeakCertificateValidation) {
         return Status(ErrorCodes::BadValue,
                       "need to enable SSL via the sslMode flag when "
                       "using SSL configuration parameters");

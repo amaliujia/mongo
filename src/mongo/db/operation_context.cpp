@@ -28,6 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 
 #include "mongo/util/assert_util.h"
@@ -37,17 +38,21 @@ namespace mongo {
 OperationContext::OperationContext(Client* client, unsigned int opId, Locker* locker)
     : _client(client), _opId(opId), _locker(locker) {}
 
+ServiceContext* OperationContext::getServiceContext() const {
+    return _client->getServiceContext();
+}
+
 Client* OperationContext::getClient() const {
-    invariant(_client);
     return _client;
 }
 
-void OperationContext::markKilled() {
-    _killPending.store(1);
+void OperationContext::markKilled(ErrorCodes::Error killCode) {
+    invariant(killCode != ErrorCodes::OK);
+    _killCode.compareAndSwap(ErrorCodes::OK, killCode);
 }
 
-bool OperationContext::isKillPending() const {
-    return _killPending.loadRelaxed();
+ErrorCodes::Error OperationContext::getKillStatus() const {
+    return _killCode.loadRelaxed();
 }
 
 }  // namespace mongo

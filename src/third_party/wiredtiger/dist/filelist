@@ -31,6 +31,7 @@ src/btree/bt_misc.c
 src/btree/bt_ovfl.c
 src/btree/bt_page.c
 src/btree/bt_read.c
+src/btree/bt_rebalance.c
 src/btree/bt_ret.c
 src/btree/bt_slvg.c
 src/btree/bt_split.c
@@ -45,6 +46,7 @@ src/btree/col_srch.c
 src/btree/row_key.c
 src/btree/row_modify.c
 src/btree/row_srch.c
+src/cache/cache_las.c
 src/config/config.c
 src/config/config_api.c
 src/config/config_check.c
@@ -71,6 +73,7 @@ src/cursor/cur_ds.c
 src/cursor/cur_dump.c
 src/cursor/cur_file.c
 src/cursor/cur_index.c
+src/cursor/cur_join.c
 src/cursor/cur_json.c
 src/cursor/cur_log.c
 src/cursor/cur_metadata.c
@@ -117,6 +120,7 @@ src/os_posix/os_mtx_cond.c
 src/os_posix/os_mtx_rw.c
 src/os_posix/os_once.c
 src/os_posix/os_open.c
+src/os_posix/os_pagesize.c
 src/os_posix/os_path.c
 src/os_posix/os_priv.c
 src/os_posix/os_remove.c

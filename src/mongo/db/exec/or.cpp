@@ -43,29 +43,18 @@ using stdx::make_unique;
 // static
 const char* OrStage::kStageType = "OR";
 
-OrStage::OrStage(WorkingSet* ws, bool dedup, const MatchExpression* filter)
-    : _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup), _commonStats(kStageType) {}
-
-OrStage::~OrStage() {
-    for (size_t i = 0; i < _children.size(); ++i) {
-        delete _children[i];
-    }
-}
+OrStage::OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter)
+    : PlanStage(kStageType, opCtx), _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) {}
 
 void OrStage::addChild(PlanStage* child) {
-    _children.push_back(child);
+    _children.emplace_back(child);
 }
 
 bool OrStage::isEOF() {
     return _currentChild >= _children.size();
 }
 
-PlanStage::StageState OrStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState OrStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -85,7 +74,6 @@ PlanStage::StageState OrStage::work(WorkingSetID* out) {
                 // ...drop it.
                 ++_specificStats.dupsDropped;
                 _ws->free(id);
-                ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
             } else {
                 // Otherwise, note that we've seen it.
@@ -96,12 +84,10 @@ PlanStage::StageState OrStage::work(WorkingSetID* out) {
         if (Filter::passes(member, _filter)) {
             // Match!  return it.
             *out = id;
-            ++_commonStats.advanced;
             return PlanStage::ADVANCED;
         } else {
             // Does not match, try again.
             _ws->free(id);
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     } else if (PlanStage::IS_EOF == childStatus) {
@@ -112,7 +98,6 @@ PlanStage::StageState OrStage::work(WorkingSetID* out) {
         if (isEOF()) {
             return PlanStage::IS_EOF;
         } else {
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     } else if (PlanStage::FAILURE == childStatus || PlanStage::DEAD == childStatus) {
@@ -127,10 +112,7 @@ PlanStage::StageState OrStage::work(WorkingSetID* out) {
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
         return childStatus;
-    } else if (PlanStage::NEED_TIME == childStatus) {
-        ++_commonStats.needTime;
     } else if (PlanStage::NEED_YIELD == childStatus) {
-        ++_commonStats.needYield;
         *out = id;
     }
 
@@ -138,29 +120,10 @@ PlanStage::StageState OrStage::work(WorkingSetID* out) {
     return childStatus;
 }
 
-void OrStage::saveState() {
-    ++_commonStats.yields;
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->saveState();
-    }
-}
-
-void OrStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->restoreState(opCtx);
-    }
-}
-
-void OrStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-
+void OrStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
+    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
     if (isEOF()) {
         return;
-    }
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->invalidate(txn, dl, type);
     }
 
     // If we see DL again it is not the same record as it once was so we still want to
@@ -172,10 +135,6 @@ void OrStage::invalidate(OperationContext* txn, const RecordId& dl, Invalidation
             _seen.erase(dl);
         }
     }
-}
-
-vector<PlanStage*> OrStage::getChildren() const {
-    return _children;
 }
 
 unique_ptr<PlanStageStats> OrStage::getStats() {
@@ -191,14 +150,10 @@ unique_ptr<PlanStageStats> OrStage::getStats() {
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_OR);
     ret->specific = make_unique<OrStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
-        ret->children.push_back(_children[i]->getStats().release());
+        ret->children.emplace_back(_children[i]->getStats());
     }
 
     return ret;
-}
-
-const CommonStats* OrStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* OrStage::getSpecificStats() const {

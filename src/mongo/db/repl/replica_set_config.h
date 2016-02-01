@@ -52,21 +52,30 @@ class ReplicaSetConfig {
 public:
     typedef std::vector<MemberConfig>::const_iterator MemberIterator;
 
+    static const std::string kConfigServerFieldName;
     static const std::string kVersionFieldName;
     static const std::string kMajorityWriteConcernModeName;
 
     static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
-    static const Seconds kDefaultHeartbeatTimeoutPeriod;
 
-    ReplicaSetConfig();
-    std::string asBson() {
-        return "";
-    }
+    static const Milliseconds kDefaultElectionTimeoutPeriod;
+    static const Milliseconds kDefaultHeartbeatInterval;
+    static const Seconds kDefaultHeartbeatTimeoutPeriod;
+    static const bool kDefaultChainingAllowed;
+
     /**
      * Initializes this ReplicaSetConfig from the contents of "cfg".
+     * The default protocol version is 0 to keep backward-compatibility.
+     * If usePV1ByDefault is true, the protocol version will be 1 when it's not specified in "cfg".
      */
-    Status initialize(const BSONObj& cfg);
+    Status initialize(const BSONObj& cfg, bool usePV1ByDefault = false);
+
+    /**
+     * Same as the generic initialize() above except will default "configsvr" setting to the value
+     * of serverGlobalParams.configsvr.
+     */
+    Status initializeForInitiate(const BSONObj& cfg, bool usePV1ByDefault = false);
 
     /**
      * Returns true if this object has been successfully initialized or copied from
@@ -166,6 +175,21 @@ public:
     }
 
     /**
+     * Interval between the time the last heartbeat from a node was received successfully, or
+     * the time when we gave up retrying, and when the next heartbeat should be sent to a target.
+     * Returns default heartbeat interval if this configuration is not initialized.
+     */
+    Milliseconds getHeartbeatInterval() const;
+
+    /**
+     * Gets the timeout for determining when the current PRIMARY is dead, which triggers a node to
+     * run for election.
+     */
+    Milliseconds getElectionTimeoutPeriod() const {
+        return _electionTimeoutPeriod;
+    }
+
+    /**
      * Gets the amount of time to wait for a response to hearbeats sent to other
      * nodes in the replica set.
      */
@@ -201,6 +225,13 @@ public:
      */
     bool isChainingAllowed() const {
         return _chainingAllowed;
+    }
+
+    /**
+     * Returns true if this replica set is for use as a config server replica set.
+     */
+    bool isConfigServer() const {
+        return _configServer;
     }
 
     /**
@@ -254,11 +285,22 @@ public:
         return _protocolVersion;
     }
 
+    /**
+     * Returns the duration to wait before running for election when this node (indicated by
+     * "memberIdx") sees that it has higher priority than the current primary.
+     */
+    Milliseconds getPriorityTakeoverDelay(int memberIdx) const;
+
 private:
     /**
      * Parses the "settings" subdocument of a replica set configuration.
      */
     Status _parseSettingsSubdocument(const BSONObj& settings);
+
+    /**
+     * Return the number of members with a priority greater than "priority".
+     */
+    int _calculatePriorityRank(double priority) const;
 
     /**
      * Calculates and stores the majority for electing a primary (_majorityVoteCount).
@@ -270,19 +312,24 @@ private:
      */
     void _addInternalWriteConcernModes();
 
-    bool _isInitialized;
-    long long _version;
+    Status _initialize(const BSONObj& cfg, bool forInitiate, bool usePV1ByDefault);
+
+    bool _isInitialized = false;
+    long long _version = 1;
     std::string _replSetName;
     std::vector<MemberConfig> _members;
     WriteConcernOptions _defaultWriteConcern;
-    Seconds _heartbeatTimeoutPeriod;
-    bool _chainingAllowed;
-    int _majorityVoteCount;
-    int _writeMajority;
-    int _totalVotingMembers;
+    Milliseconds _electionTimeoutPeriod = kDefaultElectionTimeoutPeriod;
+    Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
+    Seconds _heartbeatTimeoutPeriod = kDefaultHeartbeatTimeoutPeriod;
+    bool _chainingAllowed = kDefaultChainingAllowed;
+    int _majorityVoteCount = 0;
+    int _writeMajority = 0;
+    int _totalVotingMembers = 0;
     ReplicaSetTagConfig _tagConfig;
     StringMap<ReplicaSetTagPattern> _customWriteConcernModes;
-    long long _protocolVersion;
+    long long _protocolVersion = 0;
+    bool _configServer = false;
 };
 
 

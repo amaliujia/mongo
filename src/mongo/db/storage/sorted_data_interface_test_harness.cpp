@@ -358,8 +358,8 @@ TEST(SortedDataInterface, CursorIterate1WithSaveRestore) {
         for (auto entry = cursor->seek(BSONObj(), true); entry; entry = cursor->next()) {
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << n), RecordId(5, n * 2)));
             n++;
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT_EQUALS(N, n);
     }
@@ -387,8 +387,8 @@ TEST(SortedDataInterface, CursorIterateAllDupKeysWithSaveRestore) {
         for (auto entry = cursor->seek(BSONObj(), true); entry; entry = cursor->next()) {
             ASSERT_EQ(entry, IndexKeyEntry(BSON("" << 5), RecordId(5, n * 2)));
             n++;
-            cursor->savePositioned();
-            cursor->restore(opCtx.get());
+            cursor->save();
+            cursor->restore();
         }
         ASSERT_EQUALS(N, n);
     }

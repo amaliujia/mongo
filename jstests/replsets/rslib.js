@@ -1,4 +1,13 @@
-var wait, occasionally, reconnect, getLatestOp, waitForAllMembers, reconfig, awaitOpTime;
+var wait;
+var occasionally;
+var reconnect;
+var getLatestOp;
+var waitForAllMembers;
+var reconfig;
+var awaitOpTime;
+var startSetIfSupportsReadMajority;
+var waitUntilAllNodesCaughtUp;
+
 (function () {
 "use strict";
 var count = 0;
@@ -13,7 +22,9 @@ wait = function(f,msg) {
         if (++n == 4) {
             print("" + f);
         }
-        assert(n < 200, 'tried 200 times, giving up on ' + msg );
+        if (n >= 200) {
+            throw new Error('tried 200 times, giving up on ' + msg);
+        }
         sleep(1000);
     }
 };
@@ -102,7 +113,7 @@ waitForAllMembers = function(master, timeout) {
 
 reconfig = function(rs, config, force) {
     "use strict";
-    var admin = rs.getMaster().getDB("admin");
+    var admin = rs.getPrimary().getDB("admin");
     var e;
     var master;
     try {
@@ -114,7 +125,7 @@ reconfig = function(rs, config, force) {
         }
     }
 
-    var master = rs.getMaster().getDB("admin");
+    var master = rs.getPrimary().getDB("admin");
     waitForAllMembers(master);
 
     return master;
@@ -144,6 +155,60 @@ awaitOpTime = function (node, opTime) {
         }
         return message;
     });
+};
+
+/**
+ * Uses the results of running replSetGetStatus against an arbitrary replset node to wait until
+ * all nodes in the set are replicated through the same optime.
+ * 'rs' is an array of connections to replica set nodes.  This function is useful when you
+ * don't have a ReplSetTest object to use, otherwise ReplSetTest.awaitReplication is preferred.
+ */
+waitUntilAllNodesCaughtUp = function(rs, timeout) {
+    var rsStatus;
+    var firstConflictingIndex;
+    var ot;
+    var otherOt;
+    assert.soon(function () {
+        rsStatus = rs[0].adminCommand('replSetGetStatus');
+        if (rsStatus.ok != 1) {
+            return false;
+        }
+        assert.eq(rs.length, rsStatus.members.length, tojson(rsStatus));
+        ot = rsStatus.members[0].optime;
+        for (var i = 1; i < rsStatus.members.length; ++i) {
+            otherOt = rsStatus.members[i].optime;
+            if (bsonWoCompare({ts: otherOt.ts}, {ts: ot.ts}) ||
+                bsonWoCompare({t: otherOt.t},  {t: ot.t})) {
+                firstConflictingIndex = i;
+                return false;
+            }
+        }
+        return true;
+    }, function () {
+        return "Optimes of members 0 (" + tojson(ot) + ") and " + firstConflictingIndex + " (" +
+            tojson(otherOt) + ") are different in " + tojson(rsStatus);
+    }, timeout);
+};
+
+/**
+ * Starts each node in the given replica set if the storage engine supports readConcern 'majority'.
+ * Returns true if the replica set was started successfully and false otherwise.
+ *
+ * @param replSetTest - The instance of {@link ReplSetTest} to start
+ * @param options - The options passed to {@link ReplSetTest.startSet}
+ */
+startSetIfSupportsReadMajority = function (replSetTest, options) {
+    try {
+        replSetTest.startSet(options);
+    } catch (e) {
+        var conn = MongoRunner.runMongod();
+        if (!conn.getDB("admin").serverStatus().storageEngine.supportsCommittedReads) {
+            MongoRunner.stopMongod(conn);
+            return false;
+        }
+        throw e;
+    }
+    return true;
 };
 
 }());

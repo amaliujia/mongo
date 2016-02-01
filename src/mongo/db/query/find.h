@@ -41,41 +41,6 @@ namespace mongo {
 class NamespaceString;
 class OperationContext;
 
-class ScopedRecoveryUnitSwapper {
-public:
-    ScopedRecoveryUnitSwapper(ClientCursor* cc, OperationContext* txn);
-
-    ~ScopedRecoveryUnitSwapper();
-
-    /**
-     * Dismissing the RU swapper causes it to simply free the recovery unit rather than swapping
-     * it back into the ClientCursor.
-     */
-    void dismiss();
-
-private:
-    ClientCursor* _cc;
-    OperationContext* _txn;
-    bool _dismissed;
-
-    std::unique_ptr<RecoveryUnit> _txnPreviousRecoveryUnit;
-    OperationContext::RecoveryUnitState _txnPreviousRecoveryUnitState;
-};
-
-/**
- * Returns true if enough results have been prepared to stop adding more to the first batch.
- *
- * Should be called *after* adding to the result set rather than before.
- */
-bool enoughForFirstBatch(const LiteParsedQuery& pq, long long numDocs, int bytesBuffered);
-
-/**
- * Returns true if enough results have been prepared to stop adding more to a getMore batch.
- *
- * Should be called *after* adding to the result set rather than before.
- */
-bool enoughForGetMore(long long ntoreturn, long long numDocs, int bytesBuffered);
-
 /**
  * Whether or not the ClientCursor* is tailable.
  */
@@ -119,7 +84,8 @@ void beginQueryOp(OperationContext* txn,
                   long long ntoskip);
 
 /**
- * Fills out CurOp for "txn" with information regarding this query's execution.
+ * 1) Fills out CurOp for "txn" with information regarding this query's execution.
+ * 2) Reports index usage to the CollectionInfoCache.
  *
  * Uses explain functionality to extract stats from 'exec'.
  *
@@ -127,6 +93,7 @@ void beginQueryOp(OperationContext* txn,
  * do expensive stats gathering.
  */
 void endQueryOp(OperationContext* txn,
+                Collection* collection,
                 const PlanExecutor& exec,
                 int dbProfilingLevel,
                 long long numResults,
@@ -151,8 +118,7 @@ QueryResult::View getMore(OperationContext* txn,
                           const char* ns,
                           int ntoreturn,
                           long long cursorid,
-                          int pass,
-                          bool& exhaust,
+                          bool* exhaust,
                           bool* isCursorAuthorized);
 
 /**

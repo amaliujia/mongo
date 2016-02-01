@@ -54,13 +54,13 @@ FetchStage::FetchStage(OperationContext* txn,
                        PlanStage* child,
                        const MatchExpression* filter,
                        const Collection* collection)
-    : _txn(txn),
+    : PlanStage(kStageType, txn),
       _collection(collection),
       _ws(ws),
-      _child(child),
       _filter(filter),
-      _idRetrying(WorkingSet::INVALID_ID),
-      _commonStats(kStageType) {}
+      _idRetrying(WorkingSet::INVALID_ID) {
+    _children.emplace_back(child);
+}
 
 FetchStage::~FetchStage() {}
 
@@ -71,15 +71,10 @@ bool FetchStage::isEOF() {
         return false;
     }
 
-    return _child->isEOF();
+    return child()->isEOF();
 }
 
-PlanStage::StageState FetchStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -88,7 +83,7 @@ PlanStage::StageState FetchStage::work(WorkingSetID* out) {
     WorkingSetID id;
     StageState status;
     if (_idRetrying == WorkingSet::INVALID_ID) {
-        status = _child->work(&id);
+        status = child()->work(&id);
     } else {
         status = ADVANCED;
         id = _idRetrying;
@@ -108,7 +103,7 @@ PlanStage::StageState FetchStage::work(WorkingSetID* out) {
 
             try {
                 if (!_cursor)
-                    _cursor = _collection->getCursor(_txn);
+                    _cursor = _collection->getCursor(getOpCtx());
 
                 if (auto fetcher = _cursor->fetcherForId(member->loc)) {
                     // There's something to fetch. Hand the fetcher off to the WSM, and pass up
@@ -116,21 +111,21 @@ PlanStage::StageState FetchStage::work(WorkingSetID* out) {
                     _idRetrying = id;
                     member->setFetcher(fetcher.release());
                     *out = id;
-                    _commonStats.needYield++;
                     return NEED_YIELD;
                 }
 
                 // The doc is already in memory, so go ahead and grab it. Now we have a RecordId
                 // as well as an unowned object
-                if (!WorkingSetCommon::fetch(_txn, _ws, id, _cursor)) {
+                if (!WorkingSetCommon::fetch(getOpCtx(), _ws, id, _cursor)) {
                     _ws->free(id);
-                    _commonStats.needTime++;
                     return NEED_TIME;
                 }
             } catch (const WriteConflictException& wce) {
+                // Ensure that the BSONObj underlying the WorkingSetMember is owned because it may
+                // be freed when we yield.
+                member->makeObjOwnedIfNeeded();
                 _idRetrying = id;
                 *out = WorkingSet::INVALID_ID;
-                _commonStats.needYield++;
                 return NEED_YIELD;
             }
         }
@@ -148,38 +143,34 @@ PlanStage::StageState FetchStage::work(WorkingSetID* out) {
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
         return status;
-    } else if (PlanStage::NEED_TIME == status) {
-        ++_commonStats.needTime;
     } else if (PlanStage::NEED_YIELD == status) {
-        ++_commonStats.needYield;
         *out = id;
     }
 
     return status;
 }
 
-void FetchStage::saveState() {
-    _txn = NULL;
-    ++_commonStats.yields;
+void FetchStage::doSaveState() {
     if (_cursor)
         _cursor->saveUnpositioned();
-    _child->saveState();
 }
 
-void FetchStage::restoreState(OperationContext* opCtx) {
-    invariant(_txn == NULL);
-    _txn = opCtx;
-    ++_commonStats.unyields;
+void FetchStage::doRestoreState() {
     if (_cursor)
-        _cursor->restore(opCtx);
-    _child->restoreState(opCtx);
+        _cursor->restore();
 }
 
-void FetchStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
+void FetchStage::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+}
 
-    _child->invalidate(txn, dl, type);
+void FetchStage::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(getOpCtx());
+}
 
+void FetchStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
     // It's possible that the loc getting invalidated is the one we're about to
     // fetch. In this case we do a "forced fetch" and put the WSM in owned object state.
     if (WorkingSet::INVALID_ID != _idRetrying) {
@@ -212,21 +203,11 @@ PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
 
     if (Filter::passes(member, _filter)) {
         *out = memberID;
-
-        ++_commonStats.advanced;
         return PlanStage::ADVANCED;
     } else {
         _ws->free(memberID);
-
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     }
-}
-
-vector<PlanStage*> FetchStage::getChildren() const {
-    vector<PlanStage*> children;
-    children.push_back(_child.get());
-    return children;
 }
 
 unique_ptr<PlanStageStats> FetchStage::getStats() {
@@ -241,12 +222,8 @@ unique_ptr<PlanStageStats> FetchStage::getStats() {
 
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
     ret->specific = make_unique<FetchStats>(_specificStats);
-    ret->children.push_back(_child->getStats().release());
+    ret->children.emplace_back(child()->getStats());
     return ret;
-}
-
-const CommonStats* FetchStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* FetchStage::getSpecificStats() const {

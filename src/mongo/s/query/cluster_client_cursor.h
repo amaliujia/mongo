@@ -30,13 +30,13 @@
 
 #include <boost/optional.hpp>
 
-#include "mongo/base/status_with.h"
-#include "mongo/executor/task_executor.h"
-#include "mongo/s/query/cluster_client_cursor_params.h"
-#include "mongo/s/query/async_cluster_client_cursor.h"
-#include "mongo/util/net/hostandport.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+template <typename T>
+class StatusWith;
 
 /**
  * ClusterClientCursor is used to generate results from cursor-generating commands on one or
@@ -45,19 +45,13 @@ namespace mongo {
  * all command results, getMores must be issued against each of the remote cursors until they
  * are exhausted.
  *
- * ClusterClientCursor provides a simple blocking interface wrapping AsyncClientCursor's
- * non-blocking interface.
+ * Results are generated using a pipeline of mongoS query execution stages called RouterExecStage.
  *
  * Does not throw exceptions.
  */
 class ClusterClientCursor {
 public:
-    /**
-     * Constructs a cluster client cursor.
-     */
-    ClusterClientCursor(executor::TaskExecutor* executor,
-                        const ClusterClientCursorParams& params,
-                        const std::vector<HostAndPort>& remotes);
+    virtual ~ClusterClientCursor(){};
 
     /**
      * Returns the next available result document (along with an ok status). May block waiting
@@ -68,7 +62,7 @@ public:
      *
      * A non-ok status is returned in case of any error.
      */
-    StatusWith<boost::optional<BSONObj>> next();
+    virtual StatusWith<boost::optional<BSONObj>> next() = 0;
 
     /**
      * Must be called before destruction to abandon a not-yet-exhausted cursor. If next() has
@@ -76,16 +70,41 @@ public:
      *
      * May block waiting for responses from remote hosts.
      */
-    void kill();
+    virtual void kill() = 0;
 
-private:
-    // Not owned here.
-    executor::TaskExecutor* _executor;
+    /**
+     * Returns whether or not this cursor is tailing a capped collection on a shard.
+     */
+    virtual bool isTailable() const = 0;
 
-    const ClusterClientCursorParams _params;
+    /**
+     * Returns the number of result documents returned so far by this cursor via the next() method.
+     */
+    virtual long long getNumReturnedSoFar() const = 0;
 
-    // Does work of scheduling remote work and merging results.
-    AsyncClusterClientCursor _accc;
+    /**
+     * Stash the BSONObj so that it gets returned from the CCC on a later call to next().
+     *
+     * Queued documents are returned in FIFO order. The queued results are exhausted before
+     * generating further results from the underlying mongos query stages.
+     *
+     * 'obj' must be owned BSON.
+     */
+    virtual void queueResult(const BSONObj& obj) = 0;
+
+    /**
+     * Returns whether or not all the remote cursors underlying this cursor have been exhausted.
+     */
+    virtual bool remotesExhausted() = 0;
+
+    /**
+     * Sets the maxTimeMS value that the cursor should forward with any internally issued getMore
+     * requests.
+     *
+     * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e. if
+     * the cursor is not tailable + awaitData).
+     */
+    virtual Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) = 0;
 };
 
 }  // namespace mongo

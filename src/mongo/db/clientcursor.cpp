@@ -80,14 +80,15 @@ long long ClientCursor::totalOpen() {
 ClientCursor::ClientCursor(CursorManager* cursorManager,
                            PlanExecutor* exec,
                            const std::string& ns,
+                           bool isReadCommitted,
                            int qopts,
                            const BSONObj query,
                            bool isAggCursor)
     : _ns(ns),
+      _isReadCommitted(isReadCommitted),
       _cursorManager(cursorManager),
       _countedYet(false),
-      _isAggCursor(isAggCursor),
-      _unownedRU(NULL) {
+      _isAggCursor(isAggCursor) {
     _exec.reset(exec);
     _query = query;
     _queryOptions = qopts;
@@ -99,11 +100,11 @@ ClientCursor::ClientCursor(CursorManager* cursorManager,
 
 ClientCursor::ClientCursor(const Collection* collection)
     : _ns(collection->ns().ns()),
+      _isReadCommitted(false),
       _cursorManager(collection->getCursorManager()),
       _countedYet(false),
       _queryOptions(QueryOption_NoCursorTimeout),
-      _isAggCursor(false),
-      _unownedRU(NULL) {
+      _isAggCursor(false) {
     init();
 }
 
@@ -153,7 +154,6 @@ ClientCursor::~ClientCursor() {
 
     // defensive:
     _cursorManager = NULL;
-    _cursorid = INVALID_CURSOR_ID;
     _pos = -2;
     _isNoTimeout = false;
 }
@@ -194,30 +194,6 @@ void ClientCursor::updateSlaveLocation(OperationContext* txn) {
         return;
 
     repl::getGlobalReplicationCoordinator()->setLastOptimeForSlave(rid, _slaveReadTill);
-}
-
-//
-// Storage engine state for getMore.
-//
-
-void ClientCursor::setUnownedRecoveryUnit(RecoveryUnit* ru) {
-    invariant(!_unownedRU);
-    invariant(!_ownedRU.get());
-    _unownedRU = ru;
-}
-
-RecoveryUnit* ClientCursor::getUnownedRecoveryUnit() const {
-    return _unownedRU;
-}
-
-void ClientCursor::setOwnedRecoveryUnit(RecoveryUnit* ru) {
-    invariant(!_unownedRU);
-    invariant(!_ownedRU.get());
-    _ownedRU.reset(ru);
-}
-
-RecoveryUnit* ClientCursor::releaseOwnedRecoveryUnit() {
-    return _ownedRU.release();
 }
 
 //
@@ -320,57 +296,5 @@ void _appendCursorStats(BSONObjBuilder& b) {
 void startClientCursorMonitor() {
     clientCursorMonitor.go();
 }
-
-// QUESTION: Restrict to the namespace from which this command was issued?
-// Alternatively, make this command admin-only?
-// TODO: remove this for 3.0
-class CmdCursorInfo : public Command {
-public:
-    CmdCursorInfo() : Command("cursorInfo") {}
-    virtual bool slaveOk() const {
-        return true;
-    }
-    virtual void help(stringstream& help) const {
-        help << " example: { cursorInfo : 1 }, deprecated";
-    }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::cursorInfo);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& jsobj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        _appendCursorStats(result);
-        return true;
-    }
-} cmdCursorInfo;
-
-//
-// cursors stats.
-//
-
-class CursorServerStats : public ServerStatusSection {
-public:
-    CursorServerStats() : ServerStatusSection("cursors") {}
-    virtual bool includeByDefault() const {
-        return true;
-    }
-
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
-        BSONObjBuilder b;
-        _appendCursorStats(b);
-        return b.obj();
-    }
-
-} cursorServerStats;
 
 }  // namespace mongo

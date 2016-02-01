@@ -47,7 +47,7 @@ OplogStart::OplogStart(OperationContext* txn,
                        const Collection* collection,
                        MatchExpression* filter,
                        WorkingSet* ws)
-    : _txn(txn),
+    : PlanStage(kStageType, txn),
       _needInit(true),
       _backwardsScanning(false),
       _extentHopping(false),
@@ -56,15 +56,13 @@ OplogStart::OplogStart(OperationContext* txn,
       _workingSet(ws),
       _filter(filter) {}
 
-OplogStart::~OplogStart() {}
-
-PlanStage::StageState OplogStart::work(WorkingSetID* out) {
+PlanStage::StageState OplogStart::doWork(WorkingSetID* out) {
     // We do our (heavy) init in a work(), where work is expected.
     if (_needInit) {
         CollectionScanParams params;
         params.collection = _collection;
         params.direction = CollectionScanParams::BACKWARD;
-        _cs.reset(new CollectionScan(_txn, params, _workingSet, NULL));
+        _children.emplace_back(new CollectionScan(getOpCtx(), params, _workingSet, NULL));
 
         _needInit = false;
         _backwardsScanning = true;
@@ -109,7 +107,7 @@ PlanStage::StageState OplogStart::workExtentHopping(WorkingSetID* out) {
                 WorkingSetID id = _workingSet->allocate();
                 WorkingSetMember* member = _workingSet->get(id);
                 member->loc = record->id;
-                member->obj = {_txn->recoveryUnit()->getSnapshotId(), std::move(obj)};
+                member->obj = {getOpCtx()->recoveryUnit()->getSnapshotId(), std::move(obj)};
                 _workingSet->transitionToLocAndObj(id);
                 *out = id;
                 return PlanStage::ADVANCED;
@@ -126,18 +124,18 @@ PlanStage::StageState OplogStart::workExtentHopping(WorkingSetID* out) {
 
 void OplogStart::switchToExtentHopping() {
     // Set up our extent hopping state.
-    _subIterators = _collection->getManyCursors(_txn);
+    _subIterators = _collection->getManyCursors(getOpCtx());
 
     // Transition from backwards scanning to extent hopping.
     _backwardsScanning = false;
     _extentHopping = true;
 
     // Toss the collection scan we were using.
-    _cs.reset();
+    _children.clear();
 }
 
 PlanStage::StageState OplogStart::workBackwardsScan(WorkingSetID* out) {
-    PlanStage::StageState state = _cs->work(out);
+    PlanStage::StageState state = child()->work(out);
 
     // EOF.  Just start from the beginning, which is where we've hit.
     if (PlanStage::IS_EOF == state) {
@@ -167,7 +165,7 @@ bool OplogStart::isEOF() {
     return _done;
 }
 
-void OplogStart::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
+void OplogStart::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
     if (_needInit) {
         return;
     }
@@ -176,39 +174,36 @@ void OplogStart::invalidate(OperationContext* txn, const RecordId& dl, Invalidat
         return;
     }
 
-    if (_cs) {
-        _cs->invalidate(txn, dl, type);
-    }
-
     for (size_t i = 0; i < _subIterators.size(); i++) {
-        _subIterators[i]->invalidate(dl);
+        _subIterators[i]->invalidate(txn, dl);
     }
 }
 
-void OplogStart::saveState() {
-    _txn = NULL;
-    if (_cs) {
-        _cs->saveState();
-    }
-
+void OplogStart::doSaveState() {
     for (size_t i = 0; i < _subIterators.size(); i++) {
-        _subIterators[i]->savePositioned();
+        _subIterators[i]->save();
     }
 }
 
-void OplogStart::restoreState(OperationContext* opCtx) {
-    invariant(_txn == NULL);
-    _txn = opCtx;
-    if (_cs) {
-        _cs->restoreState(opCtx);
-    }
-
+void OplogStart::doRestoreState() {
     for (size_t i = 0; i < _subIterators.size(); i++) {
-        if (!_subIterators[i]->restore(opCtx)) {
+        if (!_subIterators[i]->restore()) {
             _subIterators.erase(_subIterators.begin() + i);
             // need to hit same i on next pass through loop
             i--;
         }
+    }
+}
+
+void OplogStart::doDetachFromOperationContext() {
+    for (auto&& iterator : _subIterators) {
+        iterator->detachFromOperationContext();
+    }
+}
+
+void OplogStart::doReattachToOperationContext() {
+    for (auto&& iterator : _subIterators) {
+        iterator->reattachToOperationContext(getOpCtx());
     }
 }
 
@@ -217,11 +212,6 @@ unique_ptr<PlanStageStats> OplogStart::getStats() {
         make_unique<PlanStageStats>(CommonStats(kStageType), STAGE_OPLOG_START);
     ret->specific = make_unique<CollectionScanStats>();
     return ret;
-}
-
-vector<PlanStage*> OplogStart::getChildren() const {
-    vector<PlanStage*> empty;
-    return empty;
 }
 
 int OplogStart::_backwardsScanTime = 5;

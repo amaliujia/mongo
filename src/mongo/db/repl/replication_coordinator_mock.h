@@ -31,8 +31,14 @@
 #include "mongo/base/status.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
+
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
+
 namespace repl {
 
 /**
@@ -50,6 +56,10 @@ public:
 
     virtual void shutdown();
 
+    virtual ReplicationExecutor* getExecutor() override {
+        return nullptr;
+    };
+
     virtual const ReplSettings& getSettings() const;
 
     virtual bool isReplEnabled() const;
@@ -57,6 +67,8 @@ public:
     virtual Mode getReplicationMode() const;
 
     virtual MemberState getMemberState() const;
+
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState() const;
 
@@ -93,14 +105,16 @@ public:
 
     virtual void setMyLastOptime(const OpTime& opTime);
 
+    virtual void setMyLastOptimeForward(const OpTime& opTime);
+
     virtual void resetMyLastOptime();
 
     virtual void setMyHeartbeatMessage(const std::string& msg);
 
     virtual OpTime getMyLastOptime() const;
 
-    virtual ReadAfterOpTimeResponse waitUntilOpTime(OperationContext* txn,
-                                                    const ReadAfterOpTimeArgs& settings) override;
+    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
+                                                const ReadConcernArgs& settings) override;
 
     virtual OID getElectionId();
 
@@ -114,6 +128,8 @@ public:
 
     virtual void signalDrainComplete(OperationContext*);
 
+    virtual Status waitForDrainFinish(Milliseconds timeout) override;
+
     virtual void signalUpstreamUpdater();
 
     virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder);
@@ -124,11 +140,15 @@ public:
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result);
 
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
+
     virtual ReplicaSetConfig getConfig() const;
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result);
 
-    virtual void processReplicationMetadata(const ReplicationMetadata& replMetadata);
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata);
+
+    virtual void cancelAndRescheduleElectionTimeout() override;
 
     virtual Status setMaintenanceMode(bool activate);
 
@@ -172,13 +192,15 @@ public:
 
     virtual Status checkReplEnabledForCommand(BSONObjBuilder* result);
 
-    virtual HostAndPort chooseNewSyncSource();
+    virtual HostAndPort chooseNewSyncSource(const Timestamp& lastTimestampFetched);
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
     virtual void resetLastOpTimeFromOplog(OperationContext* txn);
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource);
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -189,7 +211,9 @@ public:
     virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
                                                        long long* responseTerm);
 
-    virtual void prepareReplResponseMetadata(BSONObjBuilder* objBuilder);
+    void prepareReplResponseMetadata(const rpc::RequestInterface& request,
+                                     const OpTime& lastOpTimeFromClient,
+                                     BSONObjBuilder* builder) override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response);
@@ -200,11 +224,25 @@ public:
 
     virtual long long getTerm();
 
-    virtual Status updateTerm(long long term);
+    virtual Status updateTerm(OperationContext* txn, long long term);
 
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot);
+    virtual SnapshotName reserveSnapshotName(OperationContext* txn);
+
+    virtual void forceSnapshotCreation() override;
+
+    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name);
+
+    virtual void dropAllSnapshots() override;
+
+    virtual OpTime getCurrentCommittedSnapshotOpTime() override;
+
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) override;
+
+    virtual size_t getNumUncommittedSnapshots() override;
 
 private:
+    AtomicUInt64 _snapshotNameGenerator;
     const ReplSettings _settings;
     MemberState _memberState;
     OpTime _myLastOpTime;

@@ -39,6 +39,7 @@
 namespace mongo {
 
 class OperationContext;
+struct PlanSummaryStats;
 
 struct UpdateStageParams {
     UpdateStageParams(const UpdateRequest* r, UpdateDriver* d, OpDebug* o)
@@ -71,7 +72,7 @@ private:
  *
  * Callers of work() must be holding a write lock.
  */
-class UpdateStage : public PlanStage {
+class UpdateStage final : public PlanStage {
     MONGO_DISALLOW_COPYING(UpdateStage);
 
 public:
@@ -81,37 +82,41 @@ public:
                 Collection* collection,
                 PlanStage* child);
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doRestoreState() final;
 
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_UPDATE;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const CommonStats* getCommonStats() const;
-
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
     /**
-     * Converts the execution stats (stored by the update stage as an UpdateStats) for the
-     * update plan represented by 'exec' into the UpdateResult format used to report the results
-     * of writes.
+     * Gets a pointer to the UpdateStats inside 'exec'.
      *
-     * Also responsible for filling out 'opDebug' with execution info.
-     *
-     * Should only be called once this stage is EOF.
+     * The 'exec' must have an UPDATE stage as its root stage, and the plan must be EOF before
+     * calling this method.
      */
-    static UpdateResult makeUpdateResult(const PlanExecutor& exec, OpDebug* opDebug);
+    static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
+
+    /**
+     * Populate 'opDebug' with stats from 'updateStats' and 'summaryStats' describing the execution
+     * of this update.
+     */
+    static void fillOutOpDebug(const UpdateStats* updateStats,
+                               const PlanSummaryStats* summaryStats,
+                               OpDebug* opDebug);
+
+    /**
+     * Converts 'updateStats' into an UpdateResult.
+     */
+    static UpdateResult makeUpdateResult(const UpdateStats* updateStats);
 
     /**
      * Computes the document to insert if the upsert flag is set to true and no matching
@@ -169,10 +174,7 @@ private:
     /**
      * Helper for restoring the state of this update.
      */
-    Status restoreUpdateState(OperationContext* opCtx);
-
-    // Transactional context.  Not owned by us.
-    OperationContext* _txn;
+    Status restoreUpdateState();
 
     UpdateStageParams _params;
 
@@ -182,9 +184,6 @@ private:
     // Not owned by us. May be NULL.
     Collection* _collection;
 
-    // Owned by us.
-    std::unique_ptr<PlanStage> _child;
-
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;
 
@@ -192,7 +191,6 @@ private:
     WorkingSetID _idReturning;
 
     // Stats
-    CommonStats _commonStats;
     UpdateStats _specificStats;
 
     // If the update was in-place, we may see it again.  This only matters if we're doing

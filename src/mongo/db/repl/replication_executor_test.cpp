@@ -58,7 +58,7 @@ const int64_t prngSeed = 1;
 MONGO_INITIALIZER(ReplExecutorCommonTests)(InitializerContext*) {
     mongo::executor::addTestsForExecutor(
         "ReplicationExecutorCommon",
-        [](std::unique_ptr<executor::NetworkInterface>* net) {
+        [](std::unique_ptr<executor::NetworkInterfaceMock>* net) {
             return stdx::make_unique<ReplicationExecutor>(
                 net->release(), new StorageInterfaceMock(), prngSeed);
         });
@@ -148,6 +148,27 @@ TEST_F(ReplicationExecutorTest, ShutdownBeforeRunningSecondExclusiveLockOperatio
     executor.run();
     ASSERT_OK(status1);
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status2.code());
+}
+
+TEST_F(ReplicationExecutorTest, CancelBeforeRunningFutureWork) {
+    ReplicationExecutor& executor = getReplExecutor();
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    Status status1 = getDetectableErrorStatus();
+    auto cbhWithStatus =
+        executor.scheduleWorkAt(executor.now() + Milliseconds(1000),
+                                [&](const CallbackData& cbData) {
+                                    status1 = cbData.status;
+                                    if (cbData.status != ErrorCodes::CallbackCanceled)
+                                        cbData.executor->shutdown();
+                                });
+    ASSERT_OK(cbhWithStatus.getStatus());
+
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+    executor.cancel(cbhWithStatus.getValue());
+
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
 }
 
 }  // namespace

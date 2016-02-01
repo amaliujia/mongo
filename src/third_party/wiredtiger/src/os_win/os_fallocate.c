@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -24,7 +24,7 @@ __wt_fallocate_config(WT_SESSION_IMPL *session, WT_FH *fh)
 	 * support the call.
 	 */
 	fh->fallocate_available = WT_FALLOCATE_NOT_AVAILABLE;
-	fh->fallocate_requires_locking = 0;
+	fh->fallocate_requires_locking = false;
 }
 
 /*

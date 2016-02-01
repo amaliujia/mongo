@@ -64,7 +64,7 @@ class OperationContext;
  *
  *   --Plans for entire rooted $or queries are neither written to nor read from the plan cache.
  */
-class SubplanStage : public PlanStage {
+class SubplanStage final : public PlanStage {
 public:
     SubplanStage(OperationContext* txn,
                  Collection* collection,
@@ -74,24 +74,16 @@ public:
 
     static bool canUseSubplanning(const CanonicalQuery& query);
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_SUBPLAN;
     }
 
     std::unique_ptr<PlanStageStats> getStats();
 
-    virtual const CommonStats* getCommonStats() const;
-
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -180,9 +172,6 @@ private:
      */
     Status choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy);
 
-    // transactional context for read locks. Not owned by us
-    OperationContext* _txn;
-
     // Not owned here. Must be non-null.
     Collection* _collection;
 
@@ -203,15 +192,11 @@ private:
     // independently, that solution is owned here.
     std::unique_ptr<QuerySolution> _compositeSolution;
 
-    std::unique_ptr<PlanStage> _child;
-
     // Holds a list of the results from planning each branch.
     OwnedPointerVector<BranchPlanningResult> _branchResults;
 
     // We need this to extract cache-friendly index data from the index assignments.
     std::map<BSONObj, size_t> _indexMap;
-
-    CommonStats _commonStats;
 };
 
 }  // namespace mongo

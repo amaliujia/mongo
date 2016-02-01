@@ -56,12 +56,10 @@ public:
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
-    static const BSONField<BSONArray> version;
     static const BSONField<std::string> shard;
     static const BSONField<bool> jumbo;
     static const BSONField<Date_t> DEPRECATED_lastmod;
     static const BSONField<OID> DEPRECATED_epoch;
-
 
     /**
      * Constructs a new ChunkType object from BSON.

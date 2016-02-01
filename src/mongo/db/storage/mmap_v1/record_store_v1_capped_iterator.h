@@ -41,7 +41,7 @@ struct Extent;
  * This class iterates over a capped collection identified by 'ns'.
  * The collection must exist when the constructor is called.
  */
-class CappedRecordStoreV1Iterator final : public RecordCursor {
+class CappedRecordStoreV1Iterator final : public SeekableRecordCursor {
 public:
     CappedRecordStoreV1Iterator(OperationContext* txn,
                                 const CappedRecordStoreV1* collection,
@@ -49,9 +49,15 @@ public:
 
     boost::optional<Record> next() final;
     boost::optional<Record> seekExact(const RecordId& id) final;
-    void savePositioned() final;
-    bool restore(OperationContext* txn) final;
-    void invalidate(const RecordId& dl) final;
+    void save() final;
+    bool restore() final;
+    void detachFromOperationContext() final {
+        _txn = nullptr;
+    }
+    void reattachToOperationContext(OperationContext* txn) final {
+        _txn = txn;
+    }
+    void invalidate(OperationContext* txn, const RecordId& dl) final;
     std::unique_ptr<RecordFetcher> fetcherForNext() const final;
     std::unique_ptr<RecordFetcher> fetcherForId(const RecordId& id) const final;
 

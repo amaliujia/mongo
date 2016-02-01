@@ -73,11 +73,13 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "query = " << query << '\n';
+    *ss << "query = " << ftsQuery->getQuery() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "language = " << language << '\n';
+    *ss << "language = " << ftsQuery->getLanguage() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "caseSensitive= " << caseSensitive << '\n';
+    *ss << "caseSensitive= " << ftsQuery->getCaseSensitive() << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "diacriticSensitive= " << ftsQuery->getDiacriticSensitive() << '\n';
     addIndent(ss, indent + 1);
     *ss << "indexPrefix = " << indexPrefix.toString() << '\n';
     if (NULL != filter) {
@@ -93,9 +95,7 @@ QuerySolutionNode* TextNode::clone() const {
 
     copy->_sort = this->_sort;
     copy->indexKeyPattern = this->indexKeyPattern;
-    copy->query = this->query;
-    copy->language = this->language;
-    copy->caseSensitive = this->caseSensitive;
+    copy->ftsQuery = this->ftsQuery->clone();
     copy->indexPrefix = this->indexPrefix;
 
     return copy;
@@ -638,6 +638,31 @@ QuerySolutionNode* ProjectionNode::clone() const {
 }
 
 //
+// SortKeyGeneratorNode
+//
+
+void SortKeyGeneratorNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "SORT_KEY_GENERATOR\n";
+    addIndent(ss, indent + 1);
+    *ss << "sortSpec = " << sortSpec.toString() << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "queryObj = " << queryObj.toString() << '\n';
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* SortKeyGeneratorNode::clone() const {
+    SortKeyGeneratorNode* copy = new SortKeyGeneratorNode();
+    cloneBaseData(copy);
+    copy->queryObj = this->queryObj;
+    copy->sortSpec = this->sortSpec;
+    return copy;
+}
+
+//
 // SortNode
 //
 
@@ -646,8 +671,6 @@ void SortNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "SORT\n";
     addIndent(ss, indent + 1);
     *ss << "pattern = " << pattern.toString() << '\n';
-    addIndent(ss, indent + 1);
-    *ss << "query for bounds = " << query.toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "limit = " << limit << '\n';
     addCommon(ss, indent);
@@ -662,7 +685,6 @@ QuerySolutionNode* SortNode::clone() const {
 
     copy->_sorts = this->_sorts;
     copy->pattern = this->pattern;
-    copy->query = this->query;
     copy->limit = this->limit;
 
     return copy;
@@ -866,10 +888,10 @@ QuerySolutionNode* DistinctNode::clone() const {
 }
 
 //
-// CountNode
+// CountScanNode
 //
 
-void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
@@ -880,8 +902,8 @@ void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "endKey = " << endKey << '\n';
 }
 
-QuerySolutionNode* CountNode::clone() const {
-    CountNode* copy = new CountNode();
+QuerySolutionNode* CountScanNode::clone() const {
+    CountScanNode* copy = new CountScanNode();
     cloneBaseData(copy);
 
     copy->sorts = this->sorts;
@@ -890,6 +912,30 @@ QuerySolutionNode* CountNode::clone() const {
     copy->startKeyInclusive = this->startKeyInclusive;
     copy->endKey = this->endKey;
     copy->endKeyInclusive = this->endKeyInclusive;
+
+    return copy;
+}
+
+//
+// EnsureSortedNode
+//
+
+void EnsureSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "ENSURE_SORTED\n";
+    addIndent(ss, indent + 1);
+    *ss << "pattern = " << pattern.toString() << '\n';
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* EnsureSortedNode::clone() const {
+    EnsureSortedNode* copy = new EnsureSortedNode();
+    cloneBaseData(copy);
+
+    copy->pattern = this->pattern;
 
     return copy;
 }

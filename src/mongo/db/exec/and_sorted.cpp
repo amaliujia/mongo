@@ -44,34 +44,26 @@ using stdx::make_unique;
 // static
 const char* AndSortedStage::kStageType = "AND_SORTED";
 
-AndSortedStage::AndSortedStage(WorkingSet* ws, const Collection* collection)
-    : _collection(collection),
+AndSortedStage::AndSortedStage(OperationContext* opCtx,
+                               WorkingSet* ws,
+                               const Collection* collection)
+    : PlanStage(kStageType, opCtx),
+      _collection(collection),
       _ws(ws),
       _targetNode(numeric_limits<size_t>::max()),
       _targetId(WorkingSet::INVALID_ID),
-      _isEOF(false),
-      _commonStats(kStageType) {}
+      _isEOF(false) {}
 
-AndSortedStage::~AndSortedStage() {
-    for (size_t i = 0; i < _children.size(); ++i) {
-        delete _children[i];
-    }
-}
 
 void AndSortedStage::addChild(PlanStage* child) {
-    _children.push_back(child);
+    _children.emplace_back(child);
 }
 
 bool AndSortedStage::isEOF() {
     return _isEOF;
 }
 
-PlanStage::StageState AndSortedStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState AndSortedStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -118,12 +110,14 @@ PlanStage::StageState AndSortedStage::getTargetLoc(WorkingSetID* out) {
         _targetId = id;
         _targetLoc = member->loc;
 
+        // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+        member->makeObjOwnedIfNeeded();
+
         // We have to AND with all other children.
         for (size_t i = 1; i < _children.size(); ++i) {
             _workingTowardRep.push(i);
         }
 
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == state) {
         _isEOF = true;
@@ -142,10 +136,7 @@ PlanStage::StageState AndSortedStage::getTargetLoc(WorkingSetID* out) {
         _isEOF = true;
         return state;
     } else {
-        if (PlanStage::NEED_TIME == state) {
-            ++_commonStats.needTime;
-        } else if (PlanStage::NEED_YIELD == state) {
-            ++_commonStats.needYield;
+        if (PlanStage::NEED_YIELD == state) {
             *out = id;
         }
 
@@ -160,7 +151,7 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
 
     // We have nodes that haven't hit _targetLoc yet.
     size_t workingChildNumber = _workingTowardRep.front();
-    PlanStage* next = _children[workingChildNumber];
+    auto& next = _children[workingChildNumber];
     WorkingSetID id = WorkingSet::INVALID_ID;
     StageState state = next->work(&id);
 
@@ -191,17 +182,14 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
                 _targetLoc = RecordId();
 
                 *out = toReturn;
-                ++_commonStats.advanced;
                 return PlanStage::ADVANCED;
             }
             // More children need to be advanced to _targetLoc.
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         } else if (member->loc < _targetLoc) {
             // The front element of _workingTowardRep hasn't hit the thing we're AND-ing with
             // yet.  Try again later.
             _ws->free(id);
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         } else {
             // member->loc > _targetLoc.
@@ -213,6 +201,10 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
             _targetNode = workingChildNumber;
             _targetLoc = member->loc;
             _targetId = id;
+
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+            member->makeObjOwnedIfNeeded();
+
             _workingTowardRep = std::queue<size_t>();
             for (size_t i = 0; i < _children.size(); ++i) {
                 if (workingChildNumber != i) {
@@ -220,7 +212,6 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
                 }
             }
             // Need time to chase after the new _targetLoc.
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     } else if (PlanStage::IS_EOF == state) {
@@ -242,10 +233,7 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
         _ws->free(_targetId);
         return state;
     } else {
-        if (PlanStage::NEED_TIME == state) {
-            ++_commonStats.needTime;
-        } else if (PlanStage::NEED_YIELD == state) {
-            ++_commonStats.needYield;
+        if (PlanStage::NEED_YIELD == state) {
             *out = id;
         }
 
@@ -253,31 +241,13 @@ PlanStage::StageState AndSortedStage::moveTowardTargetLoc(WorkingSetID* out) {
     }
 }
 
-void AndSortedStage::saveState() {
-    ++_commonStats.yields;
 
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->saveState();
-    }
-}
-
-void AndSortedStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->restoreState(opCtx);
-    }
-}
-
-void AndSortedStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-
+void AndSortedStage::doInvalidate(OperationContext* txn,
+                                  const RecordId& dl,
+                                  InvalidationType type) {
+    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
     if (isEOF()) {
         return;
-    }
-
-    for (size_t i = 0; i < _children.size(); ++i) {
-        _children[i]->invalidate(txn, dl, type);
     }
 
     if (dl == _targetLoc) {
@@ -298,24 +268,16 @@ void AndSortedStage::invalidate(OperationContext* txn, const RecordId& dl, Inval
     }
 }
 
-vector<PlanStage*> AndSortedStage::getChildren() const {
-    return _children;
-}
-
 unique_ptr<PlanStageStats> AndSortedStage::getStats() {
     _commonStats.isEOF = isEOF();
 
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_AND_SORTED);
     ret->specific = make_unique<AndSortedStats>(_specificStats);
     for (size_t i = 0; i < _children.size(); ++i) {
-        ret->children.push_back(_children[i]->getStats().release());
+        ret->children.emplace_back(_children[i]->getStats());
     }
 
     return ret;
-}
-
-const CommonStats* AndSortedStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* AndSortedStage::getSpecificStats() const {

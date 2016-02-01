@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/dbclient_shard_resolver.h"
 
 #include <set>
@@ -39,10 +41,11 @@ namespace mongo {
 
 using std::string;
 
-Status DBClientShardResolver::chooseWriteHost(const string& shardName,
+Status DBClientShardResolver::chooseWriteHost(OperationContext* txn,
+                                              const string& shardName,
                                               ConnectionString* shardHost) const {
     // Internally uses our shard cache, does no reload
-    std::shared_ptr<Shard> shard = grid.shardRegistry()->getShard(shardName);
+    std::shared_ptr<Shard> shard = grid.shardRegistry()->getShard(txn, shardName);
     if (!shard) {
         return Status(ErrorCodes::ShardNotFound,
                       str::stream() << "unknown shard name " << shardName);

@@ -46,8 +46,21 @@ class IndexDescriptor;
 class NamespaceString;
 class OperationContext;
 class ServiceContext;
+class SnapshotName;
 class Timestamp;
 struct WriteConcernOptions;
+
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
+
+namespace rpc {
+
+class ReplSetMetadata;
+class RequestInterface;
+class ReplSetMetadata;
+
+}  // namespace rpc
 
 namespace repl {
 
@@ -56,8 +69,10 @@ class HandshakeArgs;
 class IsMasterResponse;
 class OplogReader;
 class OpTime;
-class ReadAfterOpTimeArgs;
-class ReadAfterOpTimeResponse;
+class ReadConcernArgs;
+class ReadConcernResponse;
+class ReplicaSetConfig;
+class ReplicationExecutor;
 class ReplSetDeclareElectionWinnerArgs;
 class ReplSetDeclareElectionWinnerResponse;
 class ReplSetHeartbeatArgs;
@@ -66,8 +81,6 @@ class ReplSetHeartbeatResponse;
 class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
-class ReplicaSetConfig;
-class ReplicationMetadata;
 class UpdatePositionArgs;
 
 /**
@@ -122,6 +135,11 @@ public:
     virtual void shutdown() = 0;
 
     /**
+     * Returns a pointer to the ReplicationExecutor.
+     */
+    virtual ReplicationExecutor* getExecutor() = 0;
+
+    /**
      * Returns a reference to the parsed command line arguments that are related to replication.
      */
     virtual const ReplSettings& getSettings() const = 0;
@@ -147,6 +165,14 @@ public:
     virtual MemberState getMemberState() const = 0;
 
     /**
+     * Waits for 'timeout' ms for member state to become 'state'.
+     * Returns OK if member state is 'state'.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the state change.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) = 0;
+
+    /**
      * Returns true if this node is in state PRIMARY or SECONDARY.
      *
      * It is invalid to call this unless getReplicationMode() == modeReplSet.
@@ -158,10 +184,8 @@ public:
 
 
     /**
-     * Returns how slave delayed this node is configured to be.
-     *
-     * Raises a DBException if this node is not a member of the current replica set
-     * configuration.
+     * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
+     * member of the current replica set configuration.
      */
     virtual Seconds getSlaveDelaySecs() const = 0;
 
@@ -276,6 +300,16 @@ public:
     virtual void setMyLastOptime(const OpTime& opTime) = 0;
 
     /**
+     * Updates our internal tracking of the last OpTime applied to this node, but only
+     * if the supplied optime is later than the current last OpTime known to the replication
+     * coordinator.
+     *
+     * This function is used by logOp() on a primary, since the ops in the oplog do not
+     * necessarily commit in sequential order.
+     */
+    virtual void setMyLastOptimeForward(const OpTime& opTime) = 0;
+
+    /**
      * Same as above, but used during places we need to zero our last optime.
      */
     virtual void resetMyLastOptime() = 0;
@@ -294,18 +328,13 @@ public:
      * Waits until the optime of the current node is at least the opTime specified in
      * 'settings'.
      *
-     * The returned ReadAfterOpTimeResponse object's didWait() method returns true if
-     * an attempt was made to wait for the specified opTime. Cases when this can be
-     * false could include:
+     * The returned ReadConcernResponse object's didWait() method returns true if
+     * an attempt was made to wait for the specified opTime. This will return false when
+     * attempting to do read after opTime when node is not a replica set member.
      *
-     * 1. No read after opTime was specified.
-     * 2. Attempting to do read after opTime when node is not a replica set member.
-     *
-     * Note: getDuration() on the returned ReadAfterOpTimeResponse will only be valid if
-     * its didWait() method returns true.
      */
-    virtual ReadAfterOpTimeResponse waitUntilOpTime(OperationContext* txn,
-                                                    const ReadAfterOpTimeArgs& settings) = 0;
+    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
+                                                const ReadConcernArgs& settings) = 0;
 
     /**
      * Retrieves and returns the current election id, which is a unique id that is local to
@@ -359,6 +388,15 @@ public:
     virtual void signalDrainComplete(OperationContext* txn) = 0;
 
     /**
+     * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
+     * Returns OK if isWaitingForApplierToDrain() returns false.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
+     * buffer.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForDrainFinish(Milliseconds timeout) = 0;
+
+    /**
      * Signals the sync source feedback thread to wake up and send a handshake and
      * replSetUpdatePosition command to our sync source.
      */
@@ -400,14 +438,24 @@ public:
     virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
 
     /**
-     * Processes the ReplicationMetadata returned from a command run against another replica set
+     * Processes the ReplSetMetadata returned from a command run against another replica set
      * member and updates protocol version 1 information (most recent optime that is committed,
      * member id of the current PRIMARY, the current config version and the current term).
      *
      * TODO(dannenberg): Move this method to be testing only if it does not end up being used
      * to process the find and getmore metadata responses from the DataReplicator.
      */
-    virtual void processReplicationMetadata(const ReplicationMetadata& replMetadata) = 0;
+    virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
+
+    /**
+     * Elections under protocol version 1 are triggered by a timer.
+     * When a node is informed of the primary's liveness (either through heartbeats or
+     * while reading a sync source's oplog), it calls this function to postpone the
+     * election timer by a duration of at least 'electionTimeoutMillis' (see getConfig()).
+     * If the current node is not electable (secondary with priority > 0), this function
+     * cancels the existing timer but will not schedule a new one.
+     */
+    virtual void cancelAndRescheduleElectionTimeout() = 0;
 
     /**
      * Toggles maintenanceMode to the value expressed by 'activate'
@@ -519,7 +567,7 @@ public:
      * Returns Status::OK() if all updates are processed correctly, NodeNotFound
      * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
      * "configVersion" sent in any of the updates doesn't match our config version, or
-     * NotMasterOrSecondaryCode if we are in state REMOVED or otherwise don't have a valid
+     * NotMasterOrSecondary if we are in state REMOVED or otherwise don't have a valid
      * replica set config.
      * If a non-OK status is returned, it is unspecified whether none or some of the updates
      * were applied.
@@ -601,9 +649,11 @@ public:
                                                        long long* responseTerm) = 0;
 
     /**
-     * Prepares a BSONObj describing the current term, primary, and lastOp information.
+     * Prepares a metadata object describing the current term, primary, and lastOp information.
      */
-    virtual void prepareReplResponseMetadata(BSONObjBuilder* objBuilder) = 0;
+    virtual void prepareReplResponseMetadata(const rpc::RequestInterface& request,
+                                             const OpTime& lastOpTimeFromClient,
+                                             BSONObjBuilder* builder) = 0;
 
     /**
      * Returns true if the V1 election protocol is being used and false otherwise.
@@ -628,12 +678,66 @@ public:
      * the rest of the work, because the term is still the same).
      * Returns StaleTerm if the supplied term was higher than the current term.
      */
-    virtual Status updateTerm(long long term) = 0;
+    virtual Status updateTerm(OperationContext* txn, long long term) = 0;
+
+    /**
+     * Reserves a unique SnapshotName.
+     *
+     * This name is guaranteed to compare > all names reserved before and < all names reserved
+     * after.
+     *
+     * This method will not take any locks or attempt to access storage using the passed-in
+     * OperationContext. It will only be used to track reserved SnapshotNames by each operation so
+     * that awaitReplicationOfLastOpForClient() can correctly wait for the reserved snapshot to be
+     * visible.
+     *
+     * A null OperationContext can be used in cases where the snapshot to wait for should not be
+     * adjusted.
+     */
+    virtual SnapshotName reserveSnapshotName(OperationContext* txn) = 0;
+
+    /**
+     * Signals the SnapshotThread, if running, to take a forced snapshot even if the global
+     * timestamp hasn't changed.
+     *
+     * Does not wait for the snapshot to be taken.
+     */
+    virtual void forceSnapshotCreation() = 0;
 
     /**
      * Called when a new snapshot is created.
      */
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot) = 0;
+    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) = 0;
+
+    /**
+     * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
+     * or we are interrupted for any reason, including shutdown or maxTimeMs expiration.
+     * 'txn' is used to checkForInterrupt and enforce maxTimeMS.
+     */
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) = 0;
+
+    /**
+     * Resets all information related to snapshotting.
+     */
+    virtual void dropAllSnapshots() = 0;
+
+    /**
+     * Gets the latest OpTime of the currentCommittedSnapshot.
+     */
+    virtual OpTime getCurrentCommittedSnapshotOpTime() = 0;
+
+    /**
+     * Appends connection information to the provided BSONObjBuilder.
+     */
+    virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const = 0;
+
+    /**
+     * Gets the number of uncommitted snapshots currently held.
+     * Warning: This value can change at any time and may not even be accurate at the time of
+     * return. It should not be used when an exact amount is needed.
+     */
+    virtual size_t getNumUncommittedSnapshots() = 0;
 
 protected:
     ReplicationCoordinator();

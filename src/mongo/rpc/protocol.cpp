@@ -36,6 +36,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -54,7 +55,18 @@ const char kOpQueryOnly[] = "opQueryOnly";
 const char kOpCommandOnly[] = "opCommandOnly";
 const char kAll[] = "all";
 
+const OperationContext::Decoration<Protocol> operationProtocolDecoration =
+    OperationContext::declareDecoration<Protocol>();
+
 }  // namespace
+
+Protocol getOperationProtocol(OperationContext* txn) {
+    return operationProtocolDecoration(txn);
+}
+
+void setOperationProtocol(OperationContext* txn, Protocol protocol) {
+    operationProtocolDecoration(txn) = protocol;
+}
 
 StatusWith<Protocol> negotiate(ProtocolSet fst, ProtocolSet snd) {
     using std::begin;
@@ -127,9 +139,6 @@ StatusWith<ProtocolSet> parseProtocolSetFromIsMasterReply(const BSONObj& isMaste
         return minWireExtractStatus;
     }
 
-    bool hasWireVersionForOpCommandInMongod = (minWireVersion <= WireVersion::RELEASE_3_1_5) &&
-        (maxWireVersion >= WireVersion::RELEASE_3_1_5);
-
     bool isMongos = false;
 
     std::string msgField;
@@ -143,10 +152,29 @@ StatusWith<ProtocolSet> parseProtocolSetFromIsMasterReply(const BSONObj& isMaste
         isMongos = (msgField == "isdbgrid");
     }
 
-    return (!isMongos && hasWireVersionForOpCommandInMongod) ? supports::kAll
-                                                             : supports::kOpQueryOnly;
+    return (!isMongos && supportsWireVersionForOpCommandInMongod(minWireVersion, maxWireVersion))
+        ? supports::kAll
+        : supports::kOpQueryOnly;
 }
 
+bool supportsWireVersionForOpCommandInMongod(int minWireVersion, int maxWireVersion) {
+    // FIND_COMMAND versions support OP_COMMAND (in mongod but not mongos).
+    return (minWireVersion <= WireVersion::FIND_COMMAND) &&
+        (maxWireVersion >= WireVersion::FIND_COMMAND);
+}
+
+ProtocolSet computeProtocolSet(int minWireVersion, int maxWireVersion) {
+    ProtocolSet result = supports::kNone;
+    if (minWireVersion <= maxWireVersion) {
+        if (maxWireVersion >= WireVersion::FIND_COMMAND) {
+            result |= supports::kOpCommandOnly;
+        }
+        if (minWireVersion <= WireVersion::RELEASE_2_4_AND_BEFORE) {
+            result |= supports::kOpQueryOnly;
+        }
+    }
+    return result;
+}
 
 }  // namespace rpc
 }  // namespace mongo

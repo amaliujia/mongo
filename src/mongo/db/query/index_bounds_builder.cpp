@@ -35,6 +35,8 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/geo/geoconstants.h"
+#include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs.h"
@@ -557,7 +559,9 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
         if (mongoutils::str::equals("2dsphere", elt.valuestrsafe())) {
             verify(gme->getGeoExpression().getGeometry().hasS2Region());
             const S2Region& region = gme->getGeoExpression().getGeometry().getS2Region();
-            ExpressionMapping::cover2dsphere(region, index.infoObj, oilOut);
+            S2IndexingParams indexParams;
+            ExpressionParams::parse2dsphereParams(index.infoObj, &indexParams);
+            ExpressionMapping::cover2dsphere(region, indexParams, oilOut);
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         } else if (mongoutils::str::equals("2d", elt.valuestrsafe())) {
             verify(gme->getGeoExpression().getGeometry().hasR2Region());
@@ -856,7 +860,9 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
     size_t oilIdx = 0;
     while (it.more()) {
         BSONElement elt = it.next();
-        int direction = (elt.numberInt() >= 0) ? 1 : -1;
+        // The canonical check as to whether a key pattern element is "ascending" or "descending" is
+        // (elt.number() >= 0). This is defined by the Ordering class.
+        int direction = (elt.number() >= 0) ? 1 : -1;
         direction *= scanDir;
         if (-1 == direction) {
             vector<Interval>& iv = bounds->fields[oilIdx].intervals;
@@ -874,7 +880,7 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
         log() << "INVALID BOUNDS: " << bounds->toString() << endl
               << "kp = " << kp.toString() << endl
               << "scanDir = " << scanDir << endl;
-        verify(0);
+        invariant(0);
     }
 }
 

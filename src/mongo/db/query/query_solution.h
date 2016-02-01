@@ -39,8 +39,6 @@
 
 namespace mongo {
 
-using mongo::fts::FTSQuery;
-
 class GeoNearExpression;
 
 /**
@@ -141,7 +139,7 @@ struct QuerySolutionNode {
             other->children.push_back(this->children[i]->clone());
         }
         if (NULL != this->filter) {
-            other->filter = std::move(this->filter->shallowClone());
+            other->filter = this->filter->shallowClone();
         }
     }
 
@@ -247,9 +245,7 @@ struct TextNode : public QuerySolutionNode {
     BSONObjSet _sort;
 
     BSONObj indexKeyPattern;
-    std::string query;
-    std::string language;
-    bool caseSensitive;
+    std::unique_ptr<fts::FTSQuery> ftsQuery;
 
     // "Prefix" fields of a text index can handle equality predicates.  We group them with the
     // text node while creating the text leaf node and convert them into a BSONObj index prefix
@@ -562,6 +558,39 @@ struct ProjectionNode : public QuerySolutionNode {
     BSONObj coveredKeyObj;
 };
 
+struct SortKeyGeneratorNode : public QuerySolutionNode {
+    StageType getType() const final {
+        return STAGE_SORT_KEY_GENERATOR;
+    }
+
+    bool fetched() const final {
+        return children[0]->fetched();
+    }
+
+    bool hasField(const std::string& field) const final {
+        return children[0]->hasField(field);
+    }
+
+    bool sortedByDiskLoc() const final {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const BSONObjSet& getSort() const final {
+        return children[0]->getSort();
+    }
+
+    QuerySolutionNode* clone() const final;
+
+    void appendToString(mongoutils::str::stream* ss, int indent) const final;
+
+    // The query predicate provided by the user. For sorted by an array field, the sort key depends
+    // on the predicate.
+    BSONObj queryObj;
+
+    // The user-supplied sort pattern.
+    BSONObj sortSpec;
+};
+
 struct SortNode : public QuerySolutionNode {
     SortNode() : limit(0) {}
     virtual ~SortNode() {}
@@ -599,8 +628,6 @@ struct SortNode : public QuerySolutionNode {
     BSONObjSet _sorts;
 
     BSONObj pattern;
-
-    BSONObj query;
 
     // Sum of both limit and skip count in the parsed query.
     size_t limit;
@@ -848,9 +875,9 @@ struct DistinctNode : public QuerySolutionNode {
  * Some count queries reduce to counting how many keys are between two entries in a
  * Btree.
  */
-struct CountNode : public QuerySolutionNode {
-    CountNode() {}
-    virtual ~CountNode() {}
+struct CountScanNode : public QuerySolutionNode {
+    CountScanNode() {}
+    virtual ~CountScanNode() {}
 
     virtual StageType getType() const {
         return STAGE_COUNT_SCAN;
@@ -881,6 +908,38 @@ struct CountNode : public QuerySolutionNode {
 
     BSONObj endKey;
     bool endKeyInclusive;
+};
+
+/**
+ * This stage drops results that are out of sorted order.
+ */
+struct EnsureSortedNode : public QuerySolutionNode {
+    EnsureSortedNode() {}
+    virtual ~EnsureSortedNode() {}
+
+    virtual StageType getType() const {
+        return STAGE_ENSURE_SORTED;
+    }
+
+    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+
+    bool fetched() const {
+        return children[0]->fetched();
+    }
+    bool hasField(const std::string& field) const {
+        return children[0]->hasField(field);
+    }
+    bool sortedByDiskLoc() const {
+        return children[0]->sortedByDiskLoc();
+    }
+    const BSONObjSet& getSort() const {
+        return children[0]->getSort();
+    }
+
+    QuerySolutionNode* clone() const;
+
+    // The pattern that the results should be sorted by.
+    BSONObj pattern;
 };
 
 }  // namespace mongo

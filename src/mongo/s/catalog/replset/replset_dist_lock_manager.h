@@ -37,6 +37,7 @@
 #include "mongo/s/catalog/dist_lock_catalog.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/dist_lock_ping_info.h"
+#include "mongo/stdx/chrono.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -47,6 +48,13 @@ class ServiceContext;
 
 class ReplSetDistLockManager final : public DistLockManager {
 public:
+    // How frequently should the dist lock pinger thread run and write liveness information about
+    // this instance of the dist lock manager
+    static const Seconds kDistLockPingInterval;
+
+    // How long should the lease on a distributed lock last
+    static const Minutes kDistLockExpirationTime;
+
     ReplSetDistLockManager(ServiceContext* globalContext,
                            StringData processID,
                            std::unique_ptr<DistLockCatalog> catalog,
@@ -56,18 +64,23 @@ public:
     virtual ~ReplSetDistLockManager();
 
     virtual void startUp() override;
-    virtual void shutDown() override;
+    virtual void shutDown(OperationContext* txn, bool allowNetworking) override;
+
+    virtual std::string getProcessID() override;
 
     virtual StatusWith<DistLockManager::ScopedDistLock> lock(
+        OperationContext* txn,
         StringData name,
         StringData whyMessage,
         stdx::chrono::milliseconds waitFor,
         stdx::chrono::milliseconds lockTryInterval) override;
 
-protected:
-    virtual void unlock(const DistLockHandle& lockSessionID) override;
+    virtual void unlockAll(OperationContext* txn, const std::string& processID) override;
 
-    virtual Status checkStatus(const DistLockHandle& lockSessionID) override;
+protected:
+    virtual void unlock(OperationContext* txn, const DistLockHandle& lockSessionID) override;
+
+    virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockSessionID) override;
 
 private:
     /**
@@ -89,7 +102,9 @@ private:
      * Returns true if the current process that owns the lock has no fresh pings since
      * the lock expiration threshold.
      */
-    StatusWith<bool> canOvertakeLock(const LocksType lockDoc);
+    StatusWith<bool> canOvertakeLock(OperationContext* txn,
+                                     const LocksType lockDoc,
+                                     const stdx::chrono::milliseconds& lockExpiration);
 
     //
     // All member variables are labeled with one of the following codes indicating the

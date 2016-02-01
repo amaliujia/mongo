@@ -35,6 +35,8 @@
 #include "mongo/base/status.h"
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/time_support.h"
 
@@ -49,25 +51,38 @@ class Timestamp;
 class RecordId;
 
 namespace repl {
-class ReplicationCoordinator;
+class ReplSettings;
 
-// Create a new capped collection for the oplog if it doesn't yet exist.
-// This will be either local.oplog.rs (replica sets) or local.oplog.$main (master/slave)
-// If the collection already exists, set the 'last' OpTime if master/slave (side effect!)
+/**
+ * Truncates the oplog after, and including, the "truncateTimestamp" entry.
+ */
+void truncateOplogTo(OperationContext* txn, Timestamp truncateTimestamp);
+
+/**
+ * Create a new capped collection for the oplog if it doesn't yet exist.
+ * If the collection already exists, set the 'last' OpTime if master/slave (side effect!)
+ */
+void createOplog(OperationContext* txn, const std::string& oplogCollectionName, bool replEnabled);
+
+/*
+ * Create a new capped collection for the oplog using createOplog() if it doesn't yet exist.
+ * Collection name will be "_oplogCollectionName" initialized in setOplogCollectionName().
+ * This will be either local.oplog.rs (replica sets) or local.oplog.$main (master/slave)
+ */
 void createOplog(OperationContext* txn);
 
 // This function writes ops into the replica-set oplog;
 // used internally by replication secondaries after they have applied ops.  Updates the global
 // optime.
 // Returns the optime for the last op inserted.
-OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops);
+OpTime writeOpsToOplog(OperationContext* txn, const std::vector<BSONObj>& ops);
 
 extern std::string rsOplogName;
 extern std::string masterSlaveOplogName;
 
 extern int OPLOG_VERSION;
 
-/** Log an operation to the local oplog
+/* Log operation(s) to the local oplog
  *
  * @param opstr
  *  "i" insert
@@ -76,31 +91,54 @@ extern int OPLOG_VERSION;
  *  "c" db cmd
  *  "n" no-op
  *  "db" declares presence of a database (ns is set to the db name + '.')
- *
- * For 'u' records, 'obj' captures the mutation made to the object but not
+ */
+
+void logOps(OperationContext* txn,
+            const char* opstr,
+            const NamespaceString& nss,
+            std::vector<BSONObj>::const_iterator begin,
+            std::vector<BSONObj>::const_iterator end,
+            bool fromMigrate);
+
+/* For 'u' records, 'obj' captures the mutation made to the object but not
  * the object itself. 'o2' captures the the criteria for the object that will be modified.
+ *
+ * Sets replCoord last optime if 'updateReplOpTime' is true.
  */
 void _logOp(OperationContext* txn,
             const char* opstr,
             const char* ns,
             const BSONObj& obj,
-            BSONObj* o2,
-            bool fromMigrate);
+            const BSONObj* o2,
+            bool fromMigrate,
+            const std::string& oplogCollectionName,
+            ReplicationCoordinator::Mode replicationMode,
+            bool updateReplOpTime);
+
+void logOp(OperationContext* txn,
+           const char* opstr,
+           const char* ns,
+           const BSONObj& obj,
+           const BSONObj* o2,
+           bool fromMigrate);
 
 // Flush out the cached pointers to the local database and oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.
 void oplogCheckCloseDatabase(OperationContext* txn, Database* db);
 
+using IncrementOpsAppliedStatsFn = stdx::function<void()>;
 /**
  * Take a non-command op and apply it locally
  * Used for applying from an oplog
  * @param convertUpdateToUpsert convert some updates to upserts for idempotency reasons
+ * @param incrementOpsAppliedStats is called whenever an op is applied.
  * Returns failure status if the op was an update that could not be applied.
  */
 Status applyOperation_inlock(OperationContext* txn,
                              Database* db,
                              const BSONObj& op,
-                             bool convertUpdateToUpsert = false);
+                             bool convertUpdateToUpsert = false,
+                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats = {});
 
 /**
  * Take a command op and apply it locally
@@ -108,11 +146,6 @@ Status applyOperation_inlock(OperationContext* txn,
  * Returns failure status if the op that could not be applied.
  */
 Status applyCommand_inlock(OperationContext* txn, const BSONObj& op);
-
-/**
- * Waits up to one second for the Timestamp from the oplog to change.
- */
-void waitUpToOneSecondForTimestampChange(const Timestamp& referenceTime);
 
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.
@@ -124,14 +157,15 @@ void initTimestampFromOplog(OperationContext* txn, const std::string& oplogNS);
  */
 void setNewTimestamp(const Timestamp& newTime);
 
-/*
- * Extract the OpTime from log entry.
- */
-OpTime extractOpTime(const BSONObj& op);
-
 /**
  * Detects the current replication mode and sets the "_oplogCollectionName" accordingly.
  */
 void setOplogCollectionName();
+
+/**
+ * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
+ */
+void signalOplogWaiters();
+
 }  // namespace repl
 }  // namespace mongo

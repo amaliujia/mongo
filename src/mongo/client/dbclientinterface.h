@@ -45,6 +45,10 @@
 
 namespace mongo {
 
+namespace executor {
+struct RemoteCommandResponse;
+}
+
 /** the query field 'options' can have these bits set: */
 enum QueryOptions {
     /** Tailable means cursor is not closed when the last data is retrieved.  rather, the cursor
@@ -133,14 +137,6 @@ enum InsertOptions {
     InsertOption_ContinueOnError = 1 << 0
 };
 
-/**
- * Start from *top* of bits, these are generic write options that apply to all
- */
-enum WriteOptions {
-    /** logical writeback option */
-    WriteOption_FromWriteback = 1 << 31
-};
-
 //
 // For legacy reasons, the reserved field pre-namespace of certain types of messages is used
 // to store options as opposed to the flags after the namespace.  This should be transparent to
@@ -149,7 +145,6 @@ enum WriteOptions {
 
 enum ReservedOptions {
     Reserved_InsertOption_ContinueOnError = 1 << 0,
-    Reserved_FromWriteback = 1 << 1
 };
 
 class DBClientCursor;
@@ -390,38 +385,6 @@ std::string nsGetDB(const std::string& ns);
 std::string nsGetCollection(const std::string& ns);
 
 /**
-   interface that handles communication with the db
- */
-class DBConnector {
-public:
-    virtual ~DBConnector() {}
-    /** actualServer is set to the actual server where they call went if there was a choice
-     * (SlaveOk) */
-    virtual bool call(Message& toSend,
-                      Message& response,
-                      bool assertOk = true,
-                      std::string* actualServer = 0) = 0;
-    virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0) = 0;
-    virtual void sayPiggyBack(Message& toSend) = 0;
-    /* used by QueryOption_Exhaust.  To use that your subclass must implement this. */
-    virtual bool recv(Message& m) {
-        verify(false);
-        return false;
-    }
-    // In general, for lazy queries, we'll need to say, recv, then checkResponse
-    virtual void checkResponse(const char* data,
-                               int nReturned,
-                               bool* retry = NULL,
-                               std::string* targetHost = NULL) {
-        if (retry)
-            *retry = false;
-        if (targetHost)
-            *targetHost = "";
-    }
-    virtual bool lazySupported() const = 0;
-};
-
-/**
    The interface that any db connection should implement
  */
 class DBClientInterface {
@@ -439,8 +402,6 @@ public:
     virtual void insert(const std::string& ns, BSONObj obj, int flags = 0) = 0;
 
     virtual void insert(const std::string& ns, const std::vector<BSONObj>& v, int flags = 0) = 0;
-
-    virtual void remove(const std::string& ns, Query query, bool justOne = 0) = 0;
 
     virtual void remove(const std::string& ns, Query query, int flags) = 0;
 
@@ -490,7 +451,7 @@ protected:
    DB "commands"
    Basically just invocations of connection.$cmd.findOne({...});
 */
-class DBClientWithCommands : public DBClientInterface, public DBConnector {
+class DBClientWithCommands : public DBClientInterface {
 public:
     /** controls how chatty the client is about network errors & such.  See log.h */
     logger::LogSeverity _logLevel;
@@ -512,6 +473,38 @@ public:
     rpc::ProtocolSet getServerRPCProtocols() const;
 
     void setClientRPCProtocols(rpc::ProtocolSet clientProtocols);
+
+    /**
+     * actualServer is set to the actual server where they call went if there was a choice (for
+     * example SlaveOk).
+     */
+    virtual bool call(Message& toSend,
+                      Message& response,
+                      bool assertOk = true,
+                      std::string* actualServer = nullptr) = 0;
+
+    virtual void say(Message& toSend,
+                     bool isRetry = false,
+                     std::string* actualServer = nullptr) = 0;
+
+    /* used by QueryOption_Exhaust.  To use that your subclass must implement this. */
+    virtual bool recv(Message& m) {
+        verify(false);
+        return false;
+    }
+
+    // In general, for lazy queries, we'll need to say, recv, then checkResponse
+    virtual void checkResponse(const char* data,
+                               int nReturned,
+                               bool* retry = nullptr,
+                               std::string* targetHost = nullptr) {
+        if (retry)
+            *retry = false;
+        if (targetHost)
+            *targetHost = "";
+    }
+
+    virtual bool lazySupported() const = 0;
 
     /**
      * Sets a RequestMetadataWriter on this connection.
@@ -569,6 +562,13 @@ public:
                             const BSONObj& cmd,
                             BSONObj& info,
                             int options = 0);
+
+    /**
+    * Authenticates to another cluster member using appropriate authentication data.
+    * Uses getInternalUserAuthParams() to retrive authentication parameters.
+    * @return true if the authentication was succesful
+    */
+    bool authenticateInternalUser();
 
     /**
      * Authenticate a user.
@@ -705,14 +705,6 @@ public:
     */
     BSONObj getPrevError();
 
-    /** Reset the previous error state for this connection (accessed via getLastError and
-        getPrevError).  Useful when performing several operations at once and then checking
-        for an error after attempting all operations.
-    */
-    bool resetError() {
-        return simpleCommand("admin", 0, "reseterror");
-    }
-
     /** Delete the specified collection.
      *  @param info An optional output parameter that receives the result object the database
      *  returns from the drop command.  May be null if the caller doesn't need that info.
@@ -729,13 +721,6 @@ public:
 
         bool res = runCommand(db.c_str(), BSON("drop" << coll), *info);
         return res;
-    }
-
-    /** Perform a repair and compaction of the specified database.  May take a long time to run.
-     * Disk space must be available equal to the size of the database while repairing.
-     */
-    bool repairDatabase(const std::string& dbname, BSONObj* info = 0) {
-        return simpleCommand(dbname, info, "repairDatabase");
     }
 
     /** Copy database from one server or name to another server or name.
@@ -922,24 +907,6 @@ protected:
 
     virtual void _auth(const BSONObj& params);
 
-    /**
-     * Use the MONGODB-CR protocol to authenticate as "username" against the database "dbname",
-     * with the given password.  If digestPassword is false, the password is assumed to be
-     * pre-digested.  Returns false on failure, and sets "errmsg".
-     */
-    bool _authMongoCR(const std::string& dbname,
-                      const std::string& username,
-                      const std::string& pwd,
-                      BSONObj* info,
-                      bool digestPassword);
-
-    /**
-     * Use the MONGODB-X509 protocol to authenticate as "username. The certificate details
-     * has already been communicated automatically as part of the connect call.
-     * Returns false on failure and set "errmsg".
-     */
-    bool _authX509(const std::string& dbname, const std::string& username, BSONObj* info);
-
     // should be set by subclasses during connection.
     void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
 
@@ -970,32 +937,20 @@ class DBClientBase : public DBClientWithCommands {
 protected:
     static AtomicInt64 ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
-    int _minWireVersion;
-    int _maxWireVersion;
 
 public:
     static const uint64_t INVALID_SOCK_CREATION_TIME;
 
     DBClientBase() {
         _connectionId = ConnectionIdSequence.fetchAndAdd(1);
-        _minWireVersion = _maxWireVersion = 0;
     }
 
     long long getConnectionId() const {
         return _connectionId;
     }
 
-    void setWireVersions(int minWireVersion, int maxWireVersion) {
-        _minWireVersion = minWireVersion;
-        _maxWireVersion = maxWireVersion;
-    }
-
-    int getMinWireVersion() {
-        return _minWireVersion;
-    }
-    int getMaxWireVersion() {
-        return _maxWireVersion;
-    }
+    virtual int getMinWireVersion() = 0;
+    virtual int getMaxWireVersion() = 0;
 
     /** send a query to the database.
      @param ns namespace to query, format is <dbname>.<collectname>[.<collectname>]*
@@ -1070,13 +1025,7 @@ public:
 
     virtual void update(const std::string& ns, Query query, BSONObj obj, int flags);
 
-    /**
-       remove matching objects from the database
-       @param justOne if this true, then once a single match is found will stop
-     */
-    virtual void remove(const std::string& ns, Query q, bool justOne = 0);
-
-    virtual void remove(const std::string& ns, Query query, int flags);
+    virtual void remove(const std::string& ns, Query query, int flags = 0);
 
     virtual bool isFailed() const = 0;
 
@@ -1085,9 +1034,7 @@ public:
      */
     virtual bool isStillConnected() = 0;
 
-    virtual void killCursor(long long cursorID) = 0;
-
-    virtual bool callRead(Message& toSend, Message& response) = 0;
+    virtual void killCursor(long long cursorID);
 
     virtual ConnectionString::ConnectionType type() const = 0;
 
@@ -1101,11 +1048,6 @@ public:
 
 };  // DBClientBase
 
-class ConnectException : public UserException {
-public:
-    ConnectException(std::string msg) : UserException(9000, msg) {}
-};
-
 /**
     A basic connection to the database.
     This is the main entry point for talking to a simple Mongo setup
@@ -1115,11 +1057,22 @@ public:
     using DBClientBase::query;
 
     /**
+     * A hook used to validate the reply of an 'isMaster' command during connection. If the hook
+     * returns a non-OK Status, the DBClientConnection object will disconnect from the remote
+     * server. This function must not throw - it can only indicate failure by returning a non-OK
+     * status.
+     */
+    using HandshakeValidationHook =
+        stdx::function<Status(const executor::RemoteCommandResponse& isMasterReply)>;
+
+    /**
        @param _autoReconnect if true, automatically reconnect on a connection failure
        @param timeout tcp timeout in seconds - this is for read/write, not connect.
        Connect timeout is fixed, but short, at 5 seconds.
      */
-    DBClientConnection(bool _autoReconnect = false, double so_timeout = 0);
+    DBClientConnection(bool _autoReconnect = false,
+                       double so_timeout = 0,
+                       const HandshakeValidationHook& hook = HandshakeValidationHook());
 
     virtual ~DBClientConnection() {
         _numConnections.fetchAndAdd(-1);
@@ -1139,9 +1092,12 @@ public:
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
-     * instead of taking an errmsg out parameter.
+     * instead of taking an errmsg out parameter. Also allows optional validation of the reply to
+     * the 'isMaster' command executed during connection.
      *
      * @param server The server to connect to.
+     * @param a hook to validate the 'isMaster' reply received during connection. If the hook
+     * fails, the connection will be terminated and a non-OK status will be returned.
      */
     Status connect(const HostAndPort& server);
 
@@ -1208,6 +1164,19 @@ public:
         return _port ? _port->isStillConnected() : true;
     }
 
+    void setWireVersions(int minWireVersion, int maxWireVersion) {
+        _minWireVersion = minWireVersion;
+        _maxWireVersion = maxWireVersion;
+    }
+
+    int getMinWireVersion() final {
+        return _minWireVersion;
+    }
+
+    int getMaxWireVersion() final {
+        return _maxWireVersion;
+    }
+
     MessagingPort& port() {
         verify(_port);
         return *_port;
@@ -1230,20 +1199,13 @@ public:
         return _serverAddress;
     }
 
-    virtual void killCursor(long long cursorID);
-    virtual bool callRead(Message& toSend, Message& response) {
-        return call(toSend, response);
-    }
     virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
     virtual bool recv(Message& m);
     virtual void checkResponse(const char* data,
                                int nReturned,
                                bool* retry = NULL,
                                std::string* host = NULL);
-    virtual bool call(Message& toSend,
-                      Message& response,
-                      bool assertOk = true,
-                      std::string* actualServer = 0);
+    virtual bool call(Message& toSend, Message& response, bool assertOk, std::string* actualServer);
     virtual ConnectionString::ConnectionType type() const {
         return ConnectionString::MASTER;
     }
@@ -1266,19 +1228,13 @@ public:
      */
     void setParentReplSetName(const std::string& replSetName);
 
-    static void setLazyKillCursor(bool lazy) {
-        _lazyKillCursor = lazy;
-    }
-    static bool getLazyKillCursor() {
-        return _lazyKillCursor;
-    }
-
     uint64_t getSockCreationMicroSec() const;
 
 protected:
-    friend class SyncClusterConnection;
+    int _minWireVersion{0};
+    int _maxWireVersion{0};
+
     virtual void _auth(const BSONObj& params);
-    virtual void sayPiggyBack(Message& toSend);
 
     std::unique_ptr<MessagingPort> _port;
 
@@ -1301,7 +1257,6 @@ protected:
     double _so_timeout;
 
     static AtomicInt32 _numConnections;
-    static bool _lazyKillCursor;  // lazy means we piggy back kill cursors on next op
 
 private:
     /**
@@ -1314,6 +1269,9 @@ private:
     // Contains the string for the replica set name of the host this is connected to.
     // Should be empty if this connection is not pointing to a replica set member.
     std::string _parentReplSetName;
+
+    // Hook ran on every call to connect()
+    HandshakeValidationHook _hook;
 };
 
 BSONElement getErrField(const BSONObj& result);

@@ -29,6 +29,7 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/config.hpp>
 #include <boost/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonobj.h"
@@ -68,6 +69,12 @@ public:
     const OID oid;
 };
 
+class RCDecimal : public RefCountable {
+public:
+    RCDecimal(const Decimal128& decVal) : decimalValue(decVal) {}
+    const Decimal128 decimalValue;
+};
+
 #pragma pack(1)
 class ValueStorage {
 public:
@@ -98,6 +105,11 @@ public:
         zero();
         type = t;
         doubleValue = d;
+    }
+    ValueStorage(BSONType t, const Decimal128& d) {
+        zero();
+        type = t;
+        putDecimal(d);
     }
     ValueStorage(BSONType t, Timestamp r) {
         zero();
@@ -156,6 +168,11 @@ public:
         memcpyed();
     }
 
+    ValueStorage(ValueStorage&& rhs) BOOST_NOEXCEPT {
+        memcpy(this, &rhs, sizeof(*this));
+        rhs.zero();  // Reset rhs to the missing state. TODO consider only doing this if refCounter.
+    }
+
     ~ValueStorage() {
         DEV verifyRefCountingIfShould();
         if (refCounter)
@@ -163,8 +180,34 @@ public:
         DEV memset(this, 0xee, sizeof(*this));
     }
 
-    ValueStorage& operator=(ValueStorage rhsCopy) {
-        this->swap(rhsCopy);
+    ValueStorage& operator=(const ValueStorage& rhs) {
+        // This is designed to be effectively a no-op on self-assign, without needing an explicit
+        // check. This requires that rhs's refcount is incremented before ours is released, and that
+        // we use memmove rather than memcpy.
+        DEV rhs.verifyRefCountingIfShould();
+        if (rhs.refCounter)
+            intrusive_ptr_add_ref(rhs.genericRCPtr);
+
+        DEV verifyRefCountingIfShould();
+        if (refCounter)
+            intrusive_ptr_release(genericRCPtr);
+
+        memmove(this, &rhs, sizeof(*this));
+        return *this;
+    }
+
+    ValueStorage& operator=(ValueStorage&& rhs) BOOST_NOEXCEPT {
+#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
+        if (&rhs == this)
+            return *this;
+#endif
+
+        DEV verifyRefCountingIfShould();
+        if (refCounter)
+            intrusive_ptr_release(genericRCPtr);
+
+        memmove(this, &rhs, sizeof(*this));
+        rhs.zero();  // Reset rhs to the missing state. TODO consider only doing this if refCounter.
         return *this;
     }
 
@@ -201,6 +244,10 @@ public:
         putRefCountable(new RCCodeWScope(cws.code.toString(), cws.scope));
     }
 
+    void putDecimal(const Decimal128& d) {
+        putRefCountable(new RCDecimal(d));
+    }
+
     void putRefCountable(boost::intrusive_ptr<const RefCountable> ptr) {
         genericRCPtr = ptr.get();
 
@@ -235,6 +282,12 @@ public:
     boost::intrusive_ptr<const RCDBRef> getDBRef() const {
         dassert(typeid(*genericRCPtr) == typeid(const RCDBRef));
         return static_cast<const RCDBRef*>(genericRCPtr);
+    }
+
+    Decimal128 getDecimal() const {
+        dassert(typeid(*genericRCPtr) == typeid(const RCDecimal));
+        const RCDecimal* decPtr = static_cast<const RCDecimal*>(genericRCPtr);
+        return decPtr->decimalValue;
     }
 
     // Document is incomplete here so this can't be inline

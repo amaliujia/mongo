@@ -37,6 +37,8 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo {
 
@@ -47,7 +49,8 @@ namespace mongo {
 class ParsedMatchExpression {
 public:
     ParsedMatchExpression(const std::string& str) : _obj(fromjson(str)) {
-        StatusWithMatchExpression result = MatchExpressionParser::parse(_obj);
+        StatusWithMatchExpression result =
+            MatchExpressionParser::parse(_obj, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(result.getStatus());
         _expr = std::move(result.getValue());
     }
@@ -65,7 +68,9 @@ TEST(ExpressionAlgoIsSubsetOf, NullAndOmittedField) {
     // Verify that ComparisonMatchExpression::init() prohibits creating a match expression with
     // an Undefined type.
     BSONObj undefined = fromjson("{a: undefined}");
-    ASSERT_EQUALS(ErrorCodes::BadValue, MatchExpressionParser::parse(undefined).getStatus());
+    ASSERT_EQUALS(ErrorCodes::BadValue,
+                  MatchExpressionParser::parse(undefined, ExtensionsCallbackDisallowExtensions())
+                      .getStatus());
 
     ParsedMatchExpression empty("{}");
     ParsedMatchExpression null("{a: null}");
@@ -121,6 +126,21 @@ TEST(ExpressionAlgoIsSubsetOf, Compare_NaN) {
     ASSERT_FALSE(expression::isSubsetOf(gt.get(), nan.get()));
     ASSERT_FALSE(expression::isSubsetOf(nan.get(), in.get()));
     ASSERT_FALSE(expression::isSubsetOf(in.get(), nan.get()));
+
+    if (Decimal128::enabled) {
+        ParsedMatchExpression decNan("{x : NumberDecimal(\"NaN\") }");
+        ASSERT_TRUE(expression::isSubsetOf(decNan.get(), decNan.get()));
+        ASSERT_TRUE(expression::isSubsetOf(nan.get(), decNan.get()));
+        ASSERT_TRUE(expression::isSubsetOf(decNan.get(), nan.get()));
+        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lt.get()));
+        ASSERT_FALSE(expression::isSubsetOf(lt.get(), decNan.get()));
+        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), lte.get()));
+        ASSERT_FALSE(expression::isSubsetOf(lte.get(), decNan.get()));
+        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gte.get()));
+        ASSERT_FALSE(expression::isSubsetOf(gte.get(), decNan.get()));
+        ASSERT_FALSE(expression::isSubsetOf(decNan.get(), gt.get()));
+        ASSERT_FALSE(expression::isSubsetOf(gt.get(), decNan.get()));
+    }
 }
 
 TEST(ExpressionAlgoIsSubsetOf, Compare_EQ) {

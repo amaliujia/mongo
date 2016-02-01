@@ -44,6 +44,8 @@
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
@@ -133,7 +135,7 @@ OplogFetcher::OplogFetcher(ReplicationExecutor* exec,
                    BSON("find" << oplogNSS.coll() << "filter"
                                << BSON("ts" << BSON("$gte" << startTS))),
                    work,
-                   BSON(rpc::kReplicationMetadataFieldName << 1)),
+                   BSON(rpc::kReplSetMetadataFieldName << 1)),
       _startTS(startTS) {}
 
 std::string OplogFetcher::toString() const {
@@ -385,7 +387,10 @@ Status DatabasesCloner::start() {
 
     log() << "starting cloning of all databases";
     // Schedule listDatabase command which will kick off the database cloner per result db.
-    Request listDBsReq(_source, "admin", BSON("listDatabases" << true), BSON("$secondaryOk" << 1));
+    Request listDBsReq(_source,
+                       "admin",
+                       BSON("listDatabases" << true),
+                       rpc::ServerSelectionMetadata(true, boost::none).toBSON());
     CBHStatus s = _exec->scheduleRemoteCommand(
         listDBsReq,
         stdx::bind(&DatabasesCloner::_onListDatabaseFinish, this, stdx::placeholders::_1));
@@ -496,6 +501,11 @@ void DatabasesCloner::_doNextActions() {
 }
 
 void DatabasesCloner::_failed() {
+    if (!_active) {
+        return;
+    }
+    _active = false;
+
     // TODO: cancel outstanding work, like any cloners active
     invariant(_finishFn);
     _finishFn(_status);
@@ -788,7 +798,7 @@ TimestampStatus DataReplicator::initialSync() {
 
         // Sleep for retry time
         lk.unlock();
-        sleepmillis(_opts.initialSyncRetryWait.count());
+        sleepmillis(durationCount<Milliseconds>(_opts.initialSyncRetryWait));
         lk.lock();
 
         // No need to print a stack
@@ -975,7 +985,7 @@ void DataReplicator::_doNextActions_Rollback_inlock() {
 void DataReplicator::_doNextActions_Steady_inlock() {
     // Check sync source is still good.
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource();
+        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
     }
     if (_syncSource.empty()) {
         // No sync source, reschedule check
@@ -1191,7 +1201,7 @@ void DataReplicator::_setState_inlock(const DataReplicatorState& newState) {
 
 Status DataReplicator::_ensureGoodSyncSource_inlock() {
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource();
+        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
         if (!_syncSource.empty()) {
             return Status::OK();
         }
@@ -1352,7 +1362,7 @@ void DataReplicator::_rollbackOperations(const CallbackArgs& cbData) {
     }
     invariant(cbData.txn);
 
-    OpTime lastOpTimeWritten(getLastTimestampApplied(), OpTime::kDefaultTerm);
+    OpTime lastOpTimeWritten(getLastTimestampApplied(), OpTime::kInitialTerm);
     HostAndPort syncSource = getSyncSource();
     auto rollbackStatus = _opts.rollbackFn(cbData.txn, lastOpTimeWritten, syncSource);
     if (!rollbackStatus.isOK()) {

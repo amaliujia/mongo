@@ -30,8 +30,10 @@
 
 #include "mongo/db/pipeline/expression.h"
 
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <cstdio>
+#include <vector>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
@@ -268,6 +270,10 @@ intrusive_ptr<Expression> Expression::parseObject(BSONObj obj,
                         fieldName, ExpressionFieldPath::parse(fieldElement.str(), vps));
                     break;
                 }
+                case Array:
+                    pExpressionObject->addField(fieldName,
+                                                ExpressionArray::parse(fieldElement, vps));
+                    break;
                 case Bool:
                 case NumberDouble:
                 case NumberLong:
@@ -343,6 +349,8 @@ intrusive_ptr<Expression> Expression::parseOperand(BSONElement exprElement,
     } else if (type == Object) {
         ObjectCtx oCtx(ObjectCtx::DOCUMENT_OK);
         return Expression::parseObject(exprElement.Obj(), &oCtx, vps);
+    } else if (type == Array) {
+        return ExpressionArray::parse(exprElement, vps);
     } else {
         return ExpressionConstant::parse(exprElement, vps);
     }
@@ -351,27 +359,17 @@ intrusive_ptr<Expression> Expression::parseOperand(BSONElement exprElement,
 
 /* ----------------------- ExpressionAbs ---------------------------- */
 
-Value ExpressionAbs::evaluateInternal(Variables* vars) const {
-    Value val = vpOperand[0]->evaluateInternal(vars);
-
-    if (val.numeric()) {
-        BSONType type = val.getType();
-        if (type == NumberDouble) {
-            return Value(std::abs(val.getDouble()));
-        } else {
-            long long num = val.getLong();
-            uassert(28680,
-                    "can't take $abs of long long min",
-                    num != std::numeric_limits<long long>::min());
-            long long absVal = std::abs(num);
-            return type == NumberLong ? Value(absVal) : Value::createIntOrLong(absVal);
-        }
-    } else if (val.nullish()) {
-        return Value(BSONNULL);
+Value ExpressionAbs::evaluateNumericArg(const Value& numericArg) const {
+    BSONType type = numericArg.getType();
+    if (type == NumberDouble) {
+        return Value(std::abs(numericArg.getDouble()));
     } else {
-        uasserted(28681,
-                  str::stream() << "$abs only supports numeric types, not "
-                                << typeName(val.getType()));
+        long long num = numericArg.getLong();
+        uassert(28680,
+                "can't take $abs of long long min",
+                num != std::numeric_limits<long long>::min());
+        long long absVal = std::abs(num);
+        return type == NumberLong ? Value(absVal) : Value::createIntOrLong(absVal);
     }
 }
 
@@ -556,6 +554,32 @@ const char* ExpressionAnyElementTrue::getOpName() const {
     return "$anyElementTrue";
 }
 
+/* ---------------------- ExpressionArray --------------------------- */
+
+Value ExpressionArray::evaluateInternal(Variables* vars) const {
+    vector<Value> values;
+    values.reserve(vpOperand.size());
+    for (auto&& expr : vpOperand) {
+        Value elemVal = expr->evaluateInternal(vars);
+        values.push_back(elemVal.missing() ? Value(BSONNULL) : std::move(elemVal));
+    }
+    return Value(std::move(values));
+}
+
+Value ExpressionArray::serialize(bool explain) const {
+    vector<Value> expressions;
+    expressions.reserve(vpOperand.size());
+    for (auto&& expr : vpOperand) {
+        expressions.push_back(expr->serialize(explain));
+    }
+    return Value(std::move(expressions));
+}
+
+const char* ExpressionArray::getOpName() const {
+    // This should never be called, but is needed to inherit from ExpressionNary.
+    return "$array";
+}
+
 /* ------------------------- ExpressionArrayElemAt -------------------------- */
 
 Value ExpressionArrayElemAt::evaluateInternal(Variables* vars) const {
@@ -594,6 +618,19 @@ Value ExpressionArrayElemAt::evaluateInternal(Variables* vars) const {
 REGISTER_EXPRESSION(arrayElemAt, ExpressionArrayElemAt::parse);
 const char* ExpressionArrayElemAt::getOpName() const {
     return "$arrayElemAt";
+}
+
+/* ------------------------- ExpressionCeil -------------------------- */
+
+Value ExpressionCeil::evaluateNumericArg(const Value& numericArg) const {
+    // There's no point in taking the ceiling of integers or longs, it will have no effect.
+    return numericArg.getType() == NumberDouble ? Value(std::ceil(numericArg.getDouble()))
+                                                : numericArg;
+}
+
+REGISTER_EXPRESSION(ceil, ExpressionCeil::parse);
+const char* ExpressionCeil::getOpName() const {
+    return "$ceil";
 }
 
 /* -------------------- ExpressionCoerceToBool ------------------------- */
@@ -1120,6 +1157,18 @@ const char* ExpressionDivide::getOpName() const {
     return "$divide";
 }
 
+/* ----------------------- ExpressionExp ---------------------------- */
+
+Value ExpressionExp::evaluateNumericArg(const Value& numericArg) const {
+    // exp() always returns a double since e is a double.
+    return Value(exp(numericArg.coerceToDouble()));
+}
+
+REGISTER_EXPRESSION(exp, ExpressionExp::parse);
+const char* ExpressionExp::getOpName() const {
+    return "$exp";
+}
+
 /* ---------------------- ExpressionObject --------------------------- */
 
 intrusive_ptr<ExpressionObject> ExpressionObject::create() {
@@ -1618,6 +1667,19 @@ void ExpressionFilter::addDependencies(DepsTracker* deps, vector<string>* path) 
     _filter->addDependencies(deps);
 }
 
+/* ------------------------- ExpressionFloor -------------------------- */
+
+Value ExpressionFloor::evaluateNumericArg(const Value& numericArg) const {
+    // There's no point in taking the floor of integers or longs, it will have no effect.
+    return numericArg.getType() == NumberDouble ? Value(std::floor(numericArg.getDouble()))
+                                                : numericArg;
+}
+
+REGISTER_EXPRESSION(floor, ExpressionFloor::parse);
+const char* ExpressionFloor::getOpName() const {
+    return "$floor";
+}
+
 /* ------------------------- ExpressionLet ----------------------------- */
 
 REGISTER_EXPRESSION(let, ExpressionLet::parse);
@@ -1817,23 +1879,44 @@ REGISTER_EXPRESSION(meta, ExpressionMeta::parse);
 intrusive_ptr<Expression> ExpressionMeta::parse(BSONElement expr,
                                                 const VariablesParseState& vpsIn) {
     uassert(17307, "$meta only supports String arguments", expr.type() == String);
-    uassert(17308, "Unsupported argument to $meta: " + expr.String(), expr.String() == "textScore");
-
-    return new ExpressionMeta();
+    if (expr.valueStringData() == "textScore") {
+        return new ExpressionMeta(MetaType::TEXT_SCORE);
+    } else if (expr.valueStringData() == "randVal") {
+        return new ExpressionMeta(MetaType::RAND_VAL);
+    } else {
+        uasserted(17308, "Unsupported argument to $meta: " + expr.String());
+    }
 }
 
+ExpressionMeta::ExpressionMeta(MetaType metaType) : _metaType(metaType) {}
+
 Value ExpressionMeta::serialize(bool explain) const {
-    return Value(DOC("$meta"
-                     << "textScore"));
+    switch (_metaType) {
+        case MetaType::TEXT_SCORE:
+            return Value(DOC("$meta"
+                             << "textScore"));
+        case MetaType::RAND_VAL:
+            return Value(DOC("$meta"
+                             << "randVal"));
+    }
+    MONGO_UNREACHABLE;
 }
 
 Value ExpressionMeta::evaluateInternal(Variables* vars) const {
     const Document& root = vars->getRoot();
-    return root.hasTextScore() ? Value(root.getTextScore()) : Value();
+    switch (_metaType) {
+        case MetaType::TEXT_SCORE:
+            return root.hasTextScore() ? Value(root.getTextScore()) : Value();
+        case MetaType::RAND_VAL:
+            return root.hasRandMetaField() ? Value(root.getRandMetaField()) : Value();
+    }
+    MONGO_UNREACHABLE;
 }
 
 void ExpressionMeta::addDependencies(DepsTracker* deps, vector<string>* path) const {
-    deps->needTextScore = true;
+    if (_metaType == MetaType::TEXT_SCORE) {
+        deps->needTextScore = true;
+    }
 }
 
 /* ------------------------- ExpressionMillisecond ----------------------------- */
@@ -1997,6 +2080,68 @@ const char* ExpressionIfNull::getOpName() const {
     return "$ifNull";
 }
 
+/* ----------------------- ExpressionLn ---------------------------- */
+
+Value ExpressionLn::evaluateNumericArg(const Value& numericArg) const {
+    double argDouble = numericArg.coerceToDouble();
+    uassert(28766,
+            str::stream() << "$ln's argument must be a positive number, but is " << argDouble,
+            argDouble > 0 || std::isnan(argDouble));
+    return Value(std::log(argDouble));
+}
+
+REGISTER_EXPRESSION(ln, ExpressionLn::parse);
+const char* ExpressionLn::getOpName() const {
+    return "$ln";
+}
+
+/* ----------------------- ExpressionLog ---------------------------- */
+
+Value ExpressionLog::evaluateInternal(Variables* vars) const {
+    Value argVal = vpOperand[0]->evaluateInternal(vars);
+    Value baseVal = vpOperand[1]->evaluateInternal(vars);
+    if (argVal.nullish() || baseVal.nullish())
+        return Value(BSONNULL);
+
+    uassert(28756,
+            str::stream() << "$log's argument must be numeric, not " << typeName(argVal.getType()),
+            argVal.numeric());
+    uassert(28757,
+            str::stream() << "$log's base must be numeric, not " << typeName(baseVal.getType()),
+            baseVal.numeric());
+
+    double argDouble = argVal.coerceToDouble();
+    double baseDouble = baseVal.coerceToDouble();
+    uassert(28758,
+            str::stream() << "$log's argument must be a positive number, but is " << argDouble,
+            argDouble > 0 || std::isnan(argDouble));
+    uassert(28759,
+            str::stream() << "$log's base must be a positive number not equal to 1, but is "
+                          << baseDouble,
+            (baseDouble > 0 && baseDouble != 1) || std::isnan(baseDouble));
+    return Value(std::log(argDouble) / std::log(baseDouble));
+}
+
+REGISTER_EXPRESSION(log, ExpressionLog::parse);
+const char* ExpressionLog::getOpName() const {
+    return "$log";
+}
+
+/* ----------------------- ExpressionLog10 ---------------------------- */
+
+Value ExpressionLog10::evaluateNumericArg(const Value& numericArg) const {
+    double argDouble = numericArg.coerceToDouble();
+    uassert(28761,
+            str::stream() << "$log10's argument must be a positive number, but is " << argDouble,
+            argDouble > 0 || std::isnan(argDouble));
+    return Value(std::log10(argDouble));
+}
+
+REGISTER_EXPRESSION(log10, ExpressionLog10::parse);
+const char* ExpressionLog10::getOpName() const {
+    return "$log10";
+}
+
 /* ------------------------ ExpressionNary ----------------------------- */
 
 intrusive_ptr<Expression> ExpressionNary::optimize() {
@@ -2038,12 +2183,12 @@ intrusive_ptr<Expression> ExpressionNary::optimize() {
         if (dynamic_cast<ExpressionConstant*>(expr.get())) {
             constExprs.push_back(expr);
         } else {
-            // If the child operand is the same type as this, then we can
-            // extract its operands and inline them here because we know
-            // this is commutative and associative.  We detect sameness of
-            // the child operator by checking for equality of the opNames
+            // If the child operand is the same type as this and is also associative and
+            // commutative, then we can extract its operands and inline them here. We detect
+            // sameness of the child operator by checking for equality of the opNames
             ExpressionNary* nary = dynamic_cast<ExpressionNary*>(expr.get());
-            if (!nary || !str::equals(nary->getOpName(), getOpName())) {
+            if (!nary || !str::equals(nary->getOpName(), getOpName()) ||
+                !nary->isAssociativeAndCommutative()) {
                 nonConstExprs.push_back(expr);
             } else {
                 // same expression, so flatten by adding to vpOperand which
@@ -2170,6 +2315,157 @@ intrusive_ptr<Expression> ExpressionOr::optimize() {
 REGISTER_EXPRESSION(or, ExpressionOr::parse);
 const char* ExpressionOr::getOpName() const {
     return "$or";
+}
+
+/* ----------------------- ExpressionPow ---------------------------- */
+
+Value ExpressionPow::evaluateInternal(Variables* vars) const {
+    Value baseVal = vpOperand[0]->evaluateInternal(vars);
+    Value expVal = vpOperand[1]->evaluateInternal(vars);
+    if (baseVal.nullish() || expVal.nullish())
+        return Value(BSONNULL);
+
+    BSONType baseType = baseVal.getType();
+    BSONType expType = expVal.getType();
+
+    uassert(28762,
+            str::stream() << "$pow's base must be numeric, not " << typeName(baseType),
+            baseVal.numeric());
+    uassert(28763,
+            str::stream() << "$pow's exponent must be numeric, not " << typeName(expType),
+            expVal.numeric());
+
+    // pow() will cast args to doubles.
+    double baseDouble = baseVal.coerceToDouble();
+    double expDouble = expVal.coerceToDouble();
+
+    uassert(28764,
+            "$pow cannot take a base of 0 and a negative exponent",
+            !(baseDouble == 0 && expDouble < 0));
+
+    // If either number is a double, return a double.
+    if (baseType == NumberDouble || expType == NumberDouble) {
+        return Value(std::pow(baseDouble, expDouble));
+    }
+
+    // base and exp are both integers.
+
+    auto representableAsLong = [](long long base, long long exp) {
+        // If exp is greater than 63 and base is not -1, 0, or 1, the result will overflow.
+        // If exp is negative and the base is not -1 or 1, the result will be fractional.
+        if (exp < 0 || exp > 63) {
+            return std::abs(base) == 1 || base == 0;
+        }
+
+        struct MinMax {
+            long long min;
+            long long max;
+        };
+
+        // Array indices correspond to exponents 0 through 63. The values in each index are the min
+        // and max bases, respectively, that can be raised to that exponent without overflowing a
+        // 64-bit int. For max bases, this was computed by solving for b in
+        // b = (2^63-1)^(1/exp) for exp = [0, 63] and truncating b. To calculate min bases, for even
+        // exps the equation  used was b = (2^63-1)^(1/exp), and for odd exps the equation used was
+        // b = (-2^63)^(1/exp). Since the magnitude of long min is greater than long max, the
+        // magnitude of some of the min bases raised to odd exps is greater than the corresponding
+        // max bases raised to the same exponents.
+
+        static const MinMax kBaseLimits[] = {
+            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0
+            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},
+            {-3037000499LL, 3037000499LL},
+            {-2097152, 2097151},
+            {-55108, 55108},
+            {-6208, 6208},
+            {-1448, 1448},
+            {-512, 511},
+            {-234, 234},
+            {-128, 127},
+            {-78, 78},  // 10
+            {-52, 52},
+            {-38, 38},
+            {-28, 28},
+            {-22, 22},
+            {-18, 18},
+            {-15, 15},
+            {-13, 13},
+            {-11, 11},
+            {-9, 9},
+            {-8, 8},  // 20
+            {-8, 7},
+            {-7, 7},
+            {-6, 6},
+            {-6, 6},
+            {-5, 5},
+            {-5, 5},
+            {-5, 5},
+            {-4, 4},
+            {-4, 4},
+            {-4, 4},  // 30
+            {-4, 4},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-3, 3},
+            {-2, 2},  // 40
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},  // 50
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},
+            {-2, 2},  // 60
+            {-2, 2},
+            {-2, 2},
+            {-2, 1}};
+
+        return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;
+    };
+
+    long long baseLong = baseVal.getLong();
+    long long expLong = expVal.getLong();
+
+    // If the result cannot be represented as a long, return a double. Otherwise if either number
+    // is a long, return a long. If both numbers are ints, then return an int if the result fits or
+    // a long if it is too big.
+    if (!representableAsLong(baseLong, expLong)) {
+        return Value(std::pow(baseLong, expLong));
+    }
+
+    long long result = 1;
+    // Use repeated multiplication, since pow() casts args to doubles which could result in loss of
+    // precision if arguments are very large.
+    for (int i = 0; i < expLong; i++) {
+        result *= baseLong;
+    }
+
+    if (baseType == NumberLong || expType == NumberLong) {
+        return Value(result);
+    }
+    return Value::createIntOrLong(result);
+}
+
+REGISTER_EXPRESSION(pow, ExpressionPow::parse);
+const char* ExpressionPow::getOpName() const {
+    return "$pow";
 }
 
 /* ------------------------- ExpressionSecond ----------------------------- */
@@ -2433,6 +2729,92 @@ const char* ExpressionIsArray::getOpName() const {
     return "$isArray";
 }
 
+/* ----------------------- ExpressionSlice ---------------------------- */
+
+Value ExpressionSlice::evaluateInternal(Variables* vars) const {
+    const size_t n = vpOperand.size();
+
+    Value arrayVal = vpOperand[0]->evaluateInternal(vars);
+    // Could be either a start index or the length from 0.
+    Value arg2 = vpOperand[1]->evaluateInternal(vars);
+
+    if (arrayVal.nullish() || arg2.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(28724,
+            str::stream() << "First argument to $slice must be an Array, but is"
+                          << " of type: " << typeName(arrayVal.getType()),
+            arrayVal.getType() == Array);
+    uassert(28725,
+            str::stream() << "Second argument to $slice must be a numeric value,"
+                          << " but is of type: " << typeName(arg2.getType()),
+            arg2.numeric());
+    uassert(28726,
+            str::stream() << "Second argument to $slice can't be represented as"
+                          << " a 32-bit integer: " << arg2.coerceToDouble(),
+            arg2.integral());
+
+    const auto& array = arrayVal.getArray();
+    size_t start;
+    size_t end;
+
+    if (n == 2) {
+        // Only count given.
+        int count = arg2.coerceToInt();
+        start = 0;
+        end = array.size();
+        if (count >= 0) {
+            end = std::min(end, size_t(count));
+        } else {
+            // Negative count's start from the back. If a abs(count) is greater
+            // than the
+            // length of the array, return the whole array.
+            start = std::max(0, static_cast<int>(array.size()) + count);
+        }
+    } else {
+        // We have both a start index and a count.
+        int startInt = arg2.coerceToInt();
+        if (startInt < 0) {
+            // Negative values start from the back. If a abs(start) is greater
+            // than the length
+            // of the array, start from 0.
+            start = std::max(0, static_cast<int>(array.size()) + startInt);
+        } else {
+            start = std::min(array.size(), size_t(startInt));
+        }
+
+        Value countVal = vpOperand[2]->evaluateInternal(vars);
+
+        if (countVal.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        uassert(28727,
+                str::stream() << "Third argument to $slice must be numeric, but "
+                              << "is of type: " << typeName(countVal.getType()),
+                countVal.numeric());
+        uassert(28728,
+                str::stream() << "Third argument to $slice can't be represented"
+                              << " as a 32-bit integer: " << countVal.coerceToDouble(),
+                countVal.integral());
+        uassert(28729,
+                str::stream() << "Third argument to $slice must be positive: "
+                              << countVal.coerceToInt(),
+                countVal.coerceToInt() > 0);
+
+        size_t count = size_t(countVal.coerceToInt());
+        end = std::min(start + count, array.size());
+    }
+
+    return Value(vector<Value>(array.begin() + start, array.begin() + end));
+}
+
+REGISTER_EXPRESSION(slice, ExpressionSlice::parse);
+const char* ExpressionSlice::getOpName() const {
+    return "$slice";
+}
+
 /* ----------------------- ExpressionSize ---------------------------- */
 
 Value ExpressionSize::evaluateInternal(Variables* vars) const {
@@ -2452,17 +2834,8 @@ const char* ExpressionSize::getOpName() const {
 
 /* ----------------------- ExpressionSqrt ---------------------------- */
 
-Value ExpressionSqrt::evaluateInternal(Variables* vars) const {
-    Value argVal = vpOperand[0]->evaluateInternal(vars);
-    if (argVal.nullish())
-        return Value(BSONNULL);
-
-    uassert(28715,
-            str::stream() << "$sqrt only supports numeric types, not "
-                          << typeName(argVal.getType()),
-            argVal.numeric());
-
-    double argDouble = argVal.coerceToDouble();
+Value ExpressionSqrt::evaluateNumericArg(const Value& numericArg) const {
+    double argDouble = numericArg.coerceToDouble();
     uassert(28714,
             "$sqrt's argument must be greater than or equal to 0",
             argDouble >= 0 || std::isnan(argDouble));
@@ -2621,6 +2994,19 @@ Value ExpressionToUpper::evaluateInternal(Variables* vars) const {
 REGISTER_EXPRESSION(toUpper, ExpressionToUpper::parse);
 const char* ExpressionToUpper::getOpName() const {
     return "$toUpper";
+}
+
+/* ------------------------- ExpressionTrunc -------------------------- */
+
+Value ExpressionTrunc::evaluateNumericArg(const Value& numericArg) const {
+    // There's no point in truncating integers or longs, it will have no effect.
+    return numericArg.getType() == NumberDouble ? Value(std::trunc(numericArg.getDouble()))
+                                                : numericArg;
+}
+
+REGISTER_EXPRESSION(trunc, ExpressionTrunc::parse);
+const char* ExpressionTrunc::getOpName() const {
+    return "$trunc";
 }
 
 /* ------------------------- ExpressionWeek ----------------------------- */

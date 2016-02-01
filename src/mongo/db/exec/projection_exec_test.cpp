@@ -36,6 +36,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
@@ -48,7 +49,8 @@ using std::unique_ptr;
  * Utility function to create MatchExpression
  */
 unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
     ASSERT_TRUE(status.isOK());
     return std::move(status.getValue());
 }
@@ -79,8 +81,8 @@ void testTransform(const char* specStr,
     // Create projection exec object.
     BSONObj spec = fromjson(specStr);
     BSONObj query = fromjson(queryStr);
-    unique_ptr<MatchExpression> queryExpression = std::move(parseMatchExpression(query));
-    ProjectionExec exec(spec, queryExpression.get());
+    unique_ptr<MatchExpression> queryExpression = parseMatchExpression(query);
+    ProjectionExec exec(spec, queryExpression.get(), ExtensionsCallbackDisallowExtensions());
 
     // Create working set member.
     WorkingSetMember wsm;
@@ -139,6 +141,34 @@ void testTransform(const char* specStr,
                    bool expectedStatusOK,
                    const char* expectedObjStr) {
     testTransform(specStr, queryStr, objStr, NULL, expectedStatusOK, expectedObjStr);
+}
+
+/**
+ * Test function to verify the results of projecting the $meta sortKey while under a covered
+ * projection. In particular, it tests that ProjectionExec can take a WorkingSetMember in
+ * LOC_AND_IDX state and use the sortKey along with the index data to generate the final output
+ * document. For SERVER-20117.
+ *
+ * sortKey - The sort key in BSONObj form.
+ * projSpec - The JSON representation of the proj spec BSONObj.
+ * ikd - The data stored in the index.
+ *
+ * Returns the BSON representation of the actual output, to be checked against the expected output.
+ */
+BSONObj transformMetaSortKeyCovered(const BSONObj& sortKey,
+                                    const char* projSpec,
+                                    const IndexKeyDatum& ikd) {
+    WorkingSet ws;
+    WorkingSetID wsid = ws.allocate();
+    WorkingSetMember* wsm = ws.get(wsid);
+    wsm->keyData.push_back(ikd);
+    wsm->addComputed(new SortKeyComputedData(sortKey));
+    ws.transitionToLocAndIdx(wsid);
+
+    ProjectionExec projExec(fromjson(projSpec), nullptr, ExtensionsCallbackDisallowExtensions());
+    ASSERT_OK(projExec.transform(wsm));
+
+    return wsm->obj.value();
 }
 
 //
@@ -222,6 +252,80 @@ TEST(ProjectionExecTest, TransformMetaTextScore) {
                   new mongo::TextScoreComputedData(100),
                   true,
                   "{a: 'hello', b: 100}");
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKey) {
+    testTransform("{b: {$meta: 'sortKey'}}",
+                  "{}",
+                  "{a: 'hello'}",
+                  new mongo::SortKeyComputedData(BSON("" << 99)),
+                  true,
+                  "{a: 'hello', b: {'': 99}}");
+
+    // Projected meta field should overwrite existing field.
+    testTransform("{a: {$meta: 'sortKey'}}",
+                  "{}",
+                  "{a: 'hello'}",
+                  new mongo::SortKeyComputedData(BSON("" << 99)),
+                  true,
+                  "{a: {'': 99}}");
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredNormal) {
+    BSONObj actualOut =
+        transformMetaSortKeyCovered(BSON("" << 5),
+                                    "{_id: 0, a: 1, b: {$meta: 'sortKey'}}",
+                                    IndexKeyDatum(BSON("a" << 1), BSON("" << 5), nullptr));
+    BSONObj expectedOut = BSON("a" << 5 << "b" << BSON("" << 5));
+    ASSERT_EQ(actualOut, expectedOut);
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredOverwrite) {
+    BSONObj actualOut =
+        transformMetaSortKeyCovered(BSON("" << 5),
+                                    "{_id: 0, a: 1, a: {$meta: 'sortKey'}}",
+                                    IndexKeyDatum(BSON("a" << 1), BSON("" << 5), nullptr));
+    BSONObj expectedOut = BSON("a" << BSON("" << 5));
+    ASSERT_EQ(actualOut, expectedOut);
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredAdditionalData) {
+    BSONObj actualOut = transformMetaSortKeyCovered(
+        BSON("" << 5),
+        "{_id: 0, a: 1, b: {$meta: 'sortKey'}, c: 1}",
+        IndexKeyDatum(BSON("a" << 1 << "c" << 1), BSON("" << 5 << "" << 6), nullptr));
+    BSONObj expectedOut = BSON("a" << 5 << "c" << 6 << "b" << BSON("" << 5));
+    ASSERT_EQ(actualOut, expectedOut);
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredCompound) {
+    BSONObj actualOut = transformMetaSortKeyCovered(
+        BSON("" << 5 << "" << 6),
+        "{_id: 0, a: 1, b: {$meta: 'sortKey'}}",
+        IndexKeyDatum(BSON("a" << 1 << "c" << 1), BSON("" << 5 << "" << 6), nullptr));
+    BSONObj expectedOut = BSON("a" << 5 << "b" << BSON("" << 5 << "" << 6));
+    ASSERT_EQ(actualOut, expectedOut);
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredCompound2) {
+    BSONObj actualOut = transformMetaSortKeyCovered(
+        BSON("" << 5 << "" << 6),
+        "{_id: 0, a: 1, c: 1, b: {$meta: 'sortKey'}}",
+        IndexKeyDatum(
+            BSON("a" << 1 << "b" << 1 << "c" << 1), BSON("" << 5 << "" << 6 << "" << 4), nullptr));
+    BSONObj expectedOut = BSON("a" << 5 << "c" << 4 << "b" << BSON("" << 5 << "" << 6));
+    ASSERT_EQ(actualOut, expectedOut);
+}
+
+TEST(ProjectionExecTest, TransformMetaSortKeyCoveredCompound3) {
+    BSONObj actualOut = transformMetaSortKeyCovered(
+        BSON("" << 6 << "" << 4),
+        "{_id: 0, c: 1, d: 1, b: {$meta: 'sortKey'}}",
+        IndexKeyDatum(BSON("a" << 1 << "b" << 1 << "c" << 1 << "d" << 1),
+                      BSON("" << 5 << "" << 6 << "" << 4 << "" << 9000),
+                      nullptr));
+    BSONObj expectedOut = BSON("c" << 4 << "d" << 9000 << "b" << BSON("" << 6 << "" << 4));
+    ASSERT_EQ(actualOut, expectedOut);
 }
 
 }  // namespace

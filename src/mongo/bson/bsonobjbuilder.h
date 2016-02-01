@@ -44,6 +44,8 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/itoa.h"
 
 namespace mongo {
 
@@ -93,6 +95,23 @@ public:
         _b.skip(sizeof(int));
 
         // Reserve space for the EOO byte. This means _done() can't fail.
+        _b.reserveBytes(1);
+    }
+
+    // Tag for a special overload of BSONObjBuilder that allows the user to continue
+    // building in to an existing BufBuilder that has already been built in to. Use with caution.
+    struct ResumeBuildingTag {};
+
+    BSONObjBuilder(ResumeBuildingTag, BufBuilder& existingBuilder, std::size_t offset = 0)
+        : _b(existingBuilder),
+          _buf(0),
+          _offset(offset),
+          _s(this),
+          _tracker(nullptr),
+          _doneCalled(false) {
+        invariant(_b.len() >= BSONObj::kMinBSONLength);
+        _b.setlen(_b.len() - 1);  // get rid of the previous EOO.
+        // Reserve space for our EOO.
         _b.reserveBytes(1);
     }
 
@@ -235,6 +254,14 @@ public:
         return append(fieldName, (int)n);
     }
 
+    /** Append a NumberDecimal */
+    BSONObjBuilder& append(StringData fieldName, Decimal128 n) {
+        _b.appendNum(static_cast<char>(NumberDecimal));
+        _b.appendStr(fieldName);
+        _b.appendNum(n);
+        return *this;
+    }
+
     /** Append a NumberLong */
     BSONObjBuilder& append(StringData fieldName, long long n) {
         _b.appendNum((char)NumberLong);
@@ -270,12 +297,15 @@ public:
 
     BSONObjBuilder& appendNumber(StringData fieldName, size_t n) {
         static const size_t maxInt = (1 << 30);
-
         if (n < maxInt)
             append(fieldName, static_cast<int>(n));
         else
             append(fieldName, static_cast<long long>(n));
         return *this;
+    }
+
+    BSONObjBuilder& appendNumber(StringData fieldName, Decimal128 decNumber) {
+        return append(fieldName, decNumber);
     }
 
     BSONObjBuilder& appendNumber(StringData fieldName, long long llNumber) {
@@ -302,11 +332,6 @@ public:
         _b.appendNum(n);
         return *this;
     }
-
-    /** tries to append the data as a number
-     * @return true if the data was able to be converted to a number
-     */
-    bool appendAsNumber(StringData fieldName, const std::string& data);
 
     /** Append a BSON Object ID (OID type).
         @deprecated Generally, it is preferred to use the append append(name, oid)
@@ -577,6 +602,20 @@ public:
     BSONObjBuilder& append(StringData fieldName, const std::map<K, T>& vals);
 
     /**
+     * Resets this BSONObjBulder to an empty state. All previously added fields are lost.  If this
+     * BSONObjBuilder is using an externally provided BufBuilder, this method does not affect the
+     * bytes before the start of this object.
+     *
+     * Invalid to call if done() has already been called in order to finalize the BSONObj.
+     */
+    void resetToEmpty() {
+        invariant(!_doneCalled);
+        _s.reset();
+        // Reset the position the next write will go to right after our size reservation.
+        _b.setlen(_offset + sizeof(int));
+    }
+
+    /**
      * destructive
      * The returned BSONObj will free the buffer when it is finished.
      * @return owned BSONObj
@@ -738,12 +777,14 @@ public:
 
     template <typename T>
     BSONArrayBuilder& append(const T& x) {
-        _b.append(num(), x);
+        ItoA itoa(_i++);
+        _b.append(itoa, x);
         return *this;
     }
 
     BSONArrayBuilder& append(const BSONElement& e) {
-        _b.appendAs(e, num());
+        ItoA itoa(_i++);
+        _b.appendAs(e, itoa);
         return *this;
     }
 
@@ -753,16 +794,19 @@ public:
 
     template <typename T>
     BSONArrayBuilder& operator<<(const T& x) {
-        _b << num().c_str() << x;
+        ItoA itoa(_i++);
+        _b << itoa << x;
         return *this;
     }
 
     void appendNull() {
-        _b.appendNull(num());
+        ItoA itoa(_i++);
+        _b.appendNull(itoa);
     }
 
     void appendUndefined() {
-        _b.appendUndefined(num());
+        ItoA itoa(_i++);
+        _b.appendUndefined(itoa);
     }
 
     /**
@@ -792,49 +836,59 @@ public:
 
     // These two just use next position
     BufBuilder& subobjStart() {
-        return _b.subobjStart(num());
+        ItoA itoa(_i++);
+        return _b.subobjStart(itoa);
     }
     BufBuilder& subarrayStart() {
-        return _b.subarrayStart(num());
+        ItoA itoa(_i++);
+        return _b.subarrayStart(itoa);
     }
 
     BSONArrayBuilder& appendRegex(StringData regex, StringData options = "") {
-        _b.appendRegex(num(), regex, options);
+        ItoA itoa(_i++);
+        _b.appendRegex(itoa, regex, options);
         return *this;
     }
 
     BSONArrayBuilder& appendBinData(int len, BinDataType type, const void* data) {
-        _b.appendBinData(num(), len, type, data);
+        ItoA itoa(_i++);
+        _b.appendBinData(itoa, len, type, data);
         return *this;
     }
 
     BSONArrayBuilder& appendCode(StringData code) {
-        _b.appendCode(num(), code);
+        ItoA itoa(_i++);
+        _b.appendCode(itoa, code);
         return *this;
     }
 
     BSONArrayBuilder& appendCodeWScope(StringData code, const BSONObj& scope) {
-        _b.appendCodeWScope(num(), code, scope);
+        ItoA itoa(_i++);
+        _b.appendCodeWScope(itoa, code, scope);
         return *this;
     }
 
     BSONArrayBuilder& appendTimeT(time_t dt) {
-        _b.appendTimeT(num(), dt);
+        ItoA itoa(_i++);
+        _b.appendTimeT(itoa, dt);
         return *this;
     }
 
     BSONArrayBuilder& appendDate(Date_t dt) {
-        _b.appendDate(num(), dt);
+        ItoA itoa(_i++);
+        _b.appendDate(itoa, dt);
         return *this;
     }
 
     BSONArrayBuilder& appendBool(bool val) {
-        _b.appendBool(num(), val);
+        ItoA itoa(_i++);
+        _b.appendBool(itoa, val);
         return *this;
     }
 
     BSONArrayBuilder& appendTimestamp(unsigned long long ts) {
-        _b.appendTimestamp(num(), ts);
+        ItoA itoa(_i++);
+        _b.appendTimestamp(itoa, ts);
         return *this;
     }
 
@@ -854,19 +908,15 @@ public:
     }
 
 private:
-    std::string num() {
-        return _b.numStr(_i++);
-    }
-    int _i;
+    std::uint32_t _i;
     BSONObjBuilder _b;
 };
 
 template <class T>
 inline BSONObjBuilder& BSONObjBuilder::append(StringData fieldName, const std::vector<T>& vals) {
-    BSONObjBuilder arrBuilder;
+    BSONObjBuilder arrBuilder(subarrayStart(fieldName));
     for (unsigned int i = 0; i < vals.size(); ++i)
         arrBuilder.append(numStr(i), vals[i]);
-    appendArray(fieldName, arrBuilder.done());
     return *this;
 }
 
@@ -900,7 +950,6 @@ inline BSONObjBuilder& BSONObjBuilder::append(StringData fieldName, const std::m
     return *this;
 }
 
-
 template <class L>
 inline BSONArrayBuilder& _appendArrayIt(BSONArrayBuilder& _this, const L& vals) {
     for (typename L::const_iterator i = vals.begin(); i != vals.end(); i++)
@@ -924,7 +973,6 @@ inline BSONFieldValue<BSONObj> BSONField<T>::query(const char* q, const T& t) co
     b.append(q, t);
     return BSONFieldValue<BSONObj>(_name, b.obj());
 }
-
 
 // $or helper: OR(BSON("x" << GT << 7), BSON("y" << LT 6));
 inline BSONObj OR(const BSONObj& a, const BSONObj& b) {
@@ -967,7 +1015,6 @@ inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const UndefinedLabe
     return *_builder;
 }
 
-
 inline BSONObjBuilder& BSONObjBuilderValueStream::operator<<(const MinKeyLabeler& id) {
     _builder->appendMinKey(_fieldName);
     _fieldName = StringData();
@@ -1006,4 +1053,5 @@ inline BSONObjBuilder& BSONObjBuilder::appendTimestamp(StringData fieldName,
                                                        unsigned long long val) {
     return append(fieldName, Timestamp(val));
 }
-}
+
+}  // namespace mongo

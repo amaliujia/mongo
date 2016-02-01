@@ -80,7 +80,7 @@ void truncateAndResetOplog(OperationContext* txn,
                            ReplicationCoordinator* replCoord,
                            BackgroundSync* bgsync) {
     // Clear minvalid
-    setMinValid(txn, OpTime());
+    setMinValid(txn, OpTime(), DurableRequirement::None);
 
     AutoGetDb autoDb(txn, "local", MODE_X);
     massert(28585, "no local database found", autoDb.getDb());
@@ -184,8 +184,6 @@ bool _initialSyncClone(OperationContext* txn,
         options.slaveOk = true;
         options.useReplAuth = true;
         options.snapshot = false;
-        options.mayYield = true;
-        options.mayBeInterrupted = false;
         options.syncData = dataPass;
         options.syncIndexes = !dataPass;
 
@@ -211,11 +209,11 @@ bool _initialSyncClone(OperationContext* txn,
 /**
  * Replays the sync target's oplog from lastOp to the latest op on the sync target.
  *
- * @param syncer either initial sync (can reclone missing docs) or "normal" sync (no recloning)
- * @param r      the oplog reader
- * @return if applying the oplog succeeded
+ * @param syncer used to apply the oplog (from the reader).
+ * @param r      the oplog reader.
+ * @return if applying the oplog succeeded.
  */
-bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, OplogReader* r) {
+bool _initialSyncApplyOplog(OperationContext* ctx, repl::InitialSync* syncer, OplogReader* r) {
     const OpTime startOpTime = getGlobalReplicationCoordinator()->getMyLastOptime();
     BSONObj lastOp;
 
@@ -253,7 +251,7 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, Oplog
         return false;
     }
 
-    OpTime stopOpTime = extractOpTime(lastOp);
+    OpTime stopOpTime = fassertStatusOK(28777, OpTime::parseFromOplogEntry(lastOp));
 
     // If we already have what we need then return.
     if (stopOpTime == startOpTime)
@@ -265,7 +263,7 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, Oplog
     // apply till stopOpTime
     try {
         LOG(2) << "Applying oplog entries from " << startOpTime << " until " << stopOpTime;
-        syncer.oplogApplication(ctx, stopOpTime);
+        syncer->oplogApplication(ctx, stopOpTime);
 
         if (inShutdown()) {
             return false;
@@ -277,33 +275,6 @@ bool _initialSyncApplyOplog(OperationContext* ctx, repl::SyncTail& syncer, Oplog
     }
 
     return true;
-}
-
-void _tryToApplyOpWithRetry(OperationContext* txn, SyncTail* init, const BSONObj& op) {
-    try {
-        if (!SyncTail::syncApply(txn, op, false).isOK()) {
-            bool retry;
-            {
-                ScopedTransaction transaction(txn, MODE_X);
-                Lock::GlobalWrite lk(txn->lockState());
-                retry = init->shouldRetry(txn, op);
-            }
-
-            if (retry) {
-                // retry
-                if (!SyncTail::syncApply(txn, op, false).isOK()) {
-                    uasserted(28542,
-                              str::stream() << "During initial sync, failed to apply op: " << op);
-                }
-            }
-            // If shouldRetry() returns false, fall through.
-            // This can happen if the document that was moved and missed by Cloner
-            // subsequently got deleted and no longer exists on the Sync Target at all
-        }
-    } catch (const DBException& e) {
-        error() << "exception: " << causedBy(e) << " on: " << op.toString();
-        uasserted(28541, str::stream() << "During initial sync, failed to apply op: " << op);
-    }
 }
 
 /**
@@ -344,13 +315,11 @@ Status _initialSync() {
     truncateAndResetOplog(&txn, replCoord, bgsync);
 
     OplogReader r;
-    Timestamp now(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
-    OpTime nowOpTime(now, std::numeric_limits<long long>::max());
 
     while (r.getHost().empty()) {
         // We must prime the sync source selector so that it considers all candidates regardless
-        // of oplog position, by passing in "now" with max term as the last op fetched time.
-        r.connectToSyncSource(&txn, nowOpTime, replCoord);
+        // of oplog position, by passing in null OpTime as the last op fetched time.
+        r.connectToSyncSource(&txn, OpTime(), replCoord);
         if (r.getHost().empty()) {
             std::string msg =
                 "no valid sync sources found in current replset to do an initial sync";
@@ -363,7 +332,7 @@ Status _initialSync() {
         }
     }
 
-    InitialSync init(bgsync);
+    InitialSync init(bgsync, multiInitialSyncApply);
     init.setHostname(r.getHost().toString());
 
     BSONObj lastOp = r.getLastOp(rsOplogName);
@@ -398,29 +367,26 @@ Status _initialSync() {
 
     log() << "initial sync data copy, starting syncup";
 
-    // prime oplog
-    _tryToApplyOpWithRetry(&txn, &init, lastOp);
-    std::deque<BSONObj> ops;
-    ops.push_back(lastOp);
-
-    OpTime lastOptime = writeOpsToOplog(&txn, ops);
+    // prime oplog, but don't need to actually apply the op as the cloned data already reflects it.
+    OpTime lastOptime = writeOpsToOplog(&txn, {lastOp});
     ReplClientInfo::forClient(txn.getClient()).setLastOp(lastOptime);
     replCoord->setMyLastOptime(lastOptime);
     setNewTimestamp(lastOptime.getTimestamp());
 
     std::string msg = "oplog sync 1 of 3";
     log() << msg;
-    if (!_initialSyncApplyOplog(&txn, init, &r)) {
+    if (!_initialSyncApplyOplog(&txn, &init, &r)) {
         return Status(ErrorCodes::InitialSyncFailure,
                       str::stream() << "initial sync failed: " << msg);
     }
 
     // Now we sync to the latest op on the sync target _again_, as we may have recloned ops
-    // that were "from the future" compared with minValid. During this second application,
+    // that were "from the future" from the data clone. During this second application,
     // nothing should need to be recloned.
+    // TODO: replace with "tail" instance below, since we don't need to retry/reclone missing docs.
     msg = "oplog sync 2 of 3";
     log() << msg;
-    if (!_initialSyncApplyOplog(&txn, init, &r)) {
+    if (!_initialSyncApplyOplog(&txn, &init, &r)) {
         return Status(ErrorCodes::InitialSyncFailure,
                       str::stream() << "initial sync failed: " << msg);
     }
@@ -440,8 +406,8 @@ Status _initialSync() {
     msg = "oplog sync 3 of 3";
     log() << msg;
 
-    SyncTail tail(bgsync, multiSyncApply);
-    if (!_initialSyncApplyOplog(&txn, tail, &r)) {
+    InitialSync tail(bgsync, multiSyncApply);  // Use the non-initial sync apply code
+    if (!_initialSyncApplyOplog(&txn, &tail, &r)) {
         return Status(ErrorCodes::InitialSyncFailure,
                       str::stream() << "initial sync failed: " << msg);
     }
@@ -464,16 +430,17 @@ Status _initialSync() {
 
         // Initial sync is now complete.  Flag this by setting minValid to the last thing
         // we synced.
-        setMinValid(&txn, lastOpTimeWritten);
-
-        // Clear the initial sync flag.
-        clearInitialSyncFlag(&txn);
+        setMinValid(&txn, lastOpTimeWritten, DurableRequirement::None);
         BackgroundSync::get()->setInitialSyncRequestedFlag(false);
     }
 
-    // If we just cloned & there were no ops applied, we still want the primary to know where
-    // we're up to
-    bgsync->notify(&txn);
+    // Clear the initial sync flag -- cannot be done under a db lock, or recursive.
+    clearInitialSyncFlag(&txn);
+
+    // Clear maint. mode.
+    while (replCoord->getMaintenanceMode()) {
+        replCoord->setMaintenanceMode(false);
+    }
 
     log() << "initial sync done";
     return Status::OK();

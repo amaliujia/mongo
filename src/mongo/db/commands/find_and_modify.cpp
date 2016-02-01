@@ -38,11 +38,13 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/update.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
@@ -62,31 +64,36 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/s/d_state.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 namespace {
 
-const UpdateStats* getUpdateStats(const PlanStageStats* stats) {
+const UpdateStats* getUpdateStats(const PlanExecutor* exec) {
     // The stats may refer to an update stage, or a projection stage wrapping an update stage.
-    if (StageType::STAGE_PROJECTION == stats->stageType) {
-        invariant(stats->children.size() == 1);
-        stats = stats->children[0];
+    if (StageType::STAGE_PROJECTION == exec->getRootStage()->stageType()) {
+        invariant(exec->getRootStage()->getChildren().size() == 1U);
+        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
+        const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
+        return static_cast<const UpdateStats*>(stats);
+    } else {
+        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
+        return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
     }
-
-    invariant(StageType::STAGE_UPDATE == stats->stageType);
-    return static_cast<UpdateStats*>(stats->specific.get());
 }
 
-const DeleteStats* getDeleteStats(const PlanStageStats* stats) {
+const DeleteStats* getDeleteStats(const PlanExecutor* exec) {
     // The stats may refer to a delete stage, or a projection stage wrapping a delete stage.
-    if (StageType::STAGE_PROJECTION == stats->stageType) {
-        invariant(stats->children.size() == 1);
-        stats = stats->children[0];
+    if (StageType::STAGE_PROJECTION == exec->getRootStage()->stageType()) {
+        invariant(exec->getRootStage()->getChildren().size() == 1U);
+        invariant(StageType::STAGE_DELETE == exec->getRootStage()->child()->stageType());
+        const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
+        return static_cast<const DeleteStats*>(stats);
+    } else {
+        invariant(StageType::STAGE_DELETE == exec->getRootStage()->stageType());
+        return static_cast<const DeleteStats*>(exec->getRootStage()->getSpecificStats());
     }
-
-    invariant(StageType::STAGE_DELETE == stats->stageType);
-    return static_cast<DeleteStats*>(stats->specific.get());
 }
 
 /**
@@ -96,12 +103,16 @@ const DeleteStats* getDeleteStats(const PlanStageStats* stats) {
  *
  * If the operation failed, then an error Status is returned.
  */
-StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool isRemove) {
+StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
+                                                     PlanExecutor* exec,
+                                                     bool isRemove) {
     BSONObj value;
     PlanExecutor::ExecState state = exec->getNext(&value, nullptr);
+
     if (PlanExecutor::ADVANCED == state) {
         return boost::optional<BSONObj>(std::move(value));
     }
+
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         const std::unique_ptr<PlanStageStats> stats(exec->getStats());
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
@@ -117,6 +128,7 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(PlanExecutor* exec, bool is
                 str::stream() << "executor returned " << PlanExecutor::statestr(state)
                               << " while executing " << opstr};
     }
+
     invariant(state == PlanExecutor::IS_EOF);
     return boost::optional<BSONObj>(boost::none);
 }
@@ -152,13 +164,12 @@ void appendCommandResponse(PlanExecutor* exec,
                            bool isRemove,
                            const boost::optional<BSONObj>& value,
                            BSONObjBuilder& result) {
-    const std::unique_ptr<PlanStageStats> stats(exec->getStats());
     BSONObjBuilder lastErrorObjBuilder(result.subobjStart("lastErrorObject"));
 
     if (isRemove) {
-        lastErrorObjBuilder.appendNumber("n", getDeleteStats(stats.get())->docsDeleted);
+        lastErrorObjBuilder.appendNumber("n", getDeleteStats(exec)->docsDeleted);
     } else {
-        const UpdateStats* updateStats = getUpdateStats(stats.get());
+        const UpdateStats* updateStats = getUpdateStats(exec);
         lastErrorObjBuilder.appendBool("updatedExisting", updateStats->nMatched > 0);
         lastErrorObjBuilder.appendNumber("n", updateStats->inserted ? 1 : updateStats->nMatched);
         // Note we have to use the objInserted from the stats here, rather than 'value'
@@ -217,6 +228,7 @@ public:
                    const std::string& dbName,
                    const BSONObj& cmdObj,
                    ExplainCommon::Verbosity verbosity,
+                   const rpc::ServerSelectionMetadata&,
                    BSONObjBuilder* out) const override {
         const std::string fullNs = parseNsCollectionRequired(dbName, cmdObj);
         Status allowedWriteStatus = userAllowedWriteNS(fullNs);
@@ -232,8 +244,6 @@ public:
 
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
-
-        auto client = txn->getClient();
 
         if (args.isRemove()) {
             DeleteRequest request(nsString);
@@ -251,13 +261,13 @@ public:
             AutoGetDb autoDb(txn, dbName, MODE_IX);
             Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-            ensureShardVersionOKOrThrow(client, nsString.ns());
+            ensureShardVersionOKOrThrow(txn, nsString.ns());
 
             Collection* collection = nullptr;
             if (autoDb.getDb()) {
                 collection = autoDb.getDb()->getCollection(nsString.ns());
             } else {
-                return {ErrorCodes::DatabaseNotFound,
+                return {ErrorCodes::NamespaceNotFound,
                         str::stream() << "database " << dbName << " does not exist."};
             }
 
@@ -287,13 +297,13 @@ public:
             AutoGetDb autoDb(txn, dbName, MODE_IX);
             Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-            ensureShardVersionOKOrThrow(client, nsString.ns());
+            ensureShardVersionOKOrThrow(txn, nsString.ns());
 
             Collection* collection = nullptr;
             if (autoDb.getDb()) {
                 collection = autoDb.getDb()->getCollection(nsString.ns());
             } else {
-                return {ErrorCodes::DatabaseNotFound,
+                return {ErrorCodes::NamespaceNotFound,
                         str::stream() << "database " << dbName << " does not exist."};
             }
 
@@ -332,7 +342,7 @@ public:
         const FindAndModifyRequest& args = parseStatus.getValue();
         const NamespaceString& nsString = args.getNamespaceString();
 
-        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(cmdObj);
+        StatusWith<WriteConcernOptions> wcResult = extractWriteConcern(txn, cmdObj, dbName);
         if (!wcResult.isOK()) {
             return appendCommandStatus(result, wcResult.getStatus());
         }
@@ -344,15 +354,15 @@ public:
             maybeDisableValidation.emplace(txn);
 
         auto client = txn->getClient();
+        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
+        ScopeGuard lastOpSetterGuard =
+            MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                         txn);
 
-        // We may encounter a WriteConflictException when creating a collection during an
-        // upsert, even when holding the exclusive lock on the database (due to other load on
-        // the system). The query framework should handle all other WriteConflictExceptions,
-        // but we defensively wrap the operation in the retry loop anyway.
-        //
-        // SERVER-17579 getExecutorUpdate() and getExecutorDelete() can throw a
-        // WriteConflictException when checking whether an index is ready or not.
-        // (on debug builds only)
+        // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it is
+        // executing a findAndModify. This is done to ensure that we can always match, modify, and
+        // return the document under concurrency, if a matching document exists.
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             if (args.isRemove()) {
                 DeleteRequest request(nsString);
@@ -369,7 +379,14 @@ public:
                 Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
 
-                ensureShardVersionOKOrThrow(client, nsString.ns());
+                // Attach the namespace and database profiling level to the current op.
+                {
+                    stdx::lock_guard<Client> lk(*txn->getClient());
+                    CurOp::get(txn)
+                        ->enter_inlock(nsString.ns().c_str(), autoDb.getDb()->getProfilingLevel());
+                }
+
+                ensureShardVersionOKOrThrow(txn, nsString.ns());
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {
@@ -384,10 +401,19 @@ public:
                     std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove());
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
+
+                PlanSummaryStats summaryStats;
+                Explain::getSummaryStats(*exec, &summaryStats);
+                if (collection) {
+                    collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+                }
+
+                // Fill out OpDebug with the number of deleted docs.
+                CurOp::get(txn)->debug().ndeleted = getDeleteStats(exec.get())->docsDeleted;
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);
@@ -410,7 +436,14 @@ public:
                 Lock::CollectionLock collLock(txn->lockState(), nsString.ns(), MODE_IX);
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
 
-                ensureShardVersionOKOrThrow(client, nsString.ns());
+                // Attach the namespace and database profiling level to the current op.
+                {
+                    stdx::lock_guard<Client> lk(*txn->getClient());
+                    CurOp::get(txn)
+                        ->enter_inlock(nsString.ns().c_str(), autoDb.getDb()->getProfilingLevel());
+                }
+
+                ensureShardVersionOKOrThrow(txn, nsString.ns());
 
                 Status isPrimary = checkCanAcceptWritesForDatabase(nsString);
                 if (!isPrimary.isOK()) {
@@ -454,10 +487,17 @@ public:
                     std::move(statusWithPlanExecutor.getValue());
 
                 StatusWith<boost::optional<BSONObj>> advanceStatus =
-                    advanceExecutor(exec.get(), args.isRemove());
+                    advanceExecutor(txn, exec.get(), args.isRemove());
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
+
+                PlanSummaryStats summaryStats;
+                Explain::getSummaryStats(*exec, &summaryStats);
+                if (collection) {
+                    collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+                }
+                UpdateStage::fillOutOpDebug(getUpdateStats(exec.get()), &summaryStats, opDebug);
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);
@@ -465,9 +505,19 @@ public:
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "findAndModify", nsString.ns());
 
+        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
+            // If this operation has already generated a new lastOp, don't bother setting it here.
+            // No-op updates will not generate a new lastOp, so we still need the guard to fire in
+            // that case.
+            lastOpSetterGuard.Dismiss();
+        }
+
         WriteConcernResult res;
-        auto waitForWCStatus = waitForWriteConcern(
-            txn, repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(), &res);
+        auto waitForWCStatus =
+            waitForWriteConcern(txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                txn->getWriteConcern(),
+                                &res);
         appendCommandWCStatus(result, waitForWCStatus);
 
         return true;

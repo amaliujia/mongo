@@ -54,7 +54,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -67,22 +67,10 @@ void runSyncThread() {
     AuthorizationSession::get(cc())->grantInternalAuthorization();
     ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
-    // Set initial indexPrefetch setting
-    const std::string& prefetch = replCoord->getSettings().rsIndexPrefetch;
-    if (!prefetch.empty()) {
-        BackgroundSync::IndexPrefetchConfig prefetchConfig = BackgroundSync::PREFETCH_ALL;
-        if (prefetch == "none")
-            prefetchConfig = BackgroundSync::PREFETCH_NONE;
-        else if (prefetch == "_id_only")
-            prefetchConfig = BackgroundSync::PREFETCH_ID_ONLY;
-        else if (prefetch == "all")
-            prefetchConfig = BackgroundSync::PREFETCH_ALL;
-        else {
-            warning() << "unrecognized indexPrefetch setting " << prefetch << ", defaulting "
-                      << "to \"all\"";
-        }
-        BackgroundSync::get()->setIndexPrefetchConfig(prefetchConfig);
-    }
+    // Overwrite prefetch index mode in BackgroundSync if ReplSettings has a mode set.
+    ReplSettings replSettings = replCoord->getSettings();
+    if (replSettings.isPrefetchIndexModeSet())
+        BackgroundSync::get()->setIndexPrefetchConfig(replSettings.getPrefetchIndexMode());
 
     while (!inShutdown()) {
         // After a reconfig, we may not be in the replica set anymore, so
@@ -90,8 +78,8 @@ void runSyncThread() {
         // trying to sync with other replicas.
         // TODO(spencer): Use a condition variable to await loading a config
         if (replCoord->getMemberState().startup()) {
-            warning() << "did not receive a valid config yet, sleeping 5 seconds ";
-            sleepsecs(5);
+            warning() << "did not receive a valid config yet";
+            sleepsecs(1);
             continue;
         }
 
@@ -131,12 +119,8 @@ void runSyncThread() {
             /* we have some data.  continue tailing. */
             SyncTail tail(BackgroundSync::get(), multiSyncApply);
             tail.oplogApplication();
-        } catch (const DBException& e) {
-            log() << "Received exception while syncing: " << e.toString();
-            sleepsecs(10);
-        } catch (const std::exception& e) {
-            log() << "Received exception while syncing: " << e.what();
-            sleepsecs(10);
+        } catch (...) {
+            std::terminate();
         }
     }
 }

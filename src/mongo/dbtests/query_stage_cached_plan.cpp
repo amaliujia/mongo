@@ -35,6 +35,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
@@ -47,6 +48,8 @@
 
 namespace QueryStageCachedPlan {
 
+static const NamespaceString nss("unittests.QueryStageCachedPlan");
+
 class QueryStageCachedPlanBase {
 public:
     QueryStageCachedPlanBase() {
@@ -57,7 +60,7 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
 
-        OldClientWriteContext ctx(&_txn, ns());
+        OldClientWriteContext ctx(&_txn, nss.ns());
         Collection* collection = ctx.getCollection();
         ASSERT(collection);
 
@@ -68,20 +71,19 @@ public:
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_txn, nss.ns(), obj));
     }
 
     void dropCollection() {
-        const NamespaceString nsString(ns());
         ScopedTransaction transaction(&_txn, MODE_X);
-        Lock::DBLock dbLock(_txn.lockState(), nsString.db(), MODE_X);
-        Database* database = dbHolder().get(&_txn, nsString.db());
+        Lock::DBLock dbLock(_txn.lockState(), nss.db(), MODE_X);
+        Database* database = dbHolder().get(&_txn, nss.db());
         if (!database) {
             return;
         }
 
         WriteUnitOfWork wuow(&_txn);
-        database->dropCollection(&_txn, ns());
+        database->dropCollection(&_txn, nss.ns());
         wuow.commit();
     }
 
@@ -89,14 +91,8 @@ public:
         WriteUnitOfWork wuow(&_txn);
 
         const bool enforceQuota = false;
-        StatusWith<RecordId> res = collection->insertDocument(&_txn, obj, enforceQuota);
-        ASSERT(res.isOK());
-
+        ASSERT_OK(collection->insertDocument(&_txn, obj, enforceQuota));
         wuow.commit();
-    }
-
-    static const char* ns() {
-        return "unittests.QueryStageCachedPlan";
     }
 
 protected:
@@ -111,12 +107,13 @@ protected:
 class QueryStageCachedPlanFailure : public QueryStageCachedPlanBase {
 public:
     void run() {
-        AutoGetCollectionForRead ctx(&_txn, ns());
+        AutoGetCollectionForRead ctx(&_txn, nss.ns());
         Collection* collection = ctx.getCollection();
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns(), fromjson("{a: {$gte: 8}, b: 1}"));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            nss, fromjson("{a: {$gte: 8}, b: 1}"), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -131,7 +128,7 @@ public:
         fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
 
         // Queued data stage will return a failure during the cached plan trial period.
-        std::unique_ptr<QueuedDataStage> mockChild = stdx::make_unique<QueuedDataStage>(&_ws);
+        auto mockChild = stdx::make_unique<QueuedDataStage>(&_txn, &_ws);
         mockChild->pushBack(PlanStage::FAILURE);
 
         // High enough so that we shouldn't trigger a replan based on works.
@@ -175,12 +172,13 @@ public:
 class QueryStageCachedPlanHitMaxWorks : public QueryStageCachedPlanBase {
 public:
     void run() {
-        AutoGetCollectionForRead ctx(&_txn, ns());
+        AutoGetCollectionForRead ctx(&_txn, nss.ns());
         Collection* collection = ctx.getCollection();
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns(), fromjson("{a: {$gte: 8}, b: 1}"));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            nss, fromjson("{a: {$gte: 8}, b: 1}"), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -199,7 +197,7 @@ public:
         const size_t decisionWorks = 10;
         const size_t mockWorks =
             1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
-        std::unique_ptr<QueuedDataStage> mockChild = stdx::make_unique<QueuedDataStage>(&_ws);
+        auto mockChild = stdx::make_unique<QueuedDataStage>(&_txn, &_ws);
         for (size_t i = 0; i < mockWorks; i++) {
             mockChild->pushBack(PlanStage::NEED_TIME);
         }

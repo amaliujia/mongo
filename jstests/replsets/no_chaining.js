@@ -3,7 +3,7 @@ function myprint( x ) {
     print( "chaining output: " + x );
 }
 
-var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
+var replTest = new ReplSetTest({name: 'testSet', nodes: 3, useBridge: true});
 var nodes = replTest.startSet();
 var hostnames = replTest.nodeList();
 replTest.initiate(
@@ -20,14 +20,13 @@ replTest.initiate(
     }
 );
 
-var master = replTest.getMaster();
+var master = replTest.getPrimary();
 replTest.awaitReplication();
 
 
 var breakNetwork = function() {
-    replTest.bridge();
-    replTest.partition(0, 2);
-    master = replTest.getMaster();
+    nodes[0].disconnect(nodes[2]);
+    master = replTest.getPrimary();
 };
 
 var checkNoChaining = function() {
@@ -47,20 +46,19 @@ var checkNoChaining = function() {
 };
 
 var forceSync = function() {
+    var config;
+    try {
+        config = nodes[2].getDB("local").system.replset.findOne();
+    } catch (e) {
+        config = nodes[2].getDB("local").system.replset.findOne();
+    }
+    var targetHost = config.members[1].host;
+    printjson(nodes[2].getDB("admin").runCommand({replSetSyncFrom : targetHost}));
     assert.soon(
         function() {
-            var config = nodes[2].getDB("local").system.replset.findOne();
-            var targetHost = config.members[1].host;
-            printjson(nodes[2].getDB("admin").runCommand({replSetSyncFrom : targetHost}));
-            assert.soon(
-                function() {
-                    return nodes[2].getDB("test").foo.findOne() != null;
-                },
-                'Check for data after force sync', 5000
-            );
             return nodes[2].getDB("test").foo.findOne() != null;
         },
-        'Check force sync still works'
+        'Check for data after force sync'
     );
 };
 

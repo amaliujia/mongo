@@ -34,7 +34,6 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_runner.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/executor/task_executor.h"
@@ -51,10 +50,12 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class NamespaceString;
 class OperationContext;
 
 namespace executor {
+struct ConnectionPoolStats;
 class NetworkInterface;
 }  // namespace executor
 
@@ -109,6 +110,7 @@ public:
     virtual ~ReplicationExecutor();
 
     std::string getDiagnosticString() override;
+    BSONObj getDiagnosticBSON();
     Date_t now() override;
     void startup() override;
     void shutdown() override;
@@ -119,10 +121,12 @@ public:
     void waitForEvent(const EventHandle& event) override;
     StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work) override;
     StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) override;
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const RemoteCommandRequest& request,
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
                                                      const RemoteCommandCallbackFn& cb) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle) override;
+
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
     /**
      * Executes the run loop. May be called up to one time.
@@ -262,8 +266,8 @@ private:
      */
     void finishShutdown();
 
-    void _finishRemoteCommand(const RemoteCommandRequest& request,
-                              const StatusWith<RemoteCommandResponse>& response,
+    void _finishRemoteCommand(const executor::RemoteCommandRequest& request,
+                              const StatusWith<executor::RemoteCommandResponse>& response,
                               const CallbackHandle& cbHandle,
                               const uint64_t expectedHandleGeneration,
                               const RemoteCommandCallbackFn& cb);
@@ -317,12 +321,25 @@ private:
     WorkQueue _networkInProgressQueue;
     WorkQueue _sleepersQueue;
     EventList _unsignaledEvents;
-    int64_t _totalEventWaiters;
+    int64_t _totalEventWaiters = 0;
+
+    // Counters for metrics, for the whole life of this instance, protected by _mutex.
+    int64_t _counterWaitEvents = 0;
+    int64_t _counterCreatedEvents = 0;
+    int64_t _counterScheduledCommands = 0;
+    int64_t _counterScheduledExclusiveWorks = 0;
+    int64_t _counterScheduledDBWorks = 0;
+    int64_t _counterScheduledWorks = 0;
+    int64_t _counterScheduledWorkAts = 0;
+    int64_t _counterSchedulingFailures = 0;
+    int64_t _counterCancels = 0;
+    int64_t _counterWaits = 0;
+
     bool _inShutdown;
     OldThreadPool _dblockWorkers;
     TaskRunner _dblockTaskRunner;
     TaskRunner _dblockExclusiveLockTaskRunner;
-    uint64_t _nextId;
+    uint64_t _nextId = 0;
 };
 
 class ReplicationExecutor::Callback : public executor::TaskExecutor::CallbackState {
@@ -337,6 +354,7 @@ public:
 
     void cancel() override;
     void waitForCompletion() override;
+    bool isCanceled() const override;
 
 private:
     ReplicationExecutor* _executor;
@@ -344,6 +362,7 @@ private:
     // All members other than _executor are protected by the executor's _mutex.
     CallbackFn _callbackFn;
     bool _isCanceled;
+    bool _isSleeper;
     WorkQueue::iterator _iter;
     EventHandle _finishedEvent;
 };

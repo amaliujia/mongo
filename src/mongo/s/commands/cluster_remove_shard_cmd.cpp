@@ -86,7 +86,7 @@ public:
                      BSONObjBuilder& result) {
         const string target = cmdObj.firstElement().valuestrsafe();
 
-        const auto s = grid.shardRegistry()->getShard(target);
+        const auto s = grid.shardRegistry()->getShard(txn, target);
         if (!s) {
             string msg(str::stream() << "Could not drop shard '" << target
                                      << "' because it does not exist");
@@ -94,14 +94,18 @@ public:
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
 
+        auto catalogManager = grid.catalogManager(txn);
         StatusWith<ShardDrainingStatus> removeShardResult =
-            grid.catalogManager()->removeShard(txn, s->getId());
+            catalogManager->removeShard(txn, s->getId());
         if (!removeShardResult.isOK()) {
             return appendCommandStatus(result, removeShardResult.getStatus());
         }
 
         vector<string> databases;
-        grid.catalogManager()->getDatabasesForShard(s->getId(), &databases);
+        Status status = catalogManager->getDatabasesForShard(txn, s->getId(), &databases);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
+        }
 
         // Get BSONObj containing:
         // 1) note about moving or dropping databases in a shard
@@ -131,10 +135,12 @@ public:
                 break;
             case ShardDrainingStatus::ONGOING: {
                 vector<ChunkType> chunks;
-                Status status = grid.catalogManager()->getChunks(BSON(ChunkType::shard(s->getId())),
-                                                                 BSONObj(),
-                                                                 boost::none,  // return all
-                                                                 &chunks);
+                Status status = catalogManager->getChunks(txn,
+                                                          BSON(ChunkType::shard(s->getId())),
+                                                          BSONObj(),
+                                                          boost::none,  // return all
+                                                          &chunks,
+                                                          nullptr);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }

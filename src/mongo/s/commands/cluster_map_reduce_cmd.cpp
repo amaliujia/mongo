@@ -65,6 +65,8 @@ namespace {
 
 AtomicUInt32 JOB_NUMBER;
 
+const stdx::chrono::milliseconds kNoDistLockTimeout(-1);
+
 /**
  * Generates a unique name for the temporary M/R output collection.
  */
@@ -91,7 +93,7 @@ BSONObj fixForShards(const BSONObj& orig,
         if (fn == bypassDocumentValidationCommandOption() || fn == "map" || fn == "mapreduce" ||
             fn == "mapReduce" || fn == "mapparams" || fn == "reduce" || fn == "query" ||
             fn == "sort" || fn == "scope" || fn == "verbose" || fn == "$queryOptions" ||
-            fn == "$readMajorityTemporaryName" || fn == LiteParsedQuery::cmdOptionMaxTimeMS) {
+            fn == "readConcern" || fn == LiteParsedQuery::cmdOptionMaxTimeMS) {
             b.append(e);
         } else if (fn == "out" || fn == "finalize") {
             // We don't want to copy these
@@ -212,7 +214,7 @@ public:
         }
 
         // Ensure the input database exists
-        auto status = grid.catalogCache()->getDatabase(dbname);
+        auto status = grid.catalogCache()->getDatabase(txn, dbname);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
@@ -222,7 +224,7 @@ public:
         shared_ptr<DBConfig> confOut;
         if (customOutDB) {
             // Create the output database implicitly, since we have a custom output requested
-            confOut = uassertStatusOK(grid.implicitCreateDb(outDB));
+            confOut = uassertStatusOK(grid.implicitCreateDb(txn, outDB));
         } else {
             confOut = confIn;
         }
@@ -266,7 +268,7 @@ public:
         if (!shardedInput && !shardedOutput && !customOutDB) {
             LOG(1) << "simple MR, just passthrough";
 
-            const auto shard = grid.shardRegistry()->getShard(confIn->getPrimaryId());
+            const auto shard = grid.shardRegistry()->getShard(txn, confIn->getPrimaryId());
             ShardConnection conn(shard->getConnString(), "");
 
             BSONObj res;
@@ -301,7 +303,7 @@ public:
             // TODO: take distributed lock to prevent split / migration?
 
             try {
-                Strategy::commandOp(dbname, shardedCommand, 0, fullns, q, &mrCommandResults);
+                Strategy::commandOp(txn, dbname, shardedCommand, 0, fullns, q, &mrCommandResults);
             } catch (DBException& e) {
                 e.addContext(str::stream() << "could not run map command on all shards for ns "
                                            << fullns << " and query " << q);
@@ -312,7 +314,7 @@ public:
                 // Need to gather list of all servers even if an error happened
                 string server;
                 {
-                    const auto shard = grid.shardRegistry()->getShard(mrResult.shardTargetId);
+                    const auto shard = grid.shardRegistry()->getShard(txn, mrResult.shardTargetId);
                     server = shard->getConnString().toString();
                 }
                 servers.insert(server);
@@ -403,7 +405,7 @@ public:
         BSONObj singleResult;
 
         if (!shardedOutput) {
-            const auto shard = grid.shardRegistry()->getShard(confOut->getPrimaryId());
+            const auto shard = grid.shardRegistry()->getShard(txn, confOut->getPrimaryId());
             LOG(1) << "MR with single shard output, NS=" << finalColLong
                    << " primary=" << shard->toString();
 
@@ -422,7 +424,7 @@ public:
             // Create the sharded collection if needed
             if (!confOut->isSharded(finalColLong)) {
                 // Enable sharding on db
-                confOut->enableSharding();
+                confOut->enableSharding(txn);
 
                 // Shard collection according to split points
                 vector<BSONObj> sortedSplitPts;
@@ -444,21 +446,24 @@ public:
 
                 BSONObj sortKey = BSON("_id" << 1);
                 ShardKeyPattern sortKeyPattern(sortKey);
-                Status status = grid.catalogManager()->shardCollection(
-                    txn, finalColLong, sortKeyPattern, true, &sortedSplitPts, &outShardIds);
+                Status status = grid.catalogManager(txn)->shardCollection(
+                    txn, finalColLong, sortKeyPattern, true, sortedSplitPts, outShardIds);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
+
+                // Make sure the cached metadata for the collection knows that we are now sharded
+                const NamespaceString finalNss(finalColLong);
+                confOut = uassertStatusOK(
+                    grid.catalogCache()->getDatabase(txn, finalNss.db().toString()));
+                confOut->getChunkManager(txn, finalNss.ns(), true /* force */);
             }
 
             map<BSONObj, int> chunkSizes;
             {
                 // Take distributed lock to prevent split / migration.
-                auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
-                    finalColLong,
-                    "mr-post-process",
-                    stdx::chrono::milliseconds(-1),  // retry indefinitely
-                    stdx::chrono::milliseconds(100));
+                auto scopedDistLock = grid.forwardingCatalogManager()->distLock(
+                    txn, finalColLong, "mr-post-process", kNoDistLockTimeout);
 
                 if (!scopedDistLock.isOK()) {
                     return appendCommandStatus(result, scopedDistLock.getStatus());
@@ -469,7 +474,7 @@ public:
 
                 try {
                     Strategy::commandOp(
-                        outDB, finalCmdObj, 0, finalColLong, BSONObj(), &mrCommandResults);
+                        txn, outDB, finalCmdObj, 0, finalColLong, BSONObj(), &mrCommandResults);
                     ok = true;
                 } catch (DBException& e) {
                     e.addContext(str::stream() << "could not run final reduce on all shards for "
@@ -480,7 +485,8 @@ public:
                 for (const auto& mrResult : mrCommandResults) {
                     string server;
                     {
-                        const auto shard = grid.shardRegistry()->getShard(mrResult.shardTargetId);
+                        const auto shard =
+                            grid.shardRegistry()->getShard(txn, mrResult.shardTargetId);
                         server = shard->getConnString().toString();
                     }
                     singleResult = mrResult.result;
@@ -511,19 +517,25 @@ public:
             }
 
             // Do the splitting round
-            ChunkManagerPtr cm = confOut->getChunkManagerIfExists(finalColLong);
+            ChunkManagerPtr cm = confOut->getChunkManagerIfExists(txn, finalColLong);
+
+            uassert(34359,
+                    str::stream() << "Failed to write mapreduce output to " << finalColLong
+                                  << "; expected that collection to be sharded, but it was not",
+                    cm);
+
             for (const auto& chunkSize : chunkSizes) {
                 BSONObj key = chunkSize.first;
                 const int size = chunkSize.second;
                 invariant(size < std::numeric_limits<int>::max());
 
                 // key reported should be the chunk's minimum
-                ChunkPtr c = cm->findIntersectingChunk(key);
+                ChunkPtr c = cm->findIntersectingChunk(txn, key);
                 if (!c) {
                     warning() << "Mongod reported " << size << " bytes inserted for key " << key
                               << " but can't find chunk";
                 } else {
-                    c->splitIfShould(size);
+                    c->splitIfShould(txn, size);
                 }
             }
         }

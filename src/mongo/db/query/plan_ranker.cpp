@@ -31,7 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
-#include <math.h>
+#include <cmath>
 #include <vector>
 #include <utility>
 
@@ -111,6 +111,14 @@ size_t PlanRanker::pickBestPlan(const vector<CandidatePlan>& candidates, PlanRan
     std::stable_sort(
         scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(), scoreComparator);
 
+    // Determine whether plans tied for the win.
+    if (scoresAndCandidateindices.size() > 1U) {
+        double bestScore = scoresAndCandidateindices[0].first;
+        double runnerUpScore = scoresAndCandidateindices[1].first;
+        const double epsilon = 1e-10;
+        why->tieForBest = std::abs(bestScore - runnerUpScore) < epsilon;
+    }
+
     // Update results in 'why'
     // Stats and scores in 'why' are sorted in descending order by score.
     why->stats.clear();
@@ -161,7 +169,7 @@ double computeSelectivity(const PlanStageStats* stats) {
     } else {
         double sum = 0;
         for (size_t i = 0; i < stats->children.size(); ++i) {
-            sum += computeSelectivity(stats->children[i]);
+            sum += computeSelectivity(stats->children[i].get());
         }
         return sum;
     }
@@ -172,7 +180,7 @@ bool hasStage(const StageType type, const PlanStageStats* stats) {
         return true;
     }
     for (size_t i = 0; i < stats->children.size(); ++i) {
-        if (hasStage(type, stats->children[i])) {
+        if (hasStage(type, stats->children[i].get())) {
             return true;
         }
     }

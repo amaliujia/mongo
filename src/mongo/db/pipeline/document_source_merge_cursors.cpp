@@ -48,11 +48,6 @@ const char* DocumentSourceMergeCursors::getSourceName() const {
     return "$mergeCursors";
 }
 
-void DocumentSourceMergeCursors::setSource(DocumentSource* pSource) {
-    /* this doesn't take a source */
-    verify(false);
-}
-
 intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::create(
     const CursorIds& cursorIds, const intrusive_ptr<ExpressionContext>& pExpCtx) {
     return new DocumentSourceMergeCursors(cursorIds, pExpCtx);
@@ -163,6 +158,13 @@ boost::optional<Document> DocumentSourceMergeCursors::getNext() {
 }
 
 void DocumentSourceMergeCursors::dispose() {
+    // Note it is an error to call done() on a connection before consuming the response from a
+    // request. Therefore it is an error to call dispose() if there are any outstanding connections
+    // which have not received a reply.
+    for (auto&& cursorAndConn : _cursors) {
+        cursorAndConn->cursor.kill();
+        cursorAndConn->connection.done();
+    }
     _cursors.clear();
     _currentCursor = _cursors.end();
 }

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,8 +14,8 @@
 struct __wt_data_handle_cache {
 	WT_DATA_HANDLE *dhandle;
 
-	SLIST_ENTRY(__wt_data_handle_cache) l;
-	SLIST_ENTRY(__wt_data_handle_cache) hashl;
+	TAILQ_ENTRY(__wt_data_handle_cache) q;
+	TAILQ_ENTRY(__wt_data_handle_cache) hashq;
 };
 
 /*
@@ -66,7 +66,7 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	 * across session close - so it is declared further down.
 	 */
 					/* Session handle reference list */
-	SLIST_HEAD(__dhandles, __wt_data_handle_cache) dhandles;
+	TAILQ_HEAD(__dhandles, __wt_data_handle_cache) dhandles;
 	time_t last_sweep;		/* Last sweep for dead handles */
 
 	WT_CURSOR *cursor;		/* Current cursor */
@@ -74,14 +74,22 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	TAILQ_HEAD(__cursors, __wt_cursor) cursors;
 
 	WT_CURSOR_BACKUP *bkp_cursor;	/* Hot backup cursor */
-	WT_COMPACT	 *compact;	/* Compact state */
 
-	WT_DATA_HANDLE *meta_dhandle;	/* Metadata file */
-	void	*meta_track;		/* Metadata operation tracking */
-	void	*meta_track_next;	/* Current position */
-	void	*meta_track_sub;	/* Child transaction / save point */
-	size_t	 meta_track_alloc;	/* Currently allocated */
-	int	 meta_track_nest;	/* Nesting level of meta transaction */
+	WT_COMPACT	 *compact;	/* Compaction information */
+	enum { WT_COMPACT_NONE=0,
+	    WT_COMPACT_RUNNING, WT_COMPACT_SUCCESS } compact_state;
+
+	/*
+	 * Lookaside table cursor, sweep and eviction worker threads only.
+	 */
+	WT_CURSOR	*las_cursor;	/* Lookaside table cursor */
+
+	WT_CURSOR *meta_cursor;		/* Metadata file */
+	void	  *meta_track;		/* Metadata operation tracking */
+	void	  *meta_track_next;	/* Current position */
+	void	  *meta_track_sub;	/* Child transaction / save point */
+	size_t	   meta_track_alloc;	/* Currently allocated */
+	int	   meta_track_nest;	/* Nesting level of meta transaction */
 #define	WT_META_TRACKING(session)	(session->meta_track_next != NULL)
 
 	/*
@@ -90,7 +98,7 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	 * table of lists. The hash table list is kept in allocated memory
 	 * that lives across session close - so it is declared further down.
 	 */
-	SLIST_HEAD(__tables, __wt_table) tables;
+	TAILQ_HEAD(__tables, __wt_table) tables;
 
 	WT_ITEM	**scratch;		/* Temporary memory for any function */
 	u_int	  scratch_alloc;	/* Currently allocated */
@@ -129,8 +137,6 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	void	*reconcile;		/* Reconciliation support */
 	int	(*reconcile_cleanup)(WT_SESSION_IMPL *);
 
-	int compaction;			/* Compaction did some work */
-
 	uint32_t flags;
 
 	/*
@@ -148,12 +154,12 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 #define	WT_SESSION_CLEAR_SIZE(s)					\
 	(WT_PTRDIFF(&(s)->rnd, s))
 
-	uint64_t rnd;			/* Random number generation state */
+	WT_RAND_STATE rnd;		/* Random number generation state */
 
 					/* Hashed handle reference list array */
-	SLIST_HEAD(__dhandles_hash, __wt_data_handle_cache) *dhhash;
+	TAILQ_HEAD(__dhandles_hash, __wt_data_handle_cache) *dhhash;
 					/* Hashed table reference list array */
-	SLIST_HEAD(__tables_hash, __wt_table) *tablehash;
+	TAILQ_HEAD(__tables_hash, __wt_table) *tablehash;
 
 	/*
 	 * Splits can "free" memory that may still be in use, and we use a

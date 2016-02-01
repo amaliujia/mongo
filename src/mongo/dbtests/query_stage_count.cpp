@@ -37,6 +37,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -109,14 +110,15 @@ public:
 
     void remove(const RecordId& loc) {
         WriteUnitOfWork wunit(&_txn);
-        _coll->deleteDocument(&_txn, loc, false, false, NULL);
+        _coll->deleteDocument(&_txn, loc);
         wunit.commit();
     }
 
     void update(const RecordId& oldLoc, const BSONObj& newDoc) {
         WriteUnitOfWork wunit(&_txn);
         BSONObj oldDoc = _coll->getRecordStore()->dataFor(&_txn, oldLoc).releaseToBson();
-        oplogUpdateEntryArgs args;
+        OplogUpdateEntryArgs args;
+        args.ns = _coll->ns().ns();
         _coll->updateDocument(&_txn,
                               oldLoc,
                               Snapshotted<BSONObj>(_txn.recoveryUnit()->getSnapshotId(), oldDoc),
@@ -124,7 +126,7 @@ public:
                               false,
                               true,
                               NULL,
-                              args);
+                              &args);
         wunit.commit();
     }
 
@@ -140,8 +142,8 @@ public:
 
         unique_ptr<WorkingSet> ws(new WorkingSet);
 
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(request.getQuery());
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+            request.getQuery(), ExtensionsCallbackDisallowExtensions());
         ASSERT(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> expression = std::move(statusWithMatcher.getValue());
 
@@ -182,7 +184,7 @@ public:
             }
 
             // resume from yield
-            count_stage.restoreState(&_txn);
+            count_stage.restoreState();
         }
 
         return static_cast<const CountStats*>(count_stage.getSpecificStats());
@@ -292,11 +294,13 @@ public:
         if (interjection == 0) {
             // At this point, our first interjection, we've counted _locs[0]
             // and are about to count _locs[1]
+            WriteUnitOfWork wunit(&_txn);
             count_stage.invalidate(&_txn, _locs[interjection], INVALIDATION_DELETION);
             remove(_locs[interjection]);
 
             count_stage.invalidate(&_txn, _locs[interjection + 1], INVALIDATION_DELETION);
             remove(_locs[interjection + 1]);
+            wunit.commit();
         }
     }
 };

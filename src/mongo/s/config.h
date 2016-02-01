@@ -31,6 +31,8 @@
 #include <set>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/util/concurrency/mutex.h"
 
@@ -42,15 +44,13 @@ class DatabaseType;
 class DBConfig;
 class OperationContext;
 
-typedef std::shared_ptr<DBConfig> DBConfigPtr;
-
 struct CollectionInfo {
     CollectionInfo() {
         _dirty = false;
         _dropped = false;
     }
 
-    CollectionInfo(const CollectionType& in);
+    CollectionInfo(OperationContext* txn, const CollectionType& in, repl::OpTime);
     ~CollectionInfo();
 
     bool isSharded() const {
@@ -63,25 +63,30 @@ struct CollectionInfo {
 
     void resetCM(ChunkManager* cm);
 
-    void shard(ChunkManager* cm);
     void unshard();
 
     bool isDirty() const {
         return _dirty;
     }
+
     bool wasDropped() const {
         return _dropped;
     }
 
-    void save(const std::string& ns);
+    void save(OperationContext* txn, const std::string& ns);
 
     void useChunkManager(std::shared_ptr<ChunkManager> manager);
 
     bool unique() const {
         return _unique;
     }
+
     BSONObj key() const {
         return _key;
+    }
+
+    repl::OpTime getConfigOpTime() const {
+        return _configOpTime;
     }
 
 private:
@@ -90,6 +95,7 @@ private:
     std::shared_ptr<ChunkManager> _cm;
     bool _dirty;
     bool _dropped;
+    repl::OpTime _configOpTime;
 };
 
 /**
@@ -97,7 +103,8 @@ private:
  */
 class DBConfig {
 public:
-    DBConfig(std::string name, const DatabaseType& dbt);
+    DBConfig(std::string name, const DatabaseType& dbt, repl::OpTime configOpTime);
+    ~DBConfig();
 
     /**
      * The name of the database which this entry caches.
@@ -117,12 +124,18 @@ public:
         return _primaryId;
     }
 
-    void enableSharding(bool save = true);
+    /**
+     * Removes all cached metadata for the specified namespace so that subsequent attempts to
+     * retrieve it will cause a full reload.
+     */
+    void invalidateNs(const std::string& ns);
+
+    void enableSharding(OperationContext* txn);
 
     /**
        @return true if there was sharding info to remove
      */
-    bool removeSharding(const std::string& ns);
+    bool removeSharding(OperationContext* txn, const std::string& ns);
 
     /**
      * @return whether or not the 'ns' collection is partitioned
@@ -131,26 +144,33 @@ public:
 
     // Atomically returns *either* the chunk manager *or* the primary shard for the collection,
     // neither if the collection doesn't exist.
-    void getChunkManagerOrPrimary(const std::string& ns,
+    void getChunkManagerOrPrimary(OperationContext* txn,
+                                  const std::string& ns,
                                   std::shared_ptr<ChunkManager>& manager,
                                   std::shared_ptr<Shard>& primary);
 
-    std::shared_ptr<ChunkManager> getChunkManager(const std::string& ns,
+    std::shared_ptr<ChunkManager> getChunkManager(OperationContext* txn,
+                                                  const std::string& ns,
                                                   bool reload = false,
                                                   bool forceReload = false);
-    std::shared_ptr<ChunkManager> getChunkManagerIfExists(const std::string& ns,
+    std::shared_ptr<ChunkManager> getChunkManagerIfExists(OperationContext* txn,
+                                                          const std::string& ns,
                                                           bool reload = false,
                                                           bool forceReload = false);
 
     /**
      * Returns shard id for primary shard for the database for which this DBConfig represents.
      */
-    const ShardId& getShardId(const std::string& ns);
+    const ShardId& getShardId(OperationContext* txn, const std::string& ns);
 
-    void setPrimary(const std::string& s);
+    void setPrimary(OperationContext* txn, const ShardId& newPrimaryId);
 
-    bool load();
-    bool reload();
+    /**
+     * Returns true if it is successful at loading the DBConfig, false if the database is not found,
+     * and throws on all other errors.
+     */
+    bool load(OperationContext* txn);
+    bool reload(OperationContext* txn);
 
     bool dropDatabase(OperationContext*, std::string& errmsg);
 
@@ -159,48 +179,82 @@ public:
 
 protected:
     typedef std::map<std::string, CollectionInfo> CollectionInfoMap;
-
-
-    /**
-        lockless
-    */
-    bool _isSharded(const std::string& ns);
+    typedef AtomicUInt64::WordType Counter;
 
     bool _dropShardedCollections(OperationContext* txn,
                                  int& num,
                                  std::set<ShardId>& shardIds,
                                  std::string& errmsg);
 
-    bool _load();
-    bool _reload();
-    void _save(bool db = true, bool coll = true);
+    /**
+     * Returns true if it is successful at loading the DBConfig, false if the database is not found,
+     * and throws on all other errors.
+     * Also returns true without reloading if reloadIteration is not equal to the _reloadCount.
+     * This is to avoid multiple threads attempting to reload do duplicate work.
+     */
+    bool _loadIfNeeded(OperationContext* txn, Counter reloadIteration);
 
+    void _save(OperationContext* txn, bool db = true, bool coll = true);
+
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (L) Must hold _lock for access.
+    // (I) Immutable, can access freely.
+    // (S) Self synchronizing, no explicit locking needed.
+    //
+    // Mutex lock order:
+    // _hitConfigServerLock -> _lock
+    //
 
     // Name of the database which this entry caches
-    const std::string _name;
+    const std::string _name;  // (I)
 
     // Primary shard id
-    ShardId _primaryId;
+    ShardId _primaryId;  // (L) TODO: SERVER-22175 enforce this
 
     // Whether sharding has been enabled for this database
-    bool _shardingEnabled;
+    bool _shardingEnabled;  // (L) TODO: SERVER-22175 enforce this
 
     // Set of collections and lock to protect access
     stdx::mutex _lock;
-    CollectionInfoMap _collections;
+    CollectionInfoMap _collections;  // (L)
+
+    // OpTime of config server when the database definition was loaded.
+    repl::OpTime _configOpTime;  // (L)
 
     // Ensures that only one thread at a time loads collection configuration data from
     // the config server
     stdx::mutex _hitConfigServerLock;
+
+    // Increments every time this performs a full reload. Since a full reload can take a very
+    // long time for very large clusters, this can be used to minimize duplicate work when multiple
+    // threads tries to perform full rerload at roughly the same time.
+    AtomicUInt64 _reloadCount;  // (S)
 };
 
 
 class ConfigServer {
 public:
-    static void reloadSettings();
+    static void reloadSettings(OperationContext* txn);
 
-    static void replicaSetChange(const std::string& setName,
-                                 const std::string& newConnectionString);
+    /**
+     * For use in mongos and mongod which needs notifications about changes to shard and config
+     * server replset membership to update the ShardRegistry.
+     *
+     * This is expected to be run in an existing thread.
+     */
+    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
+                                                        const std::string& newConnectionString);
+
+    /**
+     * For use in mongos which needs notifications about changes to shard replset membership to
+     * update the config.shards collection.
+     *
+     * This is expected to be run in a brand new thread.
+     */
+    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
+                                                       const std::string& newConnectionString);
 };
 
 }  // namespace mongo

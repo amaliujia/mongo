@@ -78,25 +78,6 @@ StatusWith<std::unique_ptr<PlanExecutor>> getExecutor(
     size_t plannerOptions = 0);
 
 /**
- * Get a plan executor for query. This differs from the getExecutor(...) function
- * above in that the above requires a non-NULL canonical query, whereas this
- * function can retrieve a plan executor from the raw query object.
- *
- * Used to support idhack updates that do not create a canonical query.
- *
- * If the query is valid and an executor could be created, returns a StatusWith with the
- * PlanExecutor.
- *
- * If the query cannot be executed, returns a Status indicating why.
- */
-StatusWith<std::unique_ptr<PlanExecutor>> getExecutor(OperationContext* txn,
-                                                      Collection* collection,
-                                                      const std::string& ns,
-                                                      const BSONObj& unparsedQuery,
-                                                      PlanExecutor::YieldPolicy yieldPolicy,
-                                                      size_t plannerOptions = 0);
-
-/**
  * Get a plan executor for a .find() operation.
  *
  * If the query is valid and an executor could be created, returns a StatusWith with the
@@ -130,8 +111,10 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const std::string& field)
 StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDistinct(
     OperationContext* txn,
     Collection* collection,
+    const std::string& ns,
     const BSONObj& query,
     const std::string& field,
+    bool isExplain,
     PlanExecutor::YieldPolicy yieldPolicy);
 
 /*

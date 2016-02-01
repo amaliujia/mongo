@@ -191,7 +191,7 @@ public:
     }
 
     Message* getMessage() {
-        return batch.m.get();
+        return &batch.m;
     }
 
     /**
@@ -215,19 +215,31 @@ public:
     class Batch {
         MONGO_DISALLOW_COPYING(Batch);
         friend class DBClientCursor;
-        std::unique_ptr<Message> m;
-        int nReturned;
-        int pos;
-        const char* data;
+        Message m;
+        int nReturned{0};
+        int pos{0};
+        const char* data{nullptr};
 
     public:
-        Batch() : m(new Message()), nReturned(), pos(), data() {}
+        Batch() = default;
     };
 
     /**
      * For exhaust. Used in DBClientConnection.
      */
     void exhaustReceiveMore();
+
+    /**
+     * Marks this object as dead and sends the KillCursors message to the server.
+     *
+     * Any errors that result from this are swallowed since this is typically performed as part of
+     * cleanup and a failure to kill the cursor should not result in a failure of the operation
+     * using the cursor.
+     *
+     * Killing an already killed or exhausted cursor does nothing, so it is safe to always call this
+     * if you want to ensure that a cursor is killed.
+     */
+    void kill();
 
 private:
     DBClientCursor(DBClientBase* client,

@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-2016 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -96,6 +96,11 @@ uint64_t
 sum_read_ops(CONFIG *cfg)
 {
 	return (sum_ops(cfg, offsetof(CONFIG_THREAD, read)));
+}
+uint64_t
+sum_truncate_ops(CONFIG *cfg)
+{
+	return (sum_ops(cfg, offsetof(CONFIG_THREAD, truncate)));
 }
 uint64_t
 sum_update_ops(CONFIG *cfg)

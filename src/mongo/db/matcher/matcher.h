@@ -48,9 +48,7 @@ class Matcher {
     MONGO_DISALLOW_COPYING(Matcher);
 
 public:
-    explicit Matcher(const BSONObj& pattern,
-                     const MatchExpressionParser::WhereCallback& whereCallback =
-                         MatchExpressionParser::WhereCallback());
+    explicit Matcher(const BSONObj& pattern, const ExtensionsCallback& extensionsCallback);
 
     bool matches(const BSONObj& doc, MatchDetails* details = NULL) const;
 

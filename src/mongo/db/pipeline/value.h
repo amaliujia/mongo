@@ -71,6 +71,7 @@ public:
     explicit Value(int value) : _storage(NumberInt, value) {}
     explicit Value(long long value) : _storage(NumberLong, value) {}
     explicit Value(double value) : _storage(NumberDouble, value) {}
+    explicit Value(const Decimal128& value) : _storage(NumberDecimal, value) {}
     explicit Value(const Timestamp& value) : _storage(bsonTimestamp, value) {}
     explicit Value(const OID& value) : _storage(jstOID, value) {}
     explicit Value(StringData value) : _storage(String, value) {}
@@ -96,6 +97,16 @@ public:
     /// Deep-convert from BSONElement to Value
     explicit Value(const BSONElement& elem);
 
+#if defined(_MSC_VER) && _MSC_VER < 1900  // MVSC++ <= 2013 can't generate default move operations
+    Value(const Value& other) = default;
+    Value& operator=(const Value& other) = default;
+    Value(Value&& other) : _storage(std::move(other._storage)) {}
+    Value& operator=(Value&& other) {
+        _storage = std::move(other._storage);
+        return *this;
+    }
+#endif
+
     /** Construct a long or integer-valued Value.
      *
      *  Used when preforming arithmetic operations with int where the
@@ -118,6 +129,8 @@ public:
     }
 
     /// true if type represents a number
+    // TODO: Add _storage.type == NumberDecimal
+    // SERVER-19735
     bool numeric() const {
         return _storage.type == NumberDouble || _storage.type == NumberLong ||
             _storage.type == NumberInt;
@@ -138,6 +151,7 @@ public:
      *  Asserts if the requested value type is not exactly correct.
      *  See coerceTo methods below for a more type-flexible alternative.
      */
+    Decimal128 getDecimal() const;
     double getDouble() const;
     std::string getString() const;
     Document getDocument() const;
@@ -184,6 +198,7 @@ public:
     int coerceToInt() const;
     long long coerceToLong() const;
     double coerceToDouble() const;
+    Decimal128 coerceToDecimal() const;
     Timestamp coerceToTimestamp() const;
     long long coerceToDate() const;
     time_t coerceToTimeT() const;
@@ -279,11 +294,7 @@ private:
 static_assert(sizeof(Value) == 16, "sizeof(Value) == 16");
 
 typedef unordered_set<Value, Value::Hash> ValueSet;
-}
 
-namespace std {
-// This is used by std::sort and others
-template <>
 inline void swap(mongo::Value& lhs, mongo::Value& rhs) {
     lhs.swap(rhs);
 }

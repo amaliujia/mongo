@@ -52,15 +52,17 @@ static const char* kIdField = "_id";
 // static
 const char* ProjectionStage::kStageType = "PROJECTION";
 
-ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
+ProjectionStage::ProjectionStage(OperationContext* opCtx,
+                                 const ProjectionStageParams& params,
                                  WorkingSet* ws,
                                  PlanStage* child)
-    : _ws(ws), _child(child), _commonStats(kStageType), _projImpl(params.projImpl) {
+    : PlanStage(kStageType, opCtx), _ws(ws), _projImpl(params.projImpl) {
+    _children.emplace_back(child);
     _projObj = params.projObj;
 
     if (ProjectionStageParams::NO_FAST_PATH == _projImpl) {
         _exec.reset(
-            new ProjectionExec(params.projObj, params.fullExpression, *params.whereCallback));
+            new ProjectionExec(params.projObj, params.fullExpression, *params.extensionsCallback));
     } else {
         // We shouldn't need the full expression if we're fast-pathing.
         invariant(NULL == params.fullExpression);
@@ -82,9 +84,7 @@ ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
             BSONObjIterator kpIt(_coveredKeyObj);
             while (kpIt.more()) {
                 BSONElement elt = kpIt.next();
-                unordered_set<StringData, StringData::Hasher>::iterator fieldIt;
-                fieldIt = _includedFields.find(elt.fieldNameStringData());
-
+                auto fieldIt = _includedFields.find(elt.fieldNameStringData());
                 if (_includedFields.end() == fieldIt) {
                     // Push an unused value on the back to keep _includeKey and _keyFieldNames
                     // in sync.
@@ -92,7 +92,7 @@ ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
                     _includeKey.push_back(false);
                 } else {
                     // If we are including this key field store its field name.
-                    _keyFieldNames.push_back(*fieldIt);
+                    _keyFieldNames.push_back(fieldIt->first);
                     _includeKey.push_back(true);
                 }
             }
@@ -118,11 +118,11 @@ void ProjectionStage::getSimpleInclusionFields(const BSONObj& projObj, FieldSet*
             includeId = false;
             continue;
         }
-        includedFields->insert(elt.fieldNameStringData());
+        (*includedFields)[elt.fieldNameStringData()] = true;
     }
 
     if (includeId) {
-        includedFields->insert(kIdField);
+        (*includedFields)[kIdField] = true;
     }
 }
 
@@ -134,8 +134,7 @@ void ProjectionStage::transformSimpleInclusion(const BSONObj& in,
     BSONObjIterator inputIt(in);
     while (inputIt.more()) {
         BSONElement elt = inputIt.next();
-        unordered_set<StringData, StringData::Hasher>::const_iterator fieldIt;
-        fieldIt = includedFields.find(elt.fieldNameStringData());
+        auto fieldIt = includedFields.find(elt.fieldNameStringData());
         if (includedFields.end() != fieldIt) {
             // If so, add it to the builder.
             bob.append(elt);
@@ -189,20 +188,13 @@ Status ProjectionStage::transform(WorkingSetMember* member) {
     return Status::OK();
 }
 
-ProjectionStage::~ProjectionStage() {}
-
 bool ProjectionStage::isEOF() {
-    return _child->isEOF();
+    return child()->isEOF();
 }
 
-PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState ProjectionStage::doWork(WorkingSetID* out) {
     WorkingSetID id = WorkingSet::INVALID_ID;
-    StageState status = _child->work(&id);
+    StageState status = child()->work(&id);
 
     // Note that we don't do the normal if isEOF() return EOF thing here.  Our child might be a
     // tailable cursor and isEOF() would be true even if it had more data...
@@ -217,7 +209,6 @@ PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
         }
 
         *out = id;
-        ++_commonStats.advanced;
     } else if (PlanStage::FAILURE == status || PlanStage::DEAD == status) {
         *out = id;
         // If a stage fails, it may create a status WSM to indicate why it
@@ -229,35 +220,11 @@ PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
             Status status(ErrorCodes::InternalError, ss);
             *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
-    } else if (PlanStage::NEED_TIME == status) {
-        _commonStats.needTime++;
     } else if (PlanStage::NEED_YIELD == status) {
-        _commonStats.needYield++;
         *out = id;
     }
 
     return status;
-}
-
-void ProjectionStage::saveState() {
-    ++_commonStats.yields;
-    _child->saveState();
-}
-
-void ProjectionStage::restoreState(OperationContext* opCtx) {
-    ++_commonStats.unyields;
-    _child->restoreState(opCtx);
-}
-
-void ProjectionStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
-    _child->invalidate(txn, dl, type);
-}
-
-vector<PlanStage*> ProjectionStage::getChildren() const {
-    vector<PlanStage*> children;
-    children.push_back(_child.get());
-    return children;
 }
 
 unique_ptr<PlanStageStats> ProjectionStage::getStats() {
@@ -268,12 +235,8 @@ unique_ptr<PlanStageStats> ProjectionStage::getStats() {
     projStats->projObj = _projObj;
     ret->specific = std::move(projStats);
 
-    ret->children.push_back(_child->getStats().release());
+    ret->children.emplace_back(child()->getStats());
     return ret;
-}
-
-const CommonStats* ProjectionStage::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* ProjectionStage::getSpecificStats() const {

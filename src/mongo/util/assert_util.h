@@ -1,6 +1,4 @@
-// assert_util.h
-
-/*    Copyright 2009 10gen Inc.
+/**   Copyright 2009 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -46,16 +44,6 @@
 
 namespace mongo {
 
-enum CommonErrorCodes {
-    OkCode = 0,
-    SendStaleConfigCode = 13388,       // uassert( 13388 )
-    RecvStaleConfigCode = 9996,        // uassert( 9996 )
-    PrepareConfigsFailedCode = 13104,  // uassert( 13104 )
-    NotMasterOrSecondaryCode = 13436,  // uassert( 13436 )
-    NotMasterNoSlaveOkCode = 13435,    // uassert( 13435 )
-    NotMaster = 10107,                 // uassert( 10107 )
-};
-
 class AssertionCount {
 public:
     AssertionCount();
@@ -88,27 +76,6 @@ struct ExceptionInfo {
     }
     std::string msg;
     int code;
-};
-
-/**
- * helper class that builds error strings.  lighter weight than a StringBuilder, albeit less
- * flexible.
- *  NOINLINE_DECL used in the constructor implementations as we are assuming this is a cold code
- *  path when used.
- *
- *  example:
- *    throw UserException(123, ErrorMsg("blah", num_val));
- */
-class ErrorMsg {
-public:
-    ErrorMsg(const char* msg, char ch);
-    ErrorMsg(const char* msg, unsigned val);
-    operator std::string() const {
-        return buf;
-    }
-
-private:
-    char buf[256];
 };
 
 class DBException;
@@ -163,7 +130,7 @@ private:
     static void traceIfNeeded(const DBException& e);
 
 public:
-    static bool traceExceptions;
+    static std::atomic<bool> traceExceptions;  // NOLINT
 
 protected:
     ExceptionInfo _ei;
@@ -289,6 +256,12 @@ inline T fassertStatusOK(int msgid, StatusWith<T> sw) {
         fassertFailedWithStatus(msgid, sw.getStatus());
     }
     return std::move(sw.getValue());
+}
+
+inline void fassertStatusOK(int msgid, const Status& s) {
+    if (MONGO_unlikely(!s.isOK())) {
+        fassertFailedWithStatus(msgid, s);
+    }
 }
 
 /* warning only - keeps going */

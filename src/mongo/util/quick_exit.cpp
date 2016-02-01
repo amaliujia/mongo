@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+// NOTE: This file *must not* depend on any mongo symbols.
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/config.h"
@@ -41,7 +43,19 @@
 #define __has_feature(x) 0
 #endif
 
+#if !defined(__has_include)
+#define __has_include(x) 0
+#endif
+
 #if __has_feature(address_sanitizer)
+
+#if __has_include("sanitizer/coverage_interface.h")
+// In Clang 3.7+, the coverage interface was split out into its own header file.
+#include <sanitizer/coverage_interface.h>
+#elif __has_include("sanitizer/common_interface_defs.h")
+#include <sanitizer/common_interface_defs.h>
+#endif
+
 #include <sanitizer/lsan_interface.h>
 #endif
 
@@ -57,6 +71,10 @@ void quickExit(int code) {
 #endif
 
 #if __has_feature(address_sanitizer)
+    // Always dump coverage data first because older versions of sanitizers may not write coverage
+    // data before exiting with errors. The underlying issue is fixed in clang 3.6, which also
+    // prevents coverage data from being written more than once via an atomic guard.
+    __sanitizer_cov_dump();
     __lsan_do_leak_check();
 #endif
 

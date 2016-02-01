@@ -98,6 +98,25 @@ Status bsonExtractStringField(const BSONObj& object, StringData fieldName, std::
     return Status::OK();
 }
 
+Status bsonExtractOpTimeField(const BSONObj& object, StringData fieldName, repl::OpTime* out) {
+    BSONElement element;
+    Status status = bsonExtractTypedField(object, fieldName, Object, &element);
+    if (!status.isOK())
+        return status;
+
+    BSONObj opTimeObj = element.Obj();
+    Timestamp ts;
+    status = bsonExtractTimestampField(opTimeObj, repl::OpTime::kTimestampFieldName, &ts);
+    if (!status.isOK())
+        return status;
+    long long term;
+    status = bsonExtractIntegerField(opTimeObj, repl::OpTime::kTermFieldName, &term);
+    if (!status.isOK())
+        return status;
+    *out = repl::OpTime(ts, term);
+    return Status::OK();
+}
+
 Status bsonExtractTimestampField(const BSONObj& object, StringData fieldName, Timestamp* out) {
     BSONElement element;
     Status status = bsonExtractTypedField(object, fieldName, bsonTimestamp, &element);
@@ -175,6 +194,33 @@ Status bsonExtractIntegerFieldWithDefault(const BSONObj& object,
         status = Status::OK();
     }
     return status;
+}
+
+Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
+                                            StringData fieldName,
+                                            long long defaultValue,
+                                            stdx::function<bool(long long)> pred,
+                                            const std::string& predDescription,
+                                            long long* out) {
+    auto status = bsonExtractIntegerFieldWithDefault(object, fieldName, defaultValue, out);
+    if (!status.isOK()) {
+        return status;
+    }
+    if (!pred(*out)) {
+        return Status(ErrorCodes::BadValue,
+                      mongoutils::str::stream() << "Invalid value in field \"" << fieldName
+                                                << "\": " << *out << ": " << predDescription);
+    }
+    return Status::OK();
+}
+
+Status bsonExtractIntegerFieldWithDefaultIf(const BSONObj& object,
+                                            StringData fieldName,
+                                            long long defaultValue,
+                                            stdx::function<bool(long long)> pred,
+                                            long long* out) {
+    return bsonExtractIntegerFieldWithDefaultIf(
+        object, fieldName, defaultValue, pred, "constraint failed", out);
 }
 
 }  // namespace mongo

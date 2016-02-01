@@ -33,7 +33,7 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/fts/fts_matcher.h"
-#include "mongo/db/fts/fts_query.h"
+#include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/fts/fts_spec.h"
 
 namespace mongo {
@@ -41,7 +41,7 @@ namespace mongo {
 using std::unique_ptr;
 
 using fts::FTSMatcher;
-using fts::FTSQuery;
+using fts::FTSQueryImpl;
 using fts::FTSSpec;
 
 
@@ -57,31 +57,24 @@ class RecordID;
  */
 class TextMatchStage final : public PlanStage {
 public:
-    TextMatchStage(unique_ptr<PlanStage> child,
-                   const FTSQuery& query,
+    TextMatchStage(OperationContext* opCtx,
+                   unique_ptr<PlanStage> child,
+                   const FTSQueryImpl& query,
                    const FTSSpec& spec,
                    WorkingSet* ws);
-    ~TextMatchStage() final;
+    ~TextMatchStage();
 
     void addChild(PlanStage* child);
 
     bool isEOF() final;
 
-    StageState work(WorkingSetID* out) final;
-
-    void saveState() final;
-    void restoreState(OperationContext* opCtx) final;
-    void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
-
-    std::vector<PlanStage*> getChildren() const final;
+    StageState doWork(WorkingSetID* out) final;
 
     StageType stageType() const final {
         return STAGE_TEXT_MATCH;
     }
 
     std::unique_ptr<PlanStageStats> getStats() final;
-
-    const CommonStats* getCommonStats() const final;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -94,11 +87,6 @@ private:
     // Not owned by us.
     WorkingSet* _ws;
 
-    // The child PlanStage that provides the RecordIDs and scores for text matching.
-    unique_ptr<PlanStage> _child;
-
-    // Stats
-    CommonStats _commonStats;
     TextMatchStats _specificStats;
 };
 }  // namespace mongo

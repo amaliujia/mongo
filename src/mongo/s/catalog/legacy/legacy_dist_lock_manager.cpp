@@ -49,16 +49,23 @@ const stdx::chrono::seconds kDefaultSocketTimeout(30);
 const milliseconds kDefaultPingInterval(30 * 1000);
 }  // unnamed namespace
 
-LegacyDistLockManager::LegacyDistLockManager(ConnectionString configServer)
-    : _configServer(std::move(configServer)), _isStopped(false), _pingerEnabled(true) {}
+bool LegacyDistLockManager::_pingerEnabled = true;
+
+LegacyDistLockManager::LegacyDistLockManager(ConnectionString configServer,
+                                             const std::string& processId)
+    : _configServer(std::move(configServer)), _processId(processId), _isStopped(false) {}
 
 void LegacyDistLockManager::startUp() {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     invariant(!_pinger);
     _pinger = stdx::make_unique<LegacyDistLockPinger>();
+
+    if (_pingerEnabled) {
+        uassertStatusOK(_pinger->startup(_configServer, _processId, kDefaultPingInterval));
+    }
 }
 
-void LegacyDistLockManager::shutDown() {
+void LegacyDistLockManager::shutDown(OperationContext* txn, bool allowNetworking) {
     stdx::unique_lock<stdx::mutex> sl(_mutex);
     _isStopped = true;
 
@@ -67,26 +74,27 @@ void LegacyDistLockManager::shutDown() {
     }
 
     if (_pinger) {
-        _pinger->shutdown();
+        _pinger->shutdown(allowNetworking);
     }
 }
 
+std::string LegacyDistLockManager::getProcessID() {
+    return _processId;
+}
+
 StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
-    StringData name, StringData whyMessage, milliseconds waitFor, milliseconds lockTryInterval) {
-    auto distLock = stdx::make_unique<DistributedLock>(_configServer, name.toString());
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    milliseconds waitFor,
+    milliseconds lockTryInterval) {
+    auto distLock = stdx::make_unique<DistributedLock>(_configServer, name.toString(), _processId);
 
     {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
 
         if (_isStopped) {
             return Status(ErrorCodes::LockBusy, "legacy distlock manager is stopped");
-        }
-
-        if (_pingerEnabled) {
-            auto pingStatus = _pinger->startPing(*(distLock.get()), kDefaultPingInterval);
-            if (!pingStatus.isOK()) {
-                return pingStatus;
-            }
         }
     }
 
@@ -98,13 +106,19 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
     while (waitFor <= milliseconds::zero() || milliseconds(timer.millis()) < waitFor) {
         bool acquired = false;
         BSONObj lockDoc;
+        OID lockID(OID::gen());
+
         try {
-            acquired =
-                distLock->lock_try(whyMessage.toString(), &lockDoc, kDefaultSocketTimeout.count());
+            acquired = distLock->lock_try(lockID,
+                                          whyMessage.toString(),
+                                          &lockDoc,
+                                          durationCount<Seconds>(kDefaultSocketTimeout));
 
             if (!acquired) {
                 lastStatus = Status(ErrorCodes::LockBusy,
                                     str::stream() << "Lock for " << whyMessage << " is taken.");
+                // cleanup failed attempt to acquire lock.
+                _pinger->addUnlockOID(lockID);
             }
         } catch (const LockException& lockExcep) {
             OID needUnlockID(lockExcep.getMustUnlockID());
@@ -115,19 +129,20 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
             lastStatus = lockExcep.toStatus();
         } catch (...) {
             lastStatus = exceptionToStatus();
+            _pinger->addUnlockOID(lockID);
         }
 
         if (acquired) {
             verify(!lockDoc.isEmpty());
 
-            LocksType lock;
-            string errMsg;
-            if (!lock.parseBSON(lockDoc, &errMsg)) {
+            auto locksTypeResult = LocksType::fromBSON(lockDoc);
+            if (!locksTypeResult.isOK()) {
                 return StatusWith<ScopedDistLock>(
                     ErrorCodes::UnsupportedFormat,
-                    str::stream() << "error while parsing lock document: " << errMsg);
+                    str::stream() << "error while parsing lock document: " << lockDoc << " : "
+                                  << locksTypeResult.getStatus().toString());
             }
-
+            const LocksType& lock = locksTypeResult.getValue();
             dassert(lock.isLockIDSet());
 
             {
@@ -135,7 +150,7 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
                 _lockMap.insert(std::make_pair(lock.getLockID(), std::move(distLock)));
             }
 
-            return ScopedDistLock(lock.getLockID(), this);
+            return ScopedDistLock(txn, lock.getLockID(), this);
         }
 
         if (waitFor == milliseconds::zero())
@@ -161,7 +176,8 @@ StatusWith<DistLockManager::ScopedDistLock> LegacyDistLockManager::lock(
     return lastStatus;
 }
 
-void LegacyDistLockManager::unlock(const DistLockHandle& lockHandle) BOOST_NOEXCEPT {
+void LegacyDistLockManager::unlock(OperationContext* txn,
+                                   const DistLockHandle& lockHandle) BOOST_NOEXCEPT {
     unique_ptr<DistributedLock> distLock;
 
     {
@@ -185,7 +201,7 @@ void LegacyDistLockManager::unlock(const DistLockHandle& lockHandle) BOOST_NOEXC
     }
 }
 
-Status LegacyDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
+Status LegacyDistLockManager::checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) {
     // Note: this should not happen when locks are managed through ScopedDistLock.
     if (_pinger->willUnlockOID(lockHandle)) {
         return Status(ErrorCodes::LockFailed,
@@ -204,11 +220,10 @@ Status LegacyDistLockManager::checkStatus(const DistLockHandle& lockHandle) {
         distLock = iter->second.get();
     }
 
-    return distLock->checkStatus(kDefaultSocketTimeout.count());
+    return distLock->checkStatus(durationCount<Seconds>(kDefaultSocketTimeout));
 }
 
-void LegacyDistLockManager::enablePinger(bool enable) {
-    stdx::lock_guard<stdx::mutex> sl(_mutex);
-    _pingerEnabled = enable;
+void LegacyDistLockManager::unlockAll(OperationContext* txn, const std::string& processID) {
+    fassertFailed(34367);  // Only supported for CSRS
 }
 }

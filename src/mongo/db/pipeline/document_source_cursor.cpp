@@ -37,8 +37,8 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/find_constants.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/s/d_state.h"
 
 namespace mongo {
@@ -88,7 +88,7 @@ void DocumentSourceCursor::loadBatch() {
     const NamespaceString nss(_ns);
     AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
 
-    _exec->restoreState(pExpCtx->opCtx);
+    _exec->restoreState();
 
     int memUsageBytes = 0;
     BSONObj obj;
@@ -109,7 +109,7 @@ void DocumentSourceCursor::loadBatch() {
 
         memUsageBytes += _currentBatch.back().getApproximateSize();
 
-        if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
+        if (memUsageBytes > FindCommon::kMaxBytesToReturnToClientAtOnce) {
             // End this batch and prepare PlanExecutor for yielding.
             _exec->saveState();
             return;
@@ -133,11 +133,6 @@ void DocumentSourceCursor::loadBatch() {
     massert(17286,
             str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
             state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
-}
-
-void DocumentSourceCursor::setSource(DocumentSource* pSource) {
-    /* this doesn't take a source */
-    verify(false);
 }
 
 long long DocumentSourceCursor::getLimit() const {
@@ -172,7 +167,7 @@ Value DocumentSourceCursor::serialize(bool explain) const {
 
         massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
-        _exec->restoreState(pExpCtx->opCtx);
+        _exec->restoreState();
         Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
         _exec->saveState();
     }

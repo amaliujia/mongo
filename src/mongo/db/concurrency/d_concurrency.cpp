@@ -40,11 +40,6 @@
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
-namespace {
-
-//  SERVER-14668: Remove or invert sense once MMAPv1 CLL can be default
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableCollectionLocking, bool, true);
-}  // namespace
 
 Lock::TempRelease::TempRelease(Locker* lockState)
     : _lockState(lockState),
@@ -62,17 +57,24 @@ Lock::GlobalLock::GlobalLock(Locker* locker)
     : _locker(locker), _result(LOCK_INVALID), _pbwm(locker, resourceIdParallelBatchWriterMode) {}
 
 Lock::GlobalLock::GlobalLock(Locker* locker, LockMode lockMode, unsigned timeoutMs)
-    : _locker(locker), _result(LOCK_INVALID), _pbwm(locker, resourceIdParallelBatchWriterMode) {
-    _lock(lockMode, timeoutMs);
+    : GlobalLock(locker, lockMode, EnqueueOnly()) {
+    waitForLock(timeoutMs);
 }
 
+Lock::GlobalLock::GlobalLock(Locker* locker, LockMode lockMode, EnqueueOnly enqueueOnly)
+    : _locker(locker), _result(LOCK_INVALID), _pbwm(locker, resourceIdParallelBatchWriterMode) {
+    _enqueue(lockMode);
+}
 
-void Lock::GlobalLock::_lock(LockMode lockMode, unsigned timeoutMs) {
+void Lock::GlobalLock::_enqueue(LockMode lockMode) {
     if (!_locker->isBatchWriter()) {
         _pbwm.lock(MODE_IS);
     }
 
     _result = _locker->lockGlobalBegin(lockMode);
+}
+
+void Lock::GlobalLock::waitForLock(unsigned timeoutMs) {
     if (_result == LOCK_WAITING) {
         _result = _locker->lockGlobalComplete(timeoutMs);
     }
@@ -100,17 +102,13 @@ Lock::DBLock::DBLock(Locker* locker, StringData db, LockMode mode)
     // Need to acquire the flush lock
     _locker->lockMMAPV1Flush();
 
-    if (supportsDocLocking() || enableCollectionLocking) {
-        // The check for the admin db is to ensure direct writes to auth collections
-        // are serialized (see SERVER-16092).
-        if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
-            _mode = MODE_X;
-        }
-
-        invariant(LOCK_OK == _locker->lock(_id, _mode));
-    } else {
-        invariant(LOCK_OK == _locker->lock(_id, isSharedLockMode(_mode) ? MODE_S : MODE_X));
+    // The check for the admin db is to ensure direct writes to auth collections
+    // are serialized (see SERVER-16092).
+    if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
+        _mode = MODE_X;
     }
+
+    invariant(LOCK_OK == _locker->lock(_id, _mode));
 }
 
 Lock::DBLock::~DBLock() {
@@ -127,11 +125,7 @@ void Lock::DBLock::relockWithMode(LockMode newMode) {
     _locker->unlock(_id);
     _mode = newMode;
 
-    if (supportsDocLocking() || enableCollectionLocking) {
-        invariant(LOCK_OK == _locker->lock(_id, _mode));
-    } else {
-        invariant(LOCK_OK == _locker->lock(_id, isSharedLockMode(_mode) ? MODE_S : MODE_X));
-    }
+    invariant(LOCK_OK == _locker->lock(_id, _mode));
 }
 
 
@@ -143,28 +137,22 @@ Lock::CollectionLock::CollectionLock(Locker* lockState, StringData ns, LockMode 
                                           isSharedLockMode(mode) ? MODE_IS : MODE_IX));
     if (supportsDocLocking()) {
         _lockState->lock(_id, mode);
-    } else if (enableCollectionLocking) {
+    } else {
         _lockState->lock(_id, isSharedLockMode(mode) ? MODE_S : MODE_X);
     }
 }
 
 Lock::CollectionLock::~CollectionLock() {
-    if (supportsDocLocking() || enableCollectionLocking) {
-        _lockState->unlock(_id);
-    }
+    _lockState->unlock(_id);
 }
 
 void Lock::CollectionLock::relockAsDatabaseExclusive(Lock::DBLock& dbLock) {
-    if (supportsDocLocking() || enableCollectionLocking) {
-        _lockState->unlock(_id);
-    }
+    _lockState->unlock(_id);
 
     dbLock.relockWithMode(MODE_X);
 
-    if (supportsDocLocking() || enableCollectionLocking) {
-        // don't need the lock, but need something to unlock in the destructor
-        _lockState->lock(_id, MODE_IX);
-    }
+    // don't need the lock, but need something to unlock in the destructor
+    _lockState->lock(_id, MODE_IX);
 }
 
 namespace {
@@ -206,9 +194,20 @@ void Lock::ResourceLock::unlock() {
     }
 }
 
-void synchronizeOnCappedInFlightResource(Locker* lockState) {
+void synchronizeOnCappedInFlightResource(Locker* lockState, const NamespaceString& cappedNs) {
     dassert(lockState->inAWriteUnitOfWork());
-    Lock::ResourceLock{lockState, resourceCappedInFlight, MODE_IX};  // held until end of WUOW.
+    const ResourceId resource = cappedNs.db() == "local" ? resourceCappedInFlightForLocalDb
+                                                         : resourceCappedInFlightForOtherDb;
+
+    // It is illegal to acquire the capped in-flight lock for non-local dbs while holding the
+    // capped in-flight lock for the local db. (Unless we already hold the otherDb lock since
+    // reacquiring a lock in the same mode never blocks.)
+    if (resource == resourceCappedInFlightForOtherDb) {
+        dassert(!lockState->isLockHeldForMode(resourceCappedInFlightForLocalDb, MODE_IX) ||
+                lockState->isLockHeldForMode(resourceCappedInFlightForOtherDb, MODE_IX));
+    }
+
+    Lock::ResourceLock{lockState, resource, MODE_IX};  // held until end of WUOW.
 }
 
 }  // namespace mongo

@@ -34,6 +34,8 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/db/s/migration_source_manager.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
@@ -45,8 +47,14 @@ class BSONObjBuilder;
 struct ChunkVersion;
 class Client;
 class CollectionMetadata;
+class ConnectionString;
 class OperationContext;
+class ServiceContext;
 class Status;
+
+namespace repl {
+class OpTime;
+}  // namespace repl
 
 /**
  * Represents the sharding state for the running instance. One per instance.
@@ -58,48 +66,82 @@ public:
     ShardingState();
     ~ShardingState();
 
-    bool enabled();
+    /**
+     * Retrieves the sharding state object associated with the specified service context. This
+     * method must only be called if ShardingState decoration has been created on the service
+     * context, otherwise it will fassert. In other words, it may only be called on MongoD and
+     * tests, which specifically require and instantiate ShardingState.
+     *
+     * Returns the instance's ShardingState.
+     */
+    static ShardingState* get(ServiceContext* serviceContext);
+    static ShardingState* get(OperationContext* operationContext);
 
-    std::string getConfigServer();
+    bool enabled() const;
+
+    ConnectionString getConfigServer(OperationContext* txn);
+
     std::string getShardName();
 
-    // Initialize sharding state and begin authenticating outgoing connections and handling
-    // shard versions.  If this is not run before sharded operations occur auth will not work
-    // and versions will not be tracked.
-    void initialize(const std::string& server);
+    MigrationSourceManager* migrationSourceManager() {
+        return &_migrationSourceManager;
+    }
 
-    void gotShardName(const std::string& name);
-    bool setShardName(const std::string& name);  // Same as above, does not throw
+    MigrationDestinationManager* migrationDestinationManager() {
+        return &_migrationDestManager;
+    }
 
-    // Helpers for SetShardVersion which report the host name sent to this shard when the shard
-    // name does not match.  Do not use in other places.
-    // TODO: Remove once SSV is deprecated
-    void gotShardNameAndHost(const std::string& name, const std::string& host);
-    bool setShardNameAndHost(const std::string& name, const std::string& host);
+    /**
+     * Initializes sharding state and begins authenticating outgoing connections and handling shard
+     * versions. If this is not run before sharded operations occur auth will not work and versions
+     * will not be tracked.
+     *
+     * Throws if initialization fails for any reason and the sharding state object becomes unusable
+     * afterwards. Any sharding state operations afterwards will fail.
+     */
+    void initialize(OperationContext* txn, const std::string& configSvr);
+
+    /**
+     * Shuts down sharding machinery on the shard.
+     */
+    void shutDown(OperationContext* txn);
+
+    /**
+     * Updates the ShardRegistry's stored notion of the config server optime based on the
+     * ConfigServerMetadata decoration attached to the OperationContext.
+     */
+    void updateConfigServerOpTimeFromMetadata(OperationContext* txn);
+
+    /**
+     * Assigns a shard name to this MongoD instance.
+     * TODO: The only reason we need this method and cannot merge it together with the initialize
+     * call is the setShardVersion request being sent by the config coordinator to the config server
+     * instances. This is the only command, which does not include shard name and once we get rid of
+     * the legacy style config servers, we can merge these methods.
+     *
+     * Throws an error if shard name has always been set and the newly specified value does not
+     * match what was previously installed.
+     */
+    void setShardName(const std::string& shardName);
 
     /**
      * Clears the collection metadata cache after step down.
      */
     void clearCollectionMetadata();
 
-    // versioning support
-
     bool hasVersion(const std::string& ns);
-    bool hasVersion(const std::string& ns, ChunkVersion& version);
+
     ChunkVersion getVersion(const std::string& ns);
 
     /**
      * If the metadata for 'ns' at this shard is at or above the requested version,
      * 'reqShardVersion', returns OK and fills in 'latestShardVersion' with the latest shard
-     * version.  The latter is always greater or equal than 'reqShardVersion' if in the same
-     * epoch.
+     * version. The latter is always greater or equal than 'reqShardVersion' if in the same epoch.
      *
      * Otherwise, falls back to refreshMetadataNow.
      *
-     * This call blocks if there are more than N threads
-     * currently refreshing metadata. (N is the number of
-     * tickets in ShardingState::_configServerTickets,
-     * currently 3.)
+     * This call blocks if there are more than _configServerTickets threads currently refreshing
+     * metadata (currently set to 3).
      *
      * Locking Note:
      *   + Must NOT be called with the write lock because this call may go into the network,
@@ -137,11 +179,10 @@ public:
                               const std::string& ns,
                               ChunkVersion* latestShardVersion);
 
-    void appendInfo(BSONObjBuilder& b);
+    void appendInfo(OperationContext* txn, BSONObjBuilder& b);
 
-    // querying support
+    bool needCollectionMetadata(OperationContext* txn, const std::string& ns);
 
-    bool needCollectionMetadata(Client* client, const std::string& ns) const;
     std::shared_ptr<CollectionMetadata> getCollectionMetadata(const std::string& ns);
 
     // chunk migrate and split support
@@ -278,33 +319,100 @@ private:
     // Map from a namespace into the metadata we need for each collection on this shard
     typedef std::map<std::string, std::shared_ptr<CollectionMetadata>> CollectionMetadataMap;
 
-    /**
-     * Refreshes collection metadata by asking the config server for the latest information.
-     * May or may not be based on a requested version.
-     */
-    Status doRefreshMetadata(OperationContext* txn,
-                             const std::string& ns,
-                             const ChunkVersion& reqShardVersion,
-                             bool useRequestedVersion,
-                             ChunkVersion* latestShardVersion);
+    // Progress of the sharding state initialization
+    enum class InitializationState : uint32_t {
+        // Initial state. The server must be under exclusive lock when this state is entered. No
+        // metadata is available yet and it is not known whether there is any min optime metadata,
+        // which needs to be recovered. From this state, the server may enter INITIALIZING, if a
+        // recovey document is found or stay in it until initialize has been called.
+        kNew,
 
-    // protects state below
+        // The sharding state has been recovered (or doesn't need to be recovered) and the catalog
+        // manager is currently being initialized by one of the threads.
+        kInitializing,
+
+        // Sharding state is fully usable.
+        kInitialized,
+
+        // Some initialization error occurred. The _initializationStatus variable will contain the
+        // error.
+        kError,
+    };
+
+    /**
+     * Initializes the sharding infrastructure (connection hook, catalog manager, etc) and
+     * optionally recovers its minimum optime. Must not be called while holding the sharding state
+     * mutex.
+     *
+     * Doesn't throw, only updates the initialization state variables.
+     *
+     * Runs in a new thread so that if all config servers are down initialization can continue
+     * retrying in the background even if the operation that kicked off the initialization has
+     * terminated.
+     *
+     * @param configSvr Connection string of the config server to use.
+     */
+    void _initializeImpl(ConnectionString configSvr);
+
+    /**
+     * Must be called only when the current state is kInitializing. Sets the current state to
+     * kInitialized if the status is OK or to kError otherwise.
+     */
+    void _signalInitializationComplete(Status status);
+
+    /**
+     * Blocking method, which waits for the initialization state to become kInitialized or kError
+     * and returns the initialization status.
+     */
+    Status _waitForInitialization(OperationContext* txn);
+
+    /**
+     * Simple wrapper to cast the initialization state atomic uint64 to InitializationState value
+     * without doing any locking.
+     */
+    InitializationState _getInitializationState() const;
+
+    /**
+     * Updates the initialization state. Must be called while holding _mutex.
+     */
+    void _setInitializationState_inlock(InitializationState newState);
+
+    /**
+     * Refreshes collection metadata by asking the config server for the latest information. May or
+     * may not be based on a requested version.
+     */
+    Status _refreshMetadata(OperationContext* txn,
+                            const std::string& ns,
+                            const ChunkVersion& reqShardVersion,
+                            bool useRequestedVersion,
+                            ChunkVersion* latestShardVersion);
+
+    // Manages the state of the migration donor shard
+    MigrationSourceManager _migrationSourceManager;
+
+    // Manages the state of the migration recipient shard
+    MigrationDestinationManager _migrationDestManager;
+
+    // Protects state below
     stdx::mutex _mutex;
 
-    // Whether ::initialize has been called
-    bool _enabled;
+    // State of the initialization of the sharding state along with any potential errors
+    AtomicUInt32 _initializationState;
+
+    // Only valid if _initializationState is kError. Contains the reason for initialization failure.
+    Status _initializationStatus;
+
+    // Signaled when ::initialize finishes.
+    stdx::condition_variable _initializationFinishedCondition;
 
     // Sets the shard name for this host (comes through setShardVersion)
     std::string _shardName;
 
-    // protects accessing the config server
-    // Using a ticket holder so we can have multiple redundant tries at any given time
-    mutable TicketHolder _configServerTickets;
+    // Protects from hitting the config server from too many threads at once
+    TicketHolder _configServerTickets;
 
+    // Cache of collection metadata on this shard
     CollectionMetadataMap _collMetadata;
 };
-
-// Global sharding state instance
-extern ShardingState shardingState;
 
 }  // namespace mongo

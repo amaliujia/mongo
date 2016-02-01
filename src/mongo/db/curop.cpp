@@ -37,13 +37,107 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/cursor_id.h"
 #include "mongo/db/json.h"
+#include "mongo/db/query/getmore_request.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::string;
+
+namespace {
+
+// Lists the $-prefixed query options that can be passed alongside a wrapped query predicate for
+// OP_QUERY find. The $orderby field is omitted because "orderby" (no dollar sign) is also allowed,
+// and this requires special handling.
+const std::vector<const char*> kDollarQueryModifiers = {
+    "$hint",
+    "$comment",
+    "$maxScan",
+    "$max",
+    "$min",
+    "$returnKey",
+    "$showDiskLoc",
+    "$snapshot",
+    "$maxTimeMS",
+};
+
+/**
+ * For a find using the OP_QUERY protocol (as opposed to the commands protocol), upconverts the
+ * "query" field so that the profiling entry matches that of the find command.
+ */
+BSONObj upconvertQueryEntry(const BSONObj& query,
+                            const NamespaceString& nss,
+                            int ntoreturn,
+                            int ntoskip) {
+    BSONObjBuilder bob;
+
+    bob.append("find", nss.coll());
+
+    // Whether or not the query predicate is wrapped inside a "query" or "$query" field so that
+    // other options can be passed alongside the predicate.
+    bool predicateIsWrapped = false;
+
+    // Extract the query predicate.
+    BSONObj filter;
+    if (auto elem = query["query"]) {
+        predicateIsWrapped = true;
+        bob.appendAs(elem, "filter");
+    } else if (auto elem = query["$query"]) {
+        predicateIsWrapped = true;
+        bob.appendAs(elem, "filter");
+    } else if (!query.isEmpty()) {
+        bob.append("filter", query);
+    }
+
+    if (ntoskip) {
+        bob.append("skip", ntoskip);
+    }
+    if (ntoreturn) {
+        bob.append("ntoreturn", ntoreturn);
+    }
+
+    // The remainder of the query options are only available if the predicate is passed in wrapped
+    // form. If the predicate is not wrapped, we're done.
+    if (!predicateIsWrapped) {
+        return bob.obj();
+    }
+
+    // Extract the sort.
+    if (auto elem = query["orderby"]) {
+        bob.appendAs(elem, "sort");
+    } else if (auto elem = query["$orderby"]) {
+        bob.appendAs(elem, "sort");
+    }
+
+    // Add $-prefixed OP_QUERY modifiers, like $hint.
+    for (auto modifier : kDollarQueryModifiers) {
+        if (auto elem = query[modifier]) {
+            // Use "+ 1" to omit the leading dollar sign.
+            bob.appendAs(elem, modifier + 1);
+        }
+    }
+
+    return bob.obj();
+}
+
+/**
+ * For a getMore using OP_GET_MORE, as opposed to getMore command, upconverts the "query" field so
+ * that the profiling entry matches that of the getMore command.
+ */
+BSONObj upconvertGetMoreEntry(const NamespaceString& nss, CursorId cursorId, int ntoreturn) {
+    return GetMoreRequest(nss,
+                          cursorId,
+                          ntoreturn,
+                          boost::none,  // awaitDataTimeout
+                          boost::none,  // term
+                          boost::none   // lastKnownCommittedOpTime
+                          ).toBSON();
+}
+
+}  // namespace
 
 /**
  * This type decorates a Client object with a stack of active CurOp objects.
@@ -153,27 +247,15 @@ CurOp* CurOp::get(const OperationContext& opCtx) {
 CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {}
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
+    if (_stack->top()) {
+        // Child operation should inherit the previous operation's timeout.
+        setMaxTimeMicros(_stack->top()->getRemainingMaxTimeMicros());
+    }
     if (opCtx) {
         _stack->push(opCtx, this);
     } else {
         _stack->push_nolock(this);
     }
-    _start = 0;
-    _isCommand = false;
-    _dbprofile = 0;
-    _end = 0;
-    _maxTimeMicros = 0;
-    _maxTimeTracker.reset();
-    _message = "";
-    _progressMeter.finished();
-    _numYields = 0;
-    _expectedLatencyMs = 0;
-    _op = 0;
-    _command = NULL;
-}
-
-void CurOp::setOp_inlock(int op) {
-    _op = op;
 }
 
 ProgressMeter& CurOp::setMessage_inlock(const char* msg,
@@ -231,18 +313,28 @@ void CurOp::reportState(BSONObjBuilder* builder) {
         builder->append("microsecs_running", static_cast<long long int>(elapsedMicros()));
     }
 
-    builder->append("op", opToString(_op));
-
+    builder->append("op", logicalOpToString(_logicalOp));
     builder->append("ns", _ns);
 
-    if (_op == dbInsert) {
+    if (_networkOp == dbInsert) {
         _query.append(*builder, "insert");
+    } else if (!_command && _networkOp == dbQuery) {
+        // This is a legacy OP_QUERY. We upconvert the "query" field of the currentOp output to look
+        // similar to a find command.
+        //
+        // CurOp doesn't have access to the ntoreturn or ntoskip values. By setting them to zero, we
+        // will omit mention of them in the currentOp output.
+        const int ntoreturn = 0;
+        const int ntoskip = 0;
+
+        builder->append(
+            "query", upconvertQueryEntry(_query.get(), NamespaceString(_ns), ntoreturn, ntoskip));
     } else {
         _query.append(*builder, "query");
     }
 
-    if (!debug().planSummary.empty()) {
-        builder->append("planSummary", debug().planSummary.toString());
+    if (!_planSummary.empty()) {
+        builder->append("planSummary", _planSummary);
     }
 
     if (!_message.empty()) {
@@ -295,16 +387,6 @@ bool CurOp::maxTimeHasExpired() {
 
 uint64_t CurOp::getRemainingMaxTimeMicros() const {
     return _maxTimeTracker.getRemainingMicros();
-}
-
-CurOp::MaxTimeTracker::MaxTimeTracker() {
-    reset();
-}
-
-void CurOp::MaxTimeTracker::reset() {
-    _enabled = false;
-    _targetEpochMicros = 0;
-    _approxTargetServerMillis = 0;
 }
 
 void CurOp::MaxTimeTracker::setTimeLimit(uint64_t startEpochMicros, uint64_t durationMicros) {
@@ -368,42 +450,6 @@ uint64_t CurOp::MaxTimeTracker::getRemainingMicros() const {
     return _targetEpochMicros - now;
 }
 
-void OpDebug::reset() {
-    op = 0;
-    iscommand = false;
-    query = BSONObj();
-    updateobj = BSONObj();
-
-    cursorid = -1;
-    ntoreturn = -1;
-    ntoskip = -1;
-    exhaust = false;
-
-    nscanned = -1;
-    nscannedObjects = -1;
-    idhack = false;
-    scanAndOrder = false;
-    nMatched = -1;
-    nModified = -1;
-    ninserted = -1;
-    ndeleted = -1;
-    nmoved = -1;
-    fastmod = false;
-    fastmodinsert = false;
-    upsert = false;
-    cursorExhausted = false;
-    keyUpdates = 0;  // unsigned, so -1 not possible
-    writeConflicts = 0;
-    planSummary = "";
-    execStats.reset();
-
-    exceptionInfo.reset();
-
-    executionTime = 0;
-    nreturned = -1;
-    responseLength = -1;
-}
-
 namespace {
 StringData getProtoString(int op) {
     if (op == dbQuery) {
@@ -426,7 +472,7 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     if (iscommand)
         s << "command ";
     else
-        s << opToString(op) << ' ';
+        s << networkOpToString(networkOp) << ' ';
 
     s << curop.getNS();
 
@@ -449,8 +495,8 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
         }
     }
 
-    if (!planSummary.empty()) {
-        s << " planSummary: " << planSummary.toString();
+    if (!curop.getPlanSummary().empty()) {
+        s << " planSummary: " << curop.getPlanSummary();
     }
 
     if (!updateobj.isEmpty()) {
@@ -463,10 +509,10 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     OPDEBUG_TOSTRING_HELP(ntoskip);
     OPDEBUG_TOSTRING_HELP_BOOL(exhaust);
 
-    OPDEBUG_TOSTRING_HELP(nscanned);
-    OPDEBUG_TOSTRING_HELP(nscannedObjects);
+    OPDEBUG_TOSTRING_HELP(keysExamined);
+    OPDEBUG_TOSTRING_HELP(docsExamined);
     OPDEBUG_TOSTRING_HELP_BOOL(idhack);
-    OPDEBUG_TOSTRING_HELP_BOOL(scanAndOrder);
+    OPDEBUG_TOSTRING_HELP_BOOL(hasSortStage);
     OPDEBUG_TOSTRING_HELP(nmoved);
     OPDEBUG_TOSTRING_HELP(nMatched);
     OPDEBUG_TOSTRING_HELP(nModified);
@@ -499,7 +545,7 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     }
 
     if (iscommand) {
-        s << " protocol:" << getProtoString(op);
+        s << " protocol:" << getProtoString(networkOp);
     }
 
     s << " " << executionTime << "ms";
@@ -546,16 +592,26 @@ void appendAsObjOrString(StringData name,
 #define OPDEBUG_APPEND_BOOL(x) \
     if (x)                     \
     b.appendBool(#x, (x))
+
 void OpDebug::append(const CurOp& curop,
                      const SingleThreadedLockStats& lockStats,
                      BSONObjBuilder& b) const {
     const size_t maxElementSize = 50 * 1024;
 
-    b.append("op", iscommand ? "command" : opToString(op));
-    b.append("ns", curop.getNS());
+    b.append("op", logicalOpToString(logicalOp));
 
-    if (!query.isEmpty()) {
-        appendAsObjOrString(iscommand ? "command" : "query", query, maxElementSize, &b);
+    NamespaceString nss = NamespaceString(curop.getNS());
+    b.append("ns", nss.ns());
+
+    if (!iscommand && networkOp == dbQuery) {
+        appendAsObjOrString(
+            "query", upconvertQueryEntry(query, nss, ntoreturn, ntoskip), maxElementSize, &b);
+    } else if (!iscommand && networkOp == dbGetMore) {
+        appendAsObjOrString(
+            "query", upconvertGetMoreEntry(nss, cursorid, ntoreturn), maxElementSize, &b);
+    } else if (!query.isEmpty()) {
+        const char* fieldName = (logicalOp == LogicalOp::opCommand) ? "command" : "query";
+        appendAsObjOrString(fieldName, query, maxElementSize, &b);
     } else if (!iscommand && curop.haveQuery()) {
         appendAsObjOrString("query", curop.query(), maxElementSize, &b);
     }
@@ -567,14 +623,12 @@ void OpDebug::append(const CurOp& curop,
     const bool moved = (nmoved >= 1);
 
     OPDEBUG_APPEND_NUMBER(cursorid);
-    OPDEBUG_APPEND_NUMBER(ntoreturn);
-    OPDEBUG_APPEND_NUMBER(ntoskip);
     OPDEBUG_APPEND_BOOL(exhaust);
 
-    OPDEBUG_APPEND_NUMBER(nscanned);
-    OPDEBUG_APPEND_NUMBER(nscannedObjects);
+    OPDEBUG_APPEND_NUMBER(keysExamined);
+    OPDEBUG_APPEND_NUMBER(docsExamined);
     OPDEBUG_APPEND_BOOL(idhack);
-    OPDEBUG_APPEND_BOOL(scanAndOrder);
+    OPDEBUG_APPEND_BOOL(hasSortStage);
     OPDEBUG_APPEND_BOOL(moved);
     OPDEBUG_APPEND_NUMBER(nmoved);
     OPDEBUG_APPEND_NUMBER(nMatched);
@@ -601,7 +655,7 @@ void OpDebug::append(const CurOp& curop,
     OPDEBUG_APPEND_NUMBER(nreturned);
     OPDEBUG_APPEND_NUMBER(responseLength);
     if (iscommand) {
-        b.append("protocol", getProtoString(op));
+        b.append("protocol", getProtoString(networkOp));
     }
     b.append("millis", executionTime);
 

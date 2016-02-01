@@ -74,7 +74,7 @@ void AssertionCount::condrollover(int newvalue) {
         rollover();
 }
 
-bool DBException::traceExceptions = false;
+std::atomic<bool> DBException::traceExceptions(false);  // NOLINT
 
 string DBException::toString() const {
     stringstream ss;
@@ -83,7 +83,7 @@ string DBException::toString() const {
 }
 
 void DBException::traceIfNeeded(const DBException& e) {
-    if (traceExceptions && !inShutdown()) {
+    if (traceExceptions) {
         warning() << "DBException thrown" << causedBy(e) << endl;
         printStackTrace();
     }
@@ -148,10 +148,9 @@ NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned lin
 
 NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) {
     log() << "Invariant failure " << expr << ' ' << file << ' ' << dec << line << endl;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after invariant() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 NOINLINE_DECL void invariantOKFailed(const char* expr,
@@ -168,10 +167,9 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
 
 NOINLINE_DECL void fassertFailed(int msgid) {
     log() << "Fatal Assertion " << msgid << endl;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 NOINLINE_DECL void fassertFailedNoTrace(int msgid) {
@@ -220,7 +218,6 @@ void msgasserted(int msgid, const string& msg) {
 NOINLINE_DECL void msgasserted(int msgid, const char* msg) {
     assertionCount.condrollover(++assertionCount.warning);
     log() << "Assertion: " << msgid << ":" << msg << endl;
-    // breakpoint();
     logContext();
     throw MsgAssertionException(msgid, msg);
 }
@@ -251,19 +248,16 @@ std::string causedBy(const std::string& e) {
     return causedBy(e.c_str());
 }
 
-std::string causedBy(const std::string* e) {
-    return (e && *e != "") ? causedBy(*e) : "";
-}
-
 std::string causedBy(const Status& e) {
-    return causedBy(e.reason());
+    return causedBy(e.toString());
 }
 
-string errnoWithPrefix(const char* prefix) {
+string errnoWithPrefix(StringData prefix) {
+    const auto suffix = errnoWithDescription();
     stringstream ss;
-    if (prefix)
+    if (!prefix.empty())
         ss << prefix << ": ";
-    ss << errnoWithDescription();
+    ss << suffix;
     return ss.str();
 }
 
@@ -308,22 +302,5 @@ string ExceptionInfo::toString() const {
     stringstream ss;
     ss << "exception: " << code << " " << msg;
     return ss.str();
-}
-
-NOINLINE_DECL ErrorMsg::ErrorMsg(const char* msg, char ch) {
-    int l = strlen(msg);
-    verify(l < 128);
-    memcpy(buf, msg, l);
-    char* p = buf + l;
-    p[0] = ch;
-    p[1] = 0;
-}
-
-NOINLINE_DECL ErrorMsg::ErrorMsg(const char* msg, unsigned val) {
-    int l = strlen(msg);
-    verify(l < 128);
-    memcpy(buf, msg, l);
-    char* p = buf + l;
-    sprintf(p, "%u", val);
 }
 }

@@ -3,9 +3,11 @@ selector:
     roots:
     - jstests/sharding/*.js
     - jstests/sharding/replset_config/*.js
+    exclude_files:
 
 executor:
   js_test:
     config:
       shell_options:
         nodb: ''
+        readMode: commands

@@ -31,7 +31,6 @@
 
 #pragma once
 
-
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_connection.h"
@@ -39,6 +38,7 @@
 namespace mongo {
 
 class DBClientCursorHolder;
+class OperationContext;
 class StaleConfigException;
 class ParallelConnectionMetadata;
 
@@ -70,11 +70,11 @@ public:
 
     // Please do not reorder. cursor destructor can use conn.
     // On a related note, never attempt to cleanup these pointers manually.
-    ShardConnectionPtr conn;
+    std::shared_ptr<ShardConnection> conn;
     DBClientCursorPtr cursor;
 
     // Version information
-    ChunkManagerPtr manager;
+    std::shared_ptr<ChunkManager> manager;
     std::shared_ptr<Shard> primary;
 
     // Cursor status information
@@ -147,77 +147,38 @@ public:
 
     ~ParallelSortClusteredCursor();
 
-    std::string getNS();
-
     /** call before using */
-    void init();
+    void init(OperationContext* txn);
 
     bool more();
     BSONObj next();
-    std::string type() const {
-        return "ParallelSort";
-    }
-
-    void fullInit();
-    void startInit();
-    void finishInit();
-
-    bool isCommand() {
-        return NamespaceString(_qSpec.ns()).isCommand();
-    }
-    bool isExplain() {
-        return _qSpec.isExplain();
-    }
-
-    /**
-     * Sets the batch size on all underlying cursors to 'newBatchSize'.
-     */
-    void setBatchSize(int newBatchSize);
-
-    /**
-     * Returns whether the collection was sharded when the cursors were established.
-     */
-    bool isSharded();
-
-    /**
-     * Returns the number of shards with open cursors.
-     */
-    int getNumQueryShards();
 
     /**
      * Returns the set of shards with open cursors.
      */
     void getQueryShardIds(std::set<ShardId>& shardIds);
 
-    /**
-     * Returns the single shard with an open cursor.
-     * It is an error to call this if getNumQueryShards() > 1
-     */
-    std::shared_ptr<Shard> getQueryShard();
-
-    /**
-     * Returns primary shard with an open cursor.
-     * It is an error to call this if the collection is sharded.
-     */
-    std::shared_ptr<Shard> getPrimary();
-
     DBClientCursorPtr getShardCursor(const ShardId& shardId);
 
-    BSONObj toBSON() const;
-    std::string toString() const;
-
-    void explain(BSONObjBuilder& b);
-
 private:
-    void _finishCons();
+    void fullInit(OperationContext* txn);
+    void startInit(OperationContext* txn);
+    void finishInit(OperationContext* txn);
 
-    void _explain(std::map<std::string, std::list<BSONObj>>& out);
+    bool isCommand() {
+        return NamespaceString(_qSpec.ns()).isCommand();
+    }
+
+    void _finishCons();
 
     void _markStaleNS(const NamespaceString& staleNS,
                       const StaleConfigException& e,
                       bool& forceReload,
                       bool& fullReload);
-    void _handleStaleNS(const NamespaceString& staleNS, bool forceReload, bool fullReload);
+    void _handleStaleNS(OperationContext* txn,
+                        const NamespaceString& staleNS,
+                        bool forceReload,
+                        bool fullReload);
 
     bool _didInit;
     bool _done;
@@ -227,7 +188,9 @@ private:
 
     // Count round-trips req'd for namespaces and total
     std::map<std::string, int> _staleNSMap;
+
     int _totalTries;
+    bool _cmChangeAttempted;
 
     std::map<ShardId, PCMData> _cursorMap;
 
@@ -245,12 +208,13 @@ private:
      * set connection and the primary cannot be reached, the version
      * will not be set if the slaveOk flag is set.
      */
-    void setupVersionAndHandleSlaveOk(PCStatePtr state /* in & out */,
+    void setupVersionAndHandleSlaveOk(OperationContext* txn,
+                                      PCStatePtr state /* in & out */,
                                       const ShardId& shardId,
                                       std::shared_ptr<Shard> primary /* in */,
                                       const NamespaceString& ns,
                                       const std::string& vinfo,
-                                      ChunkManagerPtr manager /* in */);
+                                      std::shared_ptr<ChunkManager> manager /* in */);
 
     // LEGACY init - Needed for map reduce
     void _oldInit();
@@ -297,81 +261,6 @@ private:
     std::unique_ptr<ParallelConnectionMetadata> _pcmData;
 };
 
-/**
- * Generally clients should be using Strategy::commandOp() wherever possible - the Future API
- * does not handle versioning.
- *
- * tools for doing asynchronous operations
- * right now uses underlying sync network ops and uses another thread
- * should be changed to use non-blocking io
- */
-class Future {
-public:
-    class CommandResult {
-    public:
-        std::string getServer() const {
-            return _server;
-        }
+void throwCursorStale(DBClientCursor* cursor);
 
-        bool isDone() const {
-            return _done;
-        }
-
-        bool ok() const {
-            verify(_done);
-            return _ok;
-        }
-
-        BSONObj result() const {
-            verify(_done);
-            return _res;
-        }
-
-        /**
-           blocks until command is done
-           returns ok()
-         */
-        bool join(int maxRetries = 1);
-
-    private:
-        CommandResult(const std::string& server,
-                      const std::string& db,
-                      const BSONObj& cmd,
-                      int options,
-                      DBClientBase* conn,
-                      bool useShardedConn);
-        void init();
-
-        std::string _server;
-        std::string _db;
-        int _options;
-        BSONObj _cmd;
-        DBClientBase* _conn;
-        std::unique_ptr<AScopedConnection> _connHolder;  // used if not provided a connection
-        bool _useShardConn;
-
-        std::unique_ptr<DBClientCursor> _cursor;
-
-        BSONObj _res;
-        bool _ok;
-        bool _done;
-
-        friend class Future;
-    };
-
-
-    /**
-     * @param server server name
-     * @param db db name
-     * @param cmd cmd to exec
-     * @param conn optional connection to use.  will use standard pooled if non-specified
-     * @param useShardConn use ShardConnection
-     */
-    static std::shared_ptr<CommandResult> spawnCommand(const std::string& server,
-                                                       const std::string& db,
-                                                       const BSONObj& cmd,
-                                                       int options,
-                                                       DBClientBase* conn = 0,
-                                                       bool useShardConn = false);
-};
-}
+}  // namespace mongo

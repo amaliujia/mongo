@@ -1,4 +1,13 @@
-// Test basic read committed functionality.
+/**
+ * Test basic read committed functionality, including:
+ *  - Writes with writeConcern 'majority' should be visible once the write completes.
+ *  - With the only data-bearing secondary down, committed reads should not include newly inserted
+ *    data.
+ *  - When data-bearing node comes back up and catches up, writes should be readable.
+ */
+
+load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
+
 (function() {
 "use strict";
 
@@ -6,37 +15,36 @@
 var name = "read_committed";
 var replTest = new ReplSetTest({name: name,
                                 nodes: 3,
-                                nodeOptions: {setParameter: "enableReplSnapshotThread=true"}});
-var nodes = replTest.nodeList();
-var conns = replTest.startSet();
-replTest.initiate({"_id": name,
-                   "members": [
-                       { "_id": 0, "host": nodes[0] },
-                       { "_id": 1, "host": nodes[1] },
-                       { "_id": 2, "host": nodes[2], arbiterOnly: true}]
-                  });
+                                nodeOptions: {enableMajorityReadConcern: ''}});
 
-// Get connections and collection.
-var master = replTest.getMaster();
-var slave = replTest.liveNodes.slaves[0];
-var slaveId = replTest.getNodeId(slave);
-var db = master.getDB(name);
-var t = db[name];
-
-if (!db.serverStatus().storageEngine.supportsCommittedReads) {
-    assert.neq(db.serverStatus().storageEngine.name, "wiredTiger");
+if (!startSetIfSupportsReadMajority(replTest)) {
     jsTest.log("skipping test since storage engine doesn't support committed reads");
     return;
 }
 
+var nodes = replTest.nodeList();
+replTest.initiate({"_id": name,
+                   "members": [
+                       { "_id": 0, "host": nodes[0] },
+                       { "_id": 1, "host": nodes[1], priority: 0 },
+                       { "_id": 2, "host": nodes[2], arbiterOnly: true}]
+                  });
+
+// Get connections and collection.
+var primary = replTest.getPrimary();
+var secondary = replTest.liveNodes.slaves[0];
+var secondaryId = replTest.getNodeId(secondary);
+var db = primary.getDB(name);
+var t = db[name];
+
 function doDirtyRead() {
-    var res = t.runCommand('find', {$readMajorityTemporaryName: false});
+    var res = t.runCommand('find', {"readConcern": {"level": "local"}});
     assert.commandWorked(res);
     return new DBCommandCursor(db.getMongo(), res).toArray()[0].state;
 }
 
 function doCommittedRead() {
-    var res = t.runCommand('find', {$readMajorityTemporaryName: true});
+    var res = t.runCommand('find', {"readConcern": {"level": "majority"}});
     assert.commandWorked(res);
     return new DBCommandCursor(db.getMongo(), res).toArray()[0].state;
 }
@@ -46,7 +54,7 @@ assert.writeOK(t.save({_id: 1, state: 0}, {writeConcern: {w: "majority", wtimeou
 assert.eq(doDirtyRead(), 0);
 assert.eq(doCommittedRead(), 0);
 
-replTest.stop(slaveId);
+replTest.stop(secondaryId);
 
 // Do a write and ensure it is only visible to dirty reads
 assert.writeOK(t.save({_id: 1, state: 1}));
@@ -59,8 +67,10 @@ sleep(1000);
 assert.eq(doCommittedRead(), 0);
 
 // Restart the node and ensure the committed view is updated.
-replTest.restart(slaveId);
-db.getLastError("majority", 60*1000);
+replTest.restart(secondaryId);
+db.getLastError("majority", 60 * 1000);
 assert.eq(doDirtyRead(), 1);
 assert.eq(doCommittedRead(), 1);
+
+
 }());

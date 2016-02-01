@@ -38,7 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
-#include "mongo/db/query/cursor_responses.h"
+#include "mongo/db/query/cursor_response.h"
 
 namespace mongo {
 
@@ -103,11 +103,15 @@ public:
         // it now so that it can be registed with ClientCursor.
         exec->deregisterExec();
         exec->saveState();
+        exec->detachFromOperationContext();
 
         // ClientCursors' constructor inserts them into a global map that manages their
         // lifetimes. That is why the next line isn't leaky.
         ClientCursor* cc =
-            new ClientCursor(collection->getCursorManager(), exec.release(), ns.ns());
+            new ClientCursor(collection->getCursorManager(),
+                             exec.release(),
+                             ns.ns(),
+                             txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
 
         appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &result);
 

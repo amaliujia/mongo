@@ -1,11 +1,11 @@
-#!/usr/bin/env python -u
+#!/usr/bin/env python
 
 """Hang Analyzer
 
 A prototype hang analyzer for MCI integration to help investigate test timeouts
 
 1. Script supports taking dumps, and/or dumping a summary of useful information about a process
-2. Script will iterate through a list of interesting processes (mongo, mongod, and mongos), 
+2. Script will iterate through a list of interesting processes (mongo, mongod, and mongos),
     and run the tools from step 1.
 
 Supports Linux, MacOS X, and Windows.
@@ -24,6 +24,9 @@ import threading
 import time
 from distutils import spawn
 from optparse import OptionParser
+
+if sys.platform == "win32":
+    import win32process
 
 def call(a = []):
     sys.stdout.write(str(a) + "\n")
@@ -184,7 +187,23 @@ class LLDBDumper(object):
 
         stream.write("INFO: Debugger %s, analyzing %d\n" % (dbg, pid))
 
-        call([dbg, "--version"])
+        lldb_version = callo([dbg, "--version"])
+
+        stream.write(lldb_version)
+
+        # Do we have the XCode or LLVM version of lldb?
+        # Old versions of lldb do not work well when taking commands via a file
+        # XCode (7.2): lldb-340.4.119
+        # LLVM - lldb version 3.7.0 ( revision )
+
+        if 'version' not in lldb_version:
+            # We have XCode's lldb
+            lldb_version = lldb_version[lldb_version.index("lldb-"):]
+            lldb_version = lldb_version.replace('lldb-', '')
+            lldb_major_version = int(lldb_version[:lldb_version.index('.')])
+            if lldb_major_version < 340:
+                stream.write("WARNING: Debugger lldb is too old, please upgrade to XCode 7.2\n")
+                return
 
         cmds = [
             "attach -p %d" % pid,
@@ -354,7 +373,13 @@ def signal_process(pid):
 
 def timeout_protector():
     print "Script timeout has been hit, terminating"
-    os.kill(os.getpid(), signal.SIGKILL)
+    if sys.platform == "win32":
+        # Have the process exit with code 9 when it terminates itself to closely match the exit code
+        # of the process when it sends itself a SIGKILL.
+        handle = win32process.GetCurrentProcess()
+        win32process.TerminateProcess(handle, 9)
+    else:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 # Basic procedure
@@ -407,11 +432,11 @@ def main():
             sys.stdout.write("Ignoring process %d of %s\n" % (process[0], process[1]))
     else:
         # Dump all other processes first since signaling the python script interrupts it
-        for process in [a for a in processes if a[1] != "python"]:
+        for process in [a for a in processes if not a[1].startswith("python")]:
             sys.stdout.write("Dumping process %d of %s\n" % (process[0], process[1]))
             dbg.dump_info(process[0], sys.stdout)
 
-        for process in [a for a in processes if a[1] == "python"]:
+        for process in [a for a in processes if a[1].startswith("python")]:
             signal_process(process[0])
 
             dbg.dump_info(process[0], sys.stdout)

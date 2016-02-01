@@ -33,12 +33,11 @@
 #include <type_traits>
 
 #include "mongo/config.h"
+#include "mongo/platform/decimal128.h"
 
 #pragma push_macro("MONGO_UINT16_SWAB")
 #pragma push_macro("MONGO_UINT32_SWAB")
 #pragma push_macro("MONGO_UINT64_SWAB")
-#pragma push_macro("MONGO_LITTLE_ENDIAN")
-#pragma push_macro("MONGO_BIG_ENDIAN")
 #pragma push_macro("htobe16")
 #pragma push_macro("htobe32")
 #pragma push_macro("htobe64")
@@ -55,8 +54,6 @@
 #undef MONGO_UINT16_SWAB
 #undef MONGO_UINT32_SWAB
 #undef MONGO_UINT64_SWAB
-#undef MONGO_LITTLE_ENDIAN
-#undef MONGO_BIG_ENDIAN
 #undef htobe16
 #undef htobe32
 #undef htobe64
@@ -416,6 +413,35 @@ struct ByteOrderConverter<double> {
     }
 };
 
+template <>
+struct ByteOrderConverter<Decimal128::Value> {
+    typedef Decimal128::Value T;
+
+    inline static T nativeToBig(T t) {
+        ByteOrderConverter<uint64_t>::nativeToBig(t.low64);
+        ByteOrderConverter<uint64_t>::nativeToBig(t.high64);
+        return t;
+    }
+
+    inline static T bigToNative(T t) {
+        ByteOrderConverter<uint64_t>::bigToNative(t.low64);
+        ByteOrderConverter<uint64_t>::bigToNative(t.high64);
+        return t;
+    }
+
+    inline static T nativeToLittle(T t) {
+        ByteOrderConverter<uint64_t>::nativeToLittle(t.low64);
+        ByteOrderConverter<uint64_t>::nativeToLittle(t.high64);
+        return t;
+    }
+
+    inline static T littleToNative(T t) {
+        ByteOrderConverter<uint64_t>::littleToNative(t.low64);
+        ByteOrderConverter<uint64_t>::littleToNative(t.high64);
+        return t;
+    }
+};
+
 // Use a typemape to normalize non-fixed-width integral types to the associated fixed width
 // types.
 
@@ -481,8 +507,6 @@ inline T littleToNative(T t) {
 #undef MONGO_UINT16_SWAB
 #undef MONGO_UINT32_SWAB
 #undef MONGO_UINT64_SWAB
-#undef MONGO_LITTLE_ENDIAN
-#undef MONGO_BIG_ENDIAN
 #undef htobe16
 #undef htobe32
 #undef htobe64
@@ -499,8 +523,6 @@ inline T littleToNative(T t) {
 #pragma pop_macro("MONGO_UINT16_SWAB")
 #pragma pop_macro("MONGO_UINT32_SWAB")
 #pragma pop_macro("MONGO_UINT64_SWAB")
-#pragma pop_macro("MONGO_LITTLE_ENDIAN")
-#pragma pop_macro("MONGO_BIG_ENDIAN")
 #pragma pop_macro("htobe16")
 #pragma pop_macro("htobe32")
 #pragma pop_macro("htobe64")

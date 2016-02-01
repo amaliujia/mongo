@@ -35,6 +35,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -89,13 +90,14 @@ std::string DBDirectClient::getServerAddress() const {
     return "localhost";  // TODO: should this have the port?
 }
 
-void DBDirectClient::sayPiggyBack(Message& toSend) {
-    // don't need to piggy back when connected locally
-    return say(toSend);
+// Returned version should match the incoming connections restrictions.
+int DBDirectClient::getMinWireVersion() {
+    return WireSpec::instance().minWireVersionIncoming;
 }
 
-bool DBDirectClient::callRead(Message& toSend, Message& response) {
-    return call(toSend, response);
+// Returned version should match the incoming connections restrictions.
+int DBDirectClient::getMaxWireVersion() {
+    return WireSpec::instance().maxWireVersionIncoming;
 }
 
 ConnectionString::ConnectionType DBDirectClient::type() const {
@@ -126,11 +128,11 @@ bool DBDirectClient::call(Message& toSend, Message& response, bool assertOk, str
     DbResponse dbResponse;
     CurOp curOp(_txn);
     assembleResponse(_txn, toSend, dbResponse, dummyHost);
-    verify(dbResponse.response);
+    verify(!dbResponse.response.empty());
 
     // can get rid of this if we make response handling smarter
-    dbResponse.response->concat();
-    response = std::move(*dbResponse.response);
+    dbResponse.response.concat();
+    response = std::move(dbResponse.response);
 
     return true;
 }
@@ -153,12 +155,6 @@ unique_ptr<DBClientCursor> DBDirectClient::query(const string& ns,
                                                  int batchSize) {
     return DBClientBase::query(
         ns, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
-}
-
-void DBDirectClient::killCursor(long long id) {
-    // The killCursor command on the DB client is only used by sharding,
-    // so no need to have it for MongoD.
-    verify(!"killCursor should not be used in MongoD");
 }
 
 const HostAndPort DBDirectClient::dummyHost("0.0.0.0", 0);

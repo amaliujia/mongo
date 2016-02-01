@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/replica_set_monitor_manager.h"
@@ -34,6 +36,7 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
@@ -63,6 +66,8 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
     if (!monitor) {
         const std::set<HostAndPort> servers(connStr.getServers().begin(),
                                             connStr.getServers().end());
+
+        log() << "Starting new replica set monitor for " << connStr.toString();
 
         monitor = std::make_shared<ReplicaSetMonitor>(connStr.getSetName(), servers);
     }
@@ -99,12 +104,18 @@ void ReplicaSetMonitorManager::removeAllMonitors() {
 }
 
 void ReplicaSetMonitorManager::report(BSONObjBuilder* builder) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    for (const auto& monitorPair : _monitors) {
-        BSONObjBuilder monitorInfo(builder->subobjStart(monitorPair.first));
-        monitorPair.second->appendInfo(monitorInfo);
-        monitorInfo.done();
+    // Don't hold _mutex the whole time to avoid ever taking a monitor's mutex while holding the
+    // manager's mutex.  Otherwise we could get a deadlock between the manager's, monitor's, and
+    // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook potentially
+    // calling ShardRegistry::updateConfigServerConnectionString.
+    auto setNames = getAllSetNames();
+    for (const auto& setName : setNames) {
+        auto monitor = getMonitor(setName);
+        if (!monitor) {
+            continue;
+        }
+        BSONObjBuilder monitorInfo(builder->subobjStart(setName));
+        monitor->appendInfo(monitorInfo);
     }
 }
 

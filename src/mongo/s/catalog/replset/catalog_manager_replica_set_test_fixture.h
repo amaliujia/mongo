@@ -28,118 +28,17 @@
 
 #pragma once
 
-#include <utility>
-
-#include "mongo/db/service_context.h"
-#include "mongo/executor/network_test_env.h"
-#include "mongo/util/net/message_port_mock.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/sharding_test_fixture.h"
 
 namespace mongo {
-
-class BSONObj;
-class CatalogManagerReplicaSet;
-class DistLockManagerMock;
-struct RemoteCommandRequest;
-class RemoteCommandTargeterFactoryMock;
-class RemoteCommandTargeterMock;
-class ShardRegistry;
-class ShardType;
-template <typename T>
-class StatusWith;
-
-namespace executor {
-class NetworkInterfaceMock;
-}  // namespace executor
 
 /**
  * Sets up the mocked out objects for testing the replica-set backed catalog manager.
  */
-class CatalogManagerReplSetTestFixture : public mongo::unittest::Test {
+class CatalogManagerReplSetTestFixture : public ShardingTestFixture {
 public:
     CatalogManagerReplSetTestFixture();
     ~CatalogManagerReplSetTestFixture();
-
-protected:
-    static const stdx::chrono::seconds kFutureTimeout;
-
-    template <typename Lambda>
-    executor::NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(
-        Lambda&& func) const {
-        return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
-    }
-
-    CatalogManagerReplicaSet* catalogManager() const;
-
-    ShardRegistry* shardRegistry() const;
-
-    RemoteCommandTargeterFactoryMock* targeterFactory() const;
-
-    RemoteCommandTargeterMock* configTargeter() const;
-
-    executor::NetworkInterfaceMock* network() const;
-
-    MessagingPortMock* getMessagingPort() const;
-
-    DistLockManagerMock* distLock() const;
-
-    OperationContext* operationContext() const;
-
-    /**
-     * Blocking methods, which receive one message from the network and respond using the
-     * responses returned from the input function. This is a syntactic sugar for simple,
-     * single request + response or find tests.
-     */
-    void onCommand(executor::NetworkTestEnv::OnCommandFunction func);
-    void onFindCommand(executor::NetworkTestEnv::OnFindCommandFunction func);
-
-    /**
-     * Setup the shard registry to contain the given shards until the next reload.
-     */
-    void setupShards(const std::vector<ShardType>& shards);
-
-    /**
-     * Wait for the shards listing command to be run and returns the specified set of shards.
-     */
-    void expectGetShards(const std::vector<ShardType>& shards);
-
-    /**
-     * Wait for a single insert request and ensures that the items being inserted exactly match the
-     * expected items. Responds with a success status.
-     */
-    void expectInserts(const NamespaceString nss, const std::vector<BSONObj>& expected);
-
-    /**
-     * Wait for an operation, which creates the sharding change log collection and return the
-     * specified response.
-     */
-    void expectChangeLogCreate(const BSONObj& response);
-
-    /**
-     * Wait for a single insert in the change log collection with the specified contents and return
-     * a successful response.
-     */
-    void expectChangeLogInsert(const std::string& clientAddress,
-                               Date_t timestamp,
-                               const std::string& what,
-                               const std::string& ns,
-                               const BSONObj& detail);
-
-    void setUp() override;
-
-    void tearDown() override;
-
-private:
-    std::unique_ptr<ServiceContext> _service;
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<MessagingPortMock> _messagePort;
-
-    RemoteCommandTargeterFactoryMock* _targeterFactory;
-    RemoteCommandTargeterMock* _configTargeter;
-
-    executor::NetworkInterfaceMock* _mockNetwork;
-    std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
 };
 
 }  // namespace mongo

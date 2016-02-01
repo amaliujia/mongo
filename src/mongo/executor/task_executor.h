@@ -30,20 +30,25 @@
 
 #include <string>
 #include <memory>
+#include <functional>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/client/remote_command_runner.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
+class BSONObjBuilder;
 class OperationContext;
 
 namespace executor {
+
+struct ConnectionPoolStats;
 
 /**
  * Generic event loop with notions of events and callbacks.
@@ -228,20 +233,27 @@ public:
      */
     virtual void wait(const CallbackHandle& cbHandle) = 0;
 
-protected:
-    TaskExecutor();
+    /**
+     * Appends information about the underlying network interface's connections to the given
+     * builder.
+     */
+    virtual void appendConnectionStats(ConnectionPoolStats* stats) const = 0;
 
+protected:
     // Retrieves the Callback from a given CallbackHandle
-    CallbackState* getCallbackFromHandle(const CallbackHandle& cbHandle);
+    static CallbackState* getCallbackFromHandle(const CallbackHandle& cbHandle);
 
     // Retrieves the Event from a given EventHandle
-    EventState* getEventFromHandle(const EventHandle& eventHandle);
+    static EventState* getEventFromHandle(const EventHandle& eventHandle);
 
     // Sets the given CallbackHandle to point to the given callback.
-    void setCallbackForHandle(CallbackHandle* cbHandle, std::shared_ptr<CallbackState> callback);
+    static void setCallbackForHandle(CallbackHandle* cbHandle,
+                                     std::shared_ptr<CallbackState> callback);
 
     // Sets the given EventHandle to point to the given event.
-    void setEventForHandle(EventHandle* eventHandle, std::shared_ptr<EventState> event);
+    static void setEventForHandle(EventHandle* eventHandle, std::shared_ptr<EventState> event);
+
+    TaskExecutor();
 };
 
 /**
@@ -255,6 +267,7 @@ public:
 
     virtual void cancel() = 0;
     virtual void waitForCompletion() = 0;
+    virtual bool isCanceled() const = 0;
 
 protected:
     CallbackState();
@@ -269,6 +282,9 @@ class TaskExecutor::CallbackHandle {
 public:
     CallbackHandle();
 
+    // Exposed solely for testing.
+    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
+
     bool operator==(const CallbackHandle& other) const {
         return _callback == other._callback;
     }
@@ -281,8 +297,22 @@ public:
         return _callback.get();
     }
 
+    /**
+     * True if this handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
+    }
+
+    std::size_t hash() const {
+        return std::hash<decltype(_callback)>()(_callback);
+    }
+
+    bool isCanceled() const {
+        return getCallback()->isCanceled();
+    }
+
 private:
-    explicit CallbackHandle(std::shared_ptr<CallbackState> cbData);
     void setCallback(std::shared_ptr<CallbackState> callback) {
         _callback = callback;
     }
@@ -333,6 +363,13 @@ public:
         return _event.get();
     }
 
+    /**
+     * True if this event handle is valid.
+     */
+    explicit operator bool() const {
+        return isValid();
+    }
+
 private:
     void setEvent(std::shared_ptr<EventState> event) {
         _event = event;
@@ -377,3 +414,14 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
 
 }  // namespace executor
 }  // namespace mongo
+
+// Provide a specialization for std::hash<CallbackHandle> so it can easily
+// be stored in unordered_set.
+namespace std {
+template <>
+struct hash<::mongo::executor::TaskExecutor::CallbackHandle> {
+    size_t operator()(const ::mongo::executor::TaskExecutor::CallbackHandle& x) const {
+        return x.hash();
+    }
+};
+}  // namespace std

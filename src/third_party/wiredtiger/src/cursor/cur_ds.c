@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -384,7 +384,7 @@ __curds_remove(WT_CURSOR *cursor)
 
 	source = ((WT_CURSOR_DATA_SOURCE *)cursor)->source;
 
-	CURSOR_UPDATE_API_CALL(cursor, session, remove, NULL);
+	CURSOR_REMOVE_API_CALL(cursor, session, NULL);
 
 	WT_STAT_FAST_CONN_INCR(session, cursor_remove);     
 	WT_STAT_FAST_DATA_INCR(session, cursor_remove);
@@ -510,7 +510,7 @@ __wt_curds_open(
 	source = data_source->source;
 	source->session = (WT_SESSION *)session;
 	memset(&source->q, 0, sizeof(source->q));
-	source->recno = 0;
+	source->recno = WT_RECNO_OOB;
 	memset(source->raw_recno_buf, 0, sizeof(source->raw_recno_buf));
 	memset(&source->key, 0, sizeof(source->key));
 	memset(&source->value, 0, sizeof(source->value));

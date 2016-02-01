@@ -44,6 +44,7 @@
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
@@ -56,12 +57,15 @@
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/data_protector.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -128,9 +132,9 @@ RecordId Helpers::findOne(OperationContext* txn,
     if (!collection)
         return RecordId();
 
-    const WhereCallbackReal whereCallback(txn, collection->ns().db());
+    const ExtensionsCallbackReal extensionsCallback(txn, &collection->ns());
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(collection->ns().ns(), query, whereCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(collection->ns(), query, extensionsCallback);
     massert(17244, "Could not canonicalize " + query.toString(), statusWithCQ.isOK());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -193,7 +197,8 @@ RecordId Helpers::findById(OperationContext* txn, Collection* collection, const 
 
 bool Helpers::getSingleton(OperationContext* txn, const char* ns, BSONObj& result) {
     AutoGetCollectionForRead ctx(txn, ns);
-    unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
+    unique_ptr<PlanExecutor> exec(
+        InternalPlanner::collectionScan(txn, ns, ctx.getCollection(), PlanExecutor::YIELD_MANUAL));
     PlanExecutor::ExecState state = exec->getNext(&result, NULL);
 
     CurOp::get(txn)->done();
@@ -208,7 +213,7 @@ bool Helpers::getSingleton(OperationContext* txn, const char* ns, BSONObj& resul
 bool Helpers::getLast(OperationContext* txn, const char* ns, BSONObj& result) {
     AutoGetCollectionForRead autoColl(txn, ns);
     unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-        txn, ns, autoColl.getCollection(), InternalPlanner::BACKWARD));
+        txn, ns, autoColl.getCollection(), PlanExecutor::YIELD_MANUAL, InternalPlanner::BACKWARD));
     PlanExecutor::ExecState state = exec->getNext(&result, NULL);
 
     if (PlanExecutor::ADVANCED == state) {
@@ -353,6 +358,7 @@ long long Helpers::removeRange(OperationContext* txn,
                                            min,
                                            max,
                                            maxInclusive,
+                                           PlanExecutor::YIELD_MANUAL,
                                            InternalPlanner::FORWARD,
                                            InternalPlanner::IXSCAN_FETCH));
             exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
@@ -362,7 +368,6 @@ long long Helpers::removeRange(OperationContext* txn,
             PlanExecutor::ExecState state;
             // This may yield so we cannot touch nsd after this.
             state = exec->getNext(&obj, &rloc);
-            exec.reset();
             if (PlanExecutor::IS_EOF == state) {
                 break;
             }
@@ -388,13 +393,13 @@ long long Helpers::removeRange(OperationContext* txn,
 
                 // We should never be able to turn off the sharding state once enabled, but
                 // in the future we might want to.
-                verify(shardingState.enabled());
+                verify(ShardingState::get(txn)->enabled());
 
                 bool docIsOrphan;
 
                 // In write lock, so will be the most up-to-date version
                 std::shared_ptr<CollectionMetadata> metadataNow =
-                    shardingState.getCollectionMetadata(ns);
+                    ShardingState::get(txn)->getCollectionMetadata(ns);
                 if (metadataNow) {
                     ShardKeyPattern kp(metadataNow->getKeyPattern());
                     BSONObj key = kp.extractShardKeyFromDoc(obj);
@@ -424,8 +429,7 @@ long long Helpers::removeRange(OperationContext* txn,
             if (callback)
                 callback->goingToDelete(obj);
 
-            BSONObj deletedId;
-            collection->deleteDocument(txn, rloc, false, false, &deletedId);
+            collection->deleteDocument(txn, rloc, fromMigrate);
             wuow.commit();
             numDeleted++;
         }
@@ -461,104 +465,16 @@ long long Helpers::removeRange(OperationContext* txn,
     return numDeleted;
 }
 
-const long long Helpers::kMaxDocsPerChunk(250000);
-
-// Used by migration clone step
-// TODO: Cannot hook up quite yet due to _trackerLocks in shared migration code.
-// TODO: This function is not used outside of tests
-Status Helpers::getLocsInRange(OperationContext* txn,
-                               const KeyRange& range,
-                               long long maxChunkSizeBytes,
-                               set<RecordId>* locs,
-                               long long* numDocs,
-                               long long* estChunkSizeBytes) {
-    const string ns = range.ns;
-    *estChunkSizeBytes = 0;
-    *numDocs = 0;
-
-    AutoGetCollectionForRead ctx(txn, ns);
-
-    Collection* collection = ctx.getCollection();
-    if (!collection) {
-        return Status(ErrorCodes::NamespaceNotFound, ns);
-    }
-
-    // Require single key
-    IndexDescriptor* idx =
-        collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn, range.keyPattern, true);
-
-    if (idx == NULL) {
-        return Status(ErrorCodes::IndexNotFound, range.keyPattern.toString());
-    }
-
-    // use the average object size to estimate how many objects a full chunk would carry
-    // do that while traversing the chunk's range using the sharding index, below
-    // there's a fair amount of slack before we determine a chunk is too large because object
-    // sizes will vary
-    long long avgDocsWhenFull;
-    long long avgDocSizeBytes;
-    const long long totalDocsInNS = collection->numRecords(txn);
-    if (totalDocsInNS > 0) {
-        // TODO: Figure out what's up here
-        avgDocSizeBytes = collection->dataSize(txn) / totalDocsInNS;
-        avgDocsWhenFull = maxChunkSizeBytes / avgDocSizeBytes;
-        avgDocsWhenFull = std::min(kMaxDocsPerChunk + 1, 130 * avgDocsWhenFull / 100 /* slack */);
-    } else {
-        avgDocSizeBytes = 0;
-        avgDocsWhenFull = kMaxDocsPerChunk + 1;
-    }
-
-    // Assume both min and max non-empty, append MinKey's to make them fit chosen index
-    KeyPattern idxKeyPattern(idx->keyPattern());
-    BSONObj min = Helpers::toKeyFormat(idxKeyPattern.extendRangeBound(range.minKey, false));
-    BSONObj max = Helpers::toKeyFormat(idxKeyPattern.extendRangeBound(range.maxKey, false));
-
-
-    // do a full traversal of the chunk and don't stop even if we think it is a large chunk
-    // we want the number of records to better report, in that case
-    bool isLargeChunk = false;
-    long long docCount = 0;
-
-    unique_ptr<PlanExecutor> exec(
-        InternalPlanner::indexScan(txn, collection, idx, min, max, false));
-    // we can afford to yield here because any change to the base data that we might miss  is
-    // already being queued and will be migrated in the 'transferMods' stage
-    exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
-
-    RecordId loc;
-    PlanExecutor::ExecState state;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
-        if (!isLargeChunk) {
-            locs->insert(loc);
-        }
-
-        if (++docCount > avgDocsWhenFull) {
-            isLargeChunk = true;
-        }
-    }
-
-    *numDocs = docCount;
-    *estChunkSizeBytes = docCount* avgDocSizeBytes;
-
-    if (isLargeChunk) {
-        stringstream ss;
-        ss << estChunkSizeBytes;
-        return Status(ErrorCodes::InvalidLength, ss.str());
-    }
-
-    return Status::OK();
-}
-
-
 void Helpers::emptyCollection(OperationContext* txn, const char* ns) {
     OldClientContext context(txn, ns);
     bool shouldReplicateWrites = txn->writesAreReplicated();
     txn->setReplicatedWrites(false);
     ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
-    deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
+    Collection* collection = context.db() ? context.db()->getCollection(ns) : nullptr;
+    deleteObjects(txn, collection, ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
 }
 
-Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string& why) : _out(0) {
+Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string& why) {
     static int NUM = 0;
 
     _root = storageGlobalParams.dbpath;
@@ -573,29 +489,104 @@ Helpers::RemoveSaver::RemoveSaver(const string& a, const string& b, const string
     stringstream ss;
     ss << why << "." << terseCurrentTime(false) << "." << NUM++ << ".bson";
     _file /= ss.str();
+
+    auto hooks = WiredTigerCustomizationHooks::get(getGlobalServiceContext());
+    if (hooks->enabled()) {
+        _protector = hooks->getDataProtector();
+        _file += hooks->getProtectedPathSuffix();
+    }
 }
 
 Helpers::RemoveSaver::~RemoveSaver() {
-    if (_out) {
-        _out->close();
-        delete _out;
-        _out = 0;
+    if (_protector && _out) {
+        auto hooks = WiredTigerCustomizationHooks::get(getGlobalServiceContext());
+        invariant(hooks->enabled());
+
+        size_t protectedSizeMax = hooks->additionalBytesForProtectedBuffer();
+        std::unique_ptr<uint8_t[]> protectedBuffer(new uint8_t[protectedSizeMax]);
+
+        size_t resultLen;
+        Status status = _protector->finalize(protectedBuffer.get(), protectedSizeMax, &resultLen);
+        if (!status.isOK()) {
+            severe() << "Unable to finalize DataProtector while closing RemoveSaver: "
+                     << status.reason();
+            fassertFailed(34350);
+        }
+
+        _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
+        if (_out->fail()) {
+            severe() << "Couldn't write finalized DataProtector data to: " << _file.string()
+                     << " for remove saving: " << errnoWithDescription();
+            fassertFailed(34351);
+        }
+
+        protectedBuffer.reset(new uint8_t[protectedSizeMax]);
+        status = _protector->finalizeTag(protectedBuffer.get(), protectedSizeMax, &resultLen);
+        if (!status.isOK()) {
+            severe() << "Unable to get finalizeTag from DataProtector while closing RemoveSaver: "
+                     << status.reason();
+            fassertFailed(34352);
+        }
+        if (resultLen != _protector->getNumberOfBytesReservedForTag()) {
+            severe() << "Attempted to write tag of size " << resultLen
+                     << " when DataProtector only reserved "
+                     << _protector->getNumberOfBytesReservedForTag() << " bytes";
+            fassertFailed(34353);
+        }
+        _out->seekp(0);
+        _out->write(reinterpret_cast<const char*>(protectedBuffer.get()), resultLen);
+        if (_out->fail()) {
+            severe() << "Couldn't write finalizeTag from DataProtector to: " << _file.string()
+                     << " for remove saving: " << errnoWithDescription();
+            fassertFailed(34354);
+        }
     }
 }
 
-void Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
+Status Helpers::RemoveSaver::goingToDelete(const BSONObj& o) {
     if (!_out) {
         boost::filesystem::create_directories(_root);
-        _out = new ofstream();
-        _out->open(_file.string().c_str(), ios_base::out | ios_base::binary);
-        if (!_out->good()) {
-            error() << "couldn't create file: " << _file.string() << " for remove saving" << endl;
-            delete _out;
+        _out.reset(new ofstream(_file.string().c_str(), ios_base::out | ios_base::binary));
+        if (_out->fail()) {
+            string msg = str::stream() << "couldn't create file: " << _file.string()
+                                       << " for remove saving: " << errnoWithDescription();
+            error() << msg;
+            _out.reset();
             _out = 0;
-            return;
+            return Status(ErrorCodes::FileNotOpen, msg);
         }
     }
-    _out->write(o.objdata(), o.objsize());
+
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(o.objdata());
+    size_t dataSize = o.objsize();
+
+    std::unique_ptr<uint8_t[]> protectedBuffer;
+    if (_protector) {
+        auto hooks = WiredTigerCustomizationHooks::get(getGlobalServiceContext());
+        invariant(hooks->enabled());
+
+        size_t protectedSizeMax = dataSize + hooks->additionalBytesForProtectedBuffer();
+        protectedBuffer.reset(new uint8_t[protectedSizeMax]);
+
+        size_t resultLen;
+        Status status = _protector->protect(
+            data, dataSize, protectedBuffer.get(), protectedSizeMax, &resultLen);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        data = protectedBuffer.get();
+        dataSize = resultLen;
+    }
+
+    _out->write(reinterpret_cast<const char*>(data), dataSize);
+    if (_out->fail()) {
+        string msg = str::stream() << "couldn't write document to file: " << _file.string()
+                                   << " for remove saving: " << errnoWithDescription();
+        error() << msg;
+        return Status(ErrorCodes::OperationFailed, msg);
+    }
+    return Status::OK();
 }
 
 

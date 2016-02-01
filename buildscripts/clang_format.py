@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/usr/bin/env python
 """
 A script that provides:
 1. Ability to grab binaries where possible from LLVM.
@@ -275,36 +275,43 @@ class ClangFormat(object):
 
         return False
 
-    def lint(self, file_name):
+    def _lint(self, file_name, print_diff):
         """Check the specified file has the correct format
         """
-        with open(file_name, 'r') as original_text:
+        with open(file_name, 'rb') as original_text:
             original_file = original_text.read()
 
         # Get formatted file as clang-format would format the file
         formatted_file = callo([self.path, "--style=file", file_name])
 
         if original_file != formatted_file:
+            if print_diff:
+                original_lines = original_file.splitlines()
+                formatted_lines = formatted_file.splitlines()
+                result = difflib.unified_diff(original_lines, formatted_lines)
 
-            original_lines = original_file.splitlines()
-            formatted_lines = formatted_file.splitlines()
-            result = difflib.unified_diff(original_lines, formatted_lines)
-
-            # Take a lock to ensure diffs do not get mixed
-            with self.print_lock:
-                print("ERROR: Found diff for " + file_name)
-                print("To fix formatting errors, run %s --style=file -i %s" %
-                        (self.path, file_name))
-                for line in result:
-                    print(line.rstrip())
+                # Take a lock to ensure diffs do not get mixed when printed to the screen
+                with self.print_lock:
+                    print("ERROR: Found diff for " + file_name)
+                    print("To fix formatting errors, run %s --style=file -i %s" %
+                            (self.path, file_name))
+                    for line in result:
+                        print(line.rstrip())
 
             return False
 
         return True
 
+    def lint(self, file_name):
+        """Check the specified file has the correct format
+        """
+        return self._lint(file_name, print_diff=True)
+
     def format(self, file_name):
         """Update the format of the specified file
         """
+        if self._lint(file_name, print_diff=False):
+            return True
 
         # Update the file with clang-format
         return not subprocess.call([self.path, "--style=file", "-i", file_name])
@@ -586,21 +593,20 @@ def usage():
 def main():
     """Main entry point
     """
-    if len(sys.argv) > 1:
-        command = sys.argv[1]
+    parser = OptionParser()
+    parser.add_option("-c", "--clang-format", type="string", dest="clang_format")
 
-        parser = OptionParser()
-        parser.add_option("-c", "--clang-format", type="string", dest="clang_format")
+    (options, args) = parser.parse_args(args=sys.argv)
+
+    if len(args) > 1:
+        command = args[1]
 
         if command == "lint":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            lint(options.clang_format, args)
+            lint(options.clang_format, args[2:])
         elif command == "lint-patch":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            lint_patch(options.clang_format, args)
+            lint_patch(options.clang_format, args[2:])
         elif command == "format":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            format_func(options.clang_format, args)
+            format_func(options.clang_format, args[2:])
         else:
             usage()
     else:

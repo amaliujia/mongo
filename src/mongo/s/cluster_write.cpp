@@ -58,8 +58,6 @@ using std::map;
 using std::string;
 using std::stringstream;
 
-const int ConfigOpTimeoutMillis = 30 * 1000;
-
 namespace {
 
 /**
@@ -111,12 +109,12 @@ void toBatchError(const Status& status, BatchedCommandResponse* response) {
 /**
  * Splits the chunks touched based from the targeter stats if needed.
  */
-void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
+void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const TargeterStats& stats) {
     if (!Chunk::ShouldAutoSplit) {
         return;
     }
 
-    auto status = grid.catalogCache()->getDatabase(nss.db().toString());
+    auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
     if (!status.isOK()) {
         warning() << "failed to get database config for " << nss
                   << " while checking for auto-split: " << status.getStatus();
@@ -126,8 +124,8 @@ void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
     shared_ptr<DBConfig> config = status.getValue();
 
     ChunkManagerPtr chunkManager;
-    ShardPtr dummyShard;
-    config->getChunkManagerOrPrimary(nss.ns(), chunkManager, dummyShard);
+    shared_ptr<Shard> dummyShard;
+    config->getChunkManagerOrPrimary(txn, nss.ns(), chunkManager, dummyShard);
 
     if (!chunkManager) {
         return;
@@ -138,22 +136,19 @@ void splitIfNeeded(const NamespaceString& nss, const TargeterStats& stats) {
          ++it) {
         ChunkPtr chunk;
         try {
-            chunk = chunkManager->findIntersectingChunk(it->first);
+            chunk = chunkManager->findIntersectingChunk(txn, it->first);
         } catch (const AssertionException& ex) {
             warning() << "could not find chunk while checking for auto-split: " << causedBy(ex);
             return;
         }
 
-        chunk->splitIfShould(it->second);
+        chunk->splitIfShould(txn, it->second);
     }
 }
 
 }  // namespace
 
-Status clusterCreateIndex(const string& ns,
-                          BSONObj keys,
-                          bool unique,
-                          BatchedCommandResponse* response) {
+Status clusterCreateIndex(OperationContext* txn, const string& ns, BSONObj keys, bool unique) {
     const NamespaceString nss(ns);
     const std::string dbName = nss.db().toString();
 
@@ -167,44 +162,23 @@ Status clusterCreateIndex(const string& ns,
     request.setNS(NamespaceString(nss.getSystemIndexesCollection()));
     request.setWriteConcern(WriteConcernOptions::Acknowledged);
 
-    BatchedCommandResponse dummyResponse;
-    if (response == NULL) {
-        response = &dummyResponse;
-    }
+    BatchedCommandResponse response;
 
     ClusterWriter writer(false, 0);
-    writer.write(request, response);
+    writer.write(txn, request, &response);
 
-    if (response->getOk() != 1) {
-        return Status(static_cast<ErrorCodes::Error>(response->getErrCode()),
-                      response->getErrMessage());
-    }
-
-    if (response->isErrDetailsSet()) {
-        const WriteErrorDetail* errDetail = response->getErrDetails().front();
-
-        return Status(static_cast<ErrorCodes::Error>(errDetail->getErrCode()),
-                      errDetail->getErrMessage());
-    }
-
-    if (response->isWriteConcernErrorSet()) {
-        const WCErrorDetail* errDetail = response->getWriteConcernError();
-
-        return Status(static_cast<ErrorCodes::Error>(errDetail->getErrCode()),
-                      errDetail->getErrMessage());
-    }
-
-    return Status::OK();
+    return response.toStatus();
 }
 
 
-void ClusterWriter::write(const BatchedCommandRequest& origRequest,
+void ClusterWriter::write(OperationContext* txn,
+                          const BatchedCommandRequest& origRequest,
                           BatchedCommandResponse* response) {
     // Add _ids to insert request if req'd
     unique_ptr<BatchedCommandRequest> idRequest(BatchedCommandRequest::cloneWithIds(origRequest));
-    const BatchedCommandRequest& request = NULL != idRequest.get() ? *idRequest : origRequest;
+    const BatchedCommandRequest* request = NULL != idRequest.get() ? idRequest.get() : &origRequest;
 
-    const NamespaceString& nss = request.getNS();
+    const NamespaceString& nss = request->getNS();
     if (!nss.isValid()) {
         toBatchError(Status(ErrorCodes::InvalidNamespace, nss.ns() + " is not a valid namespace"),
                      response);
@@ -218,13 +192,13 @@ void ClusterWriter::write(const BatchedCommandRequest& origRequest,
         return;
     }
 
-    if (request.sizeWriteOps() == 0u) {
+    if (request->sizeWriteOps() == 0u) {
         toBatchError(Status(ErrorCodes::InvalidLength, "no write ops were included in the batch"),
                      response);
         return;
     }
 
-    if (request.sizeWriteOps() > BatchedCommandRequest::kMaxWriteBatchSize) {
+    if (request->sizeWriteOps() > BatchedCommandRequest::kMaxWriteBatchSize) {
         toBatchError(Status(ErrorCodes::InvalidLength,
                             str::stream() << "exceeded maximum write batch size of "
                                           << BatchedCommandRequest::kMaxWriteBatchSize),
@@ -233,7 +207,7 @@ void ClusterWriter::write(const BatchedCommandRequest& origRequest,
     }
 
     string errMsg;
-    if (request.isInsertIndexRequest() && !request.isValidIndexRequest(&errMsg)) {
+    if (request->isInsertIndexRequest() && !request->isValidIndexRequest(&errMsg)) {
         toBatchError(Status(ErrorCodes::InvalidOptions, errMsg), response);
         return;
     }
@@ -241,49 +215,79 @@ void ClusterWriter::write(const BatchedCommandRequest& origRequest,
     // Config writes and shard writes are done differently
     const string dbName = nss.db().toString();
 
+    unique_ptr<BatchedCommandRequest> requestWithWriteConcern;
     if (dbName == "config" || dbName == "admin") {
-        grid.catalogManager()->writeConfigServerDirect(request, response);
-    } else {
-        ChunkManagerTargeter targeter(request.getTargetingNSS());
-        Status targetInitStatus = targeter.init();
-
-        if (!targetInitStatus.isOK()) {
-            // Errors will be reported in response if we are unable to target
-            warning() << "could not initialize targeter for"
-                      << (request.isInsertIndexRequest() ? " index" : "")
-                      << " write op in collection " << request.getTargetingNS();
+        // w:majority is the only valid write concern for writes to the config servers.
+        // We also allow w:1 to come in on a user-initiated write, though we convert it here to
+        // w:majority before sending it to the config servers.
+        bool rewriteCmdWithWriteConcern = false;
+        WriteConcernOptions writeConcern;
+        if (request->isWriteConcernSet()) {
+            Status status = writeConcern.parse(request->getWriteConcern());
+            if (!status.isOK()) {
+                toBatchError(status, response);
+                return;
+            }
+            if (!writeConcern.validForConfigServers()) {
+                toBatchError(Status(ErrorCodes::InvalidOptions,
+                                    "Invalid replication write concern.  Writes to config servers "
+                                    "must use w:'majority'"),
+                             response);
+                return;
+            }
+            if (writeConcern.wMode == "") {
+                invariant(writeConcern.wNumNodes == 1);
+                rewriteCmdWithWriteConcern = true;
+            }
+        } else {
+            rewriteCmdWithWriteConcern = true;
         }
 
-        DBClientShardResolver resolver;
-        DBClientMultiCommand dispatcher;
-        BatchWriteExec exec(&targeter, &resolver, &dispatcher);
-        exec.executeBatch(request, response);
+        if (rewriteCmdWithWriteConcern) {
+            requestWithWriteConcern.reset(new BatchedCommandRequest(request->getBatchType()));
+            request->cloneTo(requestWithWriteConcern.get());
+            writeConcern.wMode = WriteConcernOptions::kMajority;
+            writeConcern.wNumNodes = 0;
+            requestWithWriteConcern->setWriteConcern(writeConcern.toBSON());
+            request = requestWithWriteConcern.get();
+        }
+
+        grid.catalogManager(txn)->writeConfigServerDirect(txn, *request, response);
+    } else {
+        TargeterStats targeterStats;
+
+        {
+            ChunkManagerTargeter targeter(request->getTargetingNSS(), &targeterStats);
+
+            Status targetInitStatus = targeter.init(txn);
+            if (!targetInitStatus.isOK()) {
+                toBatchError(Status(targetInitStatus.code(),
+                                    str::stream()
+                                        << "unable to target"
+                                        << (request->isInsertIndexRequest() ? " index" : "")
+                                        << " write op for collection " << request->getTargetingNS()
+                                        << causedBy(targetInitStatus)),
+                             response);
+                return;
+            }
+
+            DBClientShardResolver resolver;
+            DBClientMultiCommand dispatcher;
+            BatchWriteExec exec(&targeter, &resolver, &dispatcher);
+            exec.executeBatch(txn, *request, response, &_stats);
+        }
 
         if (_autoSplit) {
-            splitIfNeeded(request.getNS(), *targeter.getStats());
+            splitIfNeeded(txn, request->getNS(), targeterStats);
         }
-
-        _stats->setShardStats(exec.releaseStats());
     }
 }
 
 ClusterWriter::ClusterWriter(bool autoSplit, int timeoutMillis)
-    : _autoSplit(autoSplit), _timeoutMillis(timeoutMillis), _stats(new ClusterWriterStats) {}
+    : _autoSplit(autoSplit), _timeoutMillis(timeoutMillis) {}
 
-const ClusterWriterStats& ClusterWriter::getStats() {
-    return *_stats;
-}
-
-void ClusterWriterStats::setShardStats(BatchWriteExecStats* shardStats) {
-    _shardStats.reset(shardStats);
-}
-
-bool ClusterWriterStats::hasShardStats() const {
-    return NULL != _shardStats.get();
-}
-
-const BatchWriteExecStats& ClusterWriterStats::getShardStats() const {
-    return *_shardStats;
+const BatchWriteExecStats& ClusterWriter::getStats() {
+    return _stats;
 }
 
 }  // namespace mongo

@@ -36,6 +36,7 @@
 #include <memory>
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
@@ -51,12 +52,14 @@ double numberMin = -numeric_limits<double>::max();
 double numberMax = numeric_limits<double>::max();
 double negativeInfinity = -numeric_limits<double>::infinity();
 double positiveInfinity = numeric_limits<double>::infinity();
+double NaN = numeric_limits<double>::quiet_NaN();
 
 /**
  * Utility function to create MatchExpression
  */
 MatchExpression* parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
     ASSERT_TRUE(status.isOK());
     MatchExpression* expr(status.getValue().release());
     return expr;
@@ -278,6 +281,25 @@ TEST(IndexBoundsBuilderTest, TranslateLtDate) {
                   oil.intervals[0].compare(
                       Interval(fromjson("{'': true, '': new Date(5000)}"), false, false)));
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+}
+
+TEST(IndexBoundsBuilderTest, TranslateGtTimestamp) {
+    IndexEntry testIndex = IndexEntry(BSONObj());
+    BSONObj obj = BSON("a" << GT << Timestamp(2, 3));
+    unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
+    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
+                  //  Constant below is ~0U, or 2**32 - 1, but cannot be written that way in JS
+                  oil.intervals[0].compare(Interval(
+                      fromjson("{'': Timestamp(2, 3), '': Timestamp(4294967295, 4294967295)}"),
+                      false,
+                      true)));
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
 }
 
 TEST(IndexBoundsBuilderTest, TranslateGtNumber) {
@@ -897,7 +919,7 @@ TEST(IndexBoundsBuilderTest, TranslateMod) {
     ASSERT_EQUALS(oil.intervals.size(), 1U);
     ASSERT_EQUALS(
         Interval::INTERVAL_EQUALS,
-        oil.intervals[0].compare(Interval(BSON("" << numberMin << "" << numberMax), true, true)));
+        oil.intervals[0].compare(Interval(BSON("" << NaN << "" << positiveInfinity), true, true)));
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
 }
 
@@ -1438,4 +1460,28 @@ TEST(IndexBoundsBuilderTest, CodeWithScopeTypeBounds) {
     ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
 }
 
+// Test $type bounds for double BSON type.
+TEST(IndexBoundsBuilderTest, DoubleTypeBounds) {
+    IndexEntry testIndex = IndexEntry(BSONObj());
+    BSONObj obj = fromjson("{a: {$type: 1}}");
+    unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+    // Build the expected interval.
+    BSONObjBuilder bob;
+    bob.appendNumber("", NaN);
+    bob.appendNumber("", positiveInfinity);
+    BSONObj expectedInterval = bob.obj();
+
+    // Check the output of translate().
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
+    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
+                  oil.intervals[0].compare(Interval(expectedInterval, true, true)));
+    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+}
 }  // namespace

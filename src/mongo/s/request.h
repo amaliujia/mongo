@@ -27,7 +27,6 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
 #include "mongo/db/dbmessage.h"
@@ -36,6 +35,7 @@
 namespace mongo {
 
 class Client;
+class OperationContext;
 
 class Request {
     MONGO_DISALLOW_COPYING(Request);
@@ -45,6 +45,10 @@ public:
 
     const char* getns() const {
         return _d.getns();
+    }
+
+    const char* getnsIfPresent() const {
+        return _d.messageShouldHaveNs() ? _d.getns() : "";
     }
 
     int op() const {
@@ -61,8 +65,6 @@ public:
         return _id;
     }
 
-    void reply(Message& response, const std::string& fromServer);
-
     Message& m() {
         return _m;
     }
@@ -73,9 +75,9 @@ public:
         return _p;
     }
 
-    void process(int attempt = 0);
+    void process(OperationContext* txn, int attempt = 0);
 
-    void init();
+    void init(OperationContext* txn);
 
 private:
     Client* const _clientInfo;

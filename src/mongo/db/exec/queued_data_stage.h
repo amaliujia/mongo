@@ -45,25 +45,15 @@ class RecordId;
  * queue.  Calls to QueuedDataStage::work() pop values off that queue and return them in FIFO
  * order, annotating the working set with data when appropriate.
  */
-class QueuedDataStage : public PlanStage {
+class QueuedDataStage final : public PlanStage {
 public:
-    QueuedDataStage(WorkingSet* ws);
-    virtual ~QueuedDataStage() {}
+    QueuedDataStage(OperationContext* opCtx, WorkingSet* ws);
 
-    virtual StageState work(WorkingSetID* out);
+    StageState doWork(WorkingSetID* out) final;
 
-    virtual bool isEOF();
+    bool isEOF() final;
 
-    // These don't really mean anything here.
-    // Some day we could count the # of calls to the yield functions to check that other stages
-    // have correct yielding behavior.
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_QUEUED_DATA;
     }
 
@@ -71,11 +61,9 @@ public:
     // Exec stats
     //
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const CommonStats* getCommonStats() const;
-
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     /**
      * Add a result to the back of the queue.
@@ -110,7 +98,6 @@ private:
     std::queue<WorkingSetID> _members;
 
     // Stats
-    CommonStats _commonStats;
     MockStats _specificStats;
 };
 

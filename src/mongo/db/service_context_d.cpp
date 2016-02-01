@@ -42,7 +42,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -50,11 +50,15 @@
 #include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/system_clock_source.h"
+#include "mongo/util/system_tick_source.h"
 
 namespace mongo {
 
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextMongoD>());
+    getGlobalServiceContext()->setTickSource(stdx::make_unique<SystemTickSource>());
+    getGlobalServiceContext()->setClockSource(stdx::make_unique<SystemClockSource>());
     return Status::OK();
 }
 
@@ -70,6 +74,22 @@ StorageEngine* ServiceContextMongoD::getGlobalStorageEngine() {
 }
 
 extern bool _supportsDocLocking;
+
+void ServiceContextMongoD::createLockFile() {
+    try {
+        _lockFile.reset(new StorageEngineLockFile(storageGlobalParams.dbpath));
+    } catch (const std::exception& ex) {
+        uassert(28596,
+                str::stream() << "Unable to determine status of lock file in the data directory "
+                              << storageGlobalParams.dbpath << ": " << ex.what(),
+                false);
+    }
+    bool wasUnclean = _lockFile->createdByUncleanShutdown();
+    uassertStatusOK(_lockFile->open());
+    if (wasUnclean) {
+        warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
+    }
+}
 
 void ServiceContextMongoD::initializeGlobalStorageEngine() {
     // This should be set once.
@@ -120,6 +140,14 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
                           << storageGlobalParams.engine,
             factory);
 
+    if (storageGlobalParams.readOnly) {
+        uassert(34368,
+                str::stream()
+                    << "Server was started in read-only mode, but the configured storage engine, "
+                    << storageGlobalParams.engine << ", does not support read-only operation",
+                factory->supportsReadOnly());
+    }
+
     std::unique_ptr<StorageEngineMetadata> metadata = StorageEngineMetadata::forPath(dbpath);
 
     // Validate options in metadata against current startup options.
@@ -127,19 +155,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
         uassertStatusOK(factory->validateMetadata(*metadata, storageGlobalParams));
     }
 
-    try {
-        _lockFile.reset(new StorageEngineLockFile(storageGlobalParams.dbpath));
-    } catch (const std::exception& ex) {
-        uassert(28596,
-                str::stream() << "Unable to determine status of lock file in the data directory "
-                              << storageGlobalParams.dbpath << ": " << ex.what(),
-                false);
-    }
-    if (_lockFile->createdByUncleanShutdown()) {
-        warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
-    }
-    uassertStatusOK(_lockFile->open());
-
+    invariant(_lockFile);
     ScopeGuard guard = MakeGuard(&StorageEngineLockFile::close, _lockFile.get());
     _storageEngine = factory->create(storageGlobalParams, *_lockFile);
     _storageEngine->finishInit();
@@ -216,21 +232,9 @@ bool ServiceContextMongoD::getKillAllOperations() {
     return _globalKill;
 }
 
-bool ServiceContextMongoD::_killOperationsAssociatedWithClientAndOpId_inlock(Client* client,
-                                                                             unsigned int opId) {
-    OperationContext* opCtx = client->getOperationContext();
-    if (!opCtx) {
-        return false;
-    }
-    if (opCtx->getOpID() != opId) {
-        return false;
-    }
-    _killOperation_inlock(opCtx);
-    return true;
-}
-
-void ServiceContextMongoD::_killOperation_inlock(OperationContext* opCtx) {
-    opCtx->markKilled();
+void ServiceContextMongoD::_killOperation_inlock(OperationContext* opCtx,
+                                                 ErrorCodes::Error killCode) {
+    opCtx->markKilled(killCode);
 
     for (const auto listener : _killOpListeners) {
         try {
@@ -244,8 +248,10 @@ void ServiceContextMongoD::_killOperation_inlock(OperationContext* opCtx) {
 bool ServiceContextMongoD::killOperation(unsigned int opId) {
     for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
         stdx::lock_guard<Client> lk(*client);
-        bool found = _killOperationsAssociatedWithClientAndOpId_inlock(client, opId);
-        if (found) {
+
+        OperationContext* opCtx = client->getOperationContext();
+        if (opCtx && opCtx->getOpID() == opId) {
+            _killOperation_inlock(opCtx, ErrorCodes::Interrupted);
             return true;
         }
     }
@@ -253,7 +259,8 @@ bool ServiceContextMongoD::killOperation(unsigned int opId) {
     return false;
 }
 
-void ServiceContextMongoD::killAllUserOperations(const OperationContext* txn) {
+void ServiceContextMongoD::killAllUserOperations(const OperationContext* txn,
+                                                 ErrorCodes::Error killCode) {
     for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
         if (!client->isFromUserConnection()) {
             // Don't kill system operations.
@@ -262,16 +269,11 @@ void ServiceContextMongoD::killAllUserOperations(const OperationContext* txn) {
 
         stdx::lock_guard<Client> lk(*client);
         OperationContext* toKill = client->getOperationContext();
-        if (!toKill) {
-            continue;
-        }
 
-        if (toKill->getOpID() == txn->getOpID()) {
-            // Don't kill ourself.
-            continue;
+        // Don't kill ourself.
+        if (toKill && toKill->getOpID() != txn->getOpID()) {
+            _killOperation_inlock(toKill, killCode);
         }
-
-        _killOperation_inlock(toKill);
     }
 }
 

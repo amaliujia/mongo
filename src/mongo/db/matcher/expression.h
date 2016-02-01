@@ -41,7 +41,10 @@
 
 namespace mongo {
 
+class MatchExpression;
 class TreeMatchExpression;
+
+typedef StatusWith<std::unique_ptr<MatchExpression>> StatusWithMatchExpression;
 
 class MatchExpression {
     MONGO_DISALLOW_COPYING(MatchExpression);
@@ -67,6 +70,10 @@ public:
         MOD,
         EXISTS,
         MATCH_IN,
+        BITS_ALL_SET,
+        BITS_ALL_CLEAR,
+        BITS_ANY_SET,
+        BITS_ANY_CLEAR,
 
         // Negations.
         NOT,

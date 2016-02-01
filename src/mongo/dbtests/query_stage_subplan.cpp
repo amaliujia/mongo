@@ -37,6 +37,8 @@
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
@@ -44,25 +46,23 @@
 
 namespace QueryStageSubplan {
 
+static const NamespaceString nss("unittests.QueryStageSubplan");
+
 class QueryStageSubplanBase {
 public:
     QueryStageSubplanBase() : _client(&_txn) {}
 
     virtual ~QueryStageSubplanBase() {
-        OldClientWriteContext ctx(&_txn, ns());
-        _client.dropCollection(ns());
+        OldClientWriteContext ctx(&_txn, nss.ns());
+        _client.dropCollection(nss.ns());
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_txn, nss.ns(), obj));
     }
 
     void insert(const BSONObj& doc) {
-        _client.insert(ns(), doc);
-    }
-
-    static const char* ns() {
-        return "unittests.QueryStageSubplan";
+        _client.insert(nss.ns(), doc);
     }
 
 protected:
@@ -72,12 +72,12 @@ protected:
     std::unique_ptr<CanonicalQuery> cqFromFindCommand(const std::string& findCmd) {
         BSONObj cmdObj = fromjson(findCmd);
 
-        const NamespaceString nss("testns.testcoll");
         bool isExplain = false;
         auto lpq =
             unittest::assertGet(LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain));
 
-        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(lpq.release()));
+        auto cq = unittest::assertGet(
+            CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackNoop()));
         return cq;
     }
 
@@ -96,7 +96,7 @@ private:
 class QueryStageSubplanGeo2dOr : public QueryStageSubplanBase {
 public:
     void run() {
-        OldClientWriteContext ctx(&_txn, ns());
+        OldClientWriteContext ctx(&_txn, nss.ns());
         addIndex(BSON("a"
                       << "2d"
                       << "b" << 1));
@@ -107,7 +107,8 @@ public:
             "{$or: [{a: {$geoWithin: {$centerSphere: [[0,0],10]}}},"
             "{a: {$geoWithin: {$centerSphere: [[1,1],10]}}}]}");
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns(), query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -133,7 +134,7 @@ public:
 class QueryStageSubplanPlanFromCache : public QueryStageSubplanBase {
 public:
     void run() {
-        OldClientWriteContext ctx(&_txn, ns());
+        OldClientWriteContext ctx(&_txn, nss.ns());
 
         addIndex(BSON("a" << 1));
         addIndex(BSON("a" << 1 << "b" << 1));
@@ -150,7 +151,8 @@ public:
 
         Collection* collection = ctx.getCollection();
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(ns(), query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -178,6 +180,120 @@ public:
         ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
         ASSERT_TRUE(subplan->branchPlannedFromCache(0));
+        ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+    }
+};
+
+/**
+ * Ensure that the subplan stage doesn't create a plan cache entry if there are no query results.
+ */
+class QueryStageSubplanDontCacheZeroResults : public QueryStageSubplanBase {
+public:
+    void run() {
+        OldClientWriteContext ctx(&_txn, nss.ns());
+
+        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("c" << 1));
+
+        for (int i = 0; i < 10; i++) {
+            insert(BSON("a" << 1 << "b" << i << "c" << i));
+        }
+
+        // Running this query should not create any cache entries. For the first branch, it's
+        // because there are no matching results. For the second branch it's because there is only
+        // one relevant index.
+        BSONObj query = fromjson("{$or: [{a: 1, b: 15}, {c: 1}]}");
+
+        Collection* collection = ctx.getCollection();
+
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
+        ASSERT_OK(statusWithCQ.getStatus());
+        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+        // Get planner params.
+        QueryPlannerParams plannerParams;
+        fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
+
+        WorkingSet ws;
+        std::unique_ptr<SubplanStage> subplan(
+            new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+        PlanYieldPolicy yieldPolicy(nullptr, PlanExecutor::YIELD_MANUAL);
+        ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+        // Nothing is in the cache yet, so neither branch should have been planned from
+        // the plan cache.
+        ASSERT_FALSE(subplan->branchPlannedFromCache(0));
+        ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+
+        // If we run the query again, it should again be the case that neither branch gets planned
+        // from the cache (because the first call to pickBestPlan() refrained from creating any
+        // cache entries).
+        ws.clear();
+        subplan.reset(new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+        ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+        ASSERT_FALSE(subplan->branchPlannedFromCache(0));
+        ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+    }
+};
+
+/**
+ * Ensure that the subplan stage doesn't create a plan cache entry if there are no query results.
+ */
+class QueryStageSubplanDontCacheTies : public QueryStageSubplanBase {
+public:
+    void run() {
+        OldClientWriteContext ctx(&_txn, nss.ns());
+
+        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("a" << 1 << "c" << 1));
+        addIndex(BSON("d" << 1));
+
+        for (int i = 0; i < 10; i++) {
+            insert(BSON("a" << 1 << "e" << 1 << "d" << 1));
+        }
+
+        // Running this query should not create any cache entries. For the first branch, it's
+        // because plans using the {a: 1, b: 1} and {a: 1, c: 1} indices should tie during plan
+        // ranking. For the second branch it's because there is only one relevant index.
+        BSONObj query = fromjson("{$or: [{a: 1, e: 1}, {d: 1}]}");
+
+        Collection* collection = ctx.getCollection();
+
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
+        ASSERT_OK(statusWithCQ.getStatus());
+        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+        // Get planner params.
+        QueryPlannerParams plannerParams;
+        fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
+
+        WorkingSet ws;
+        std::unique_ptr<SubplanStage> subplan(
+            new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+        PlanYieldPolicy yieldPolicy(nullptr, PlanExecutor::YIELD_MANUAL);
+        ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+        // Nothing is in the cache yet, so neither branch should have been planned from
+        // the plan cache.
+        ASSERT_FALSE(subplan->branchPlannedFromCache(0));
+        ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+
+        // If we run the query again, it should again be the case that neither branch gets planned
+        // from the cache (because the first call to pickBestPlan() refrained from creating any
+        // cache entries).
+        ws.clear();
+        subplan.reset(new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+        ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+        ASSERT_FALSE(subplan->branchPlannedFromCache(0));
         ASSERT_FALSE(subplan->branchPlannedFromCache(1));
     }
 };
@@ -276,23 +392,27 @@ public:
             ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq2));
         }
 
-        // Can use subplanning for a single contained $or.
+        // Can't use subplanning for a single contained $or.
+        //
+        // TODO: Consider allowing this to use subplanning (see SERVER-13732).
         {
             std::string findCmd =
                 "{find: 'testns',"
                 "filter: {e: 1, $or: [{a:1, b:1}, {c:1, d:1}]}}";
             std::unique_ptr<CanonicalQuery> cq = cqFromFindCommand(findCmd);
-            ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq));
+            ASSERT_FALSE(SubplanStage::canUseSubplanning(*cq));
         }
 
-        // Can use subplanning if the contained $or query has a geo predicate.
+        // Can't use subplanning if the contained $or query has a geo predicate.
+        //
+        // TODO: Consider allowing this to use subplanning (see SERVER-13732).
         {
             std::string findCmd =
                 "{find: 'testns',"
                 "filter: {loc: {$geoWithin: {$centerSphere: [[0,0], 1]}},"
                 "e: 1, $or: [{a:1, b:1}, {c:1, d:1}]}}";
             std::unique_ptr<CanonicalQuery> cq = cqFromFindCommand(findCmd);
-            ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq));
+            ASSERT_FALSE(SubplanStage::canUseSubplanning(*cq));
         }
 
         // Can't use subplanning if the contained $or query also has a $text predicate.
@@ -326,7 +446,8 @@ public:
         // Rewrite (AND (OR a b) e) => (OR (AND a e) (AND b e))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1}, {b:1}], e:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -342,7 +463,8 @@ public:
         // Rewrite (AND (OR a b) e f) => (OR (AND a e f) (AND b e f))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1}, {b:1}], e:1, f:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -358,7 +480,8 @@ public:
         // Rewrite (AND (OR (AND a b) (AND c d) e f) => (OR (AND a b e f) (AND c d e f))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1,b:1}, {c:1,d:1}], e:1,f:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -377,10 +500,10 @@ public:
 /**
  * Test the subplan stage's ability to answer a contained $or query.
  */
-class QueryStageSubplanPlanRootedOr : public QueryStageSubplanBase {
+class QueryStageSubplanPlanContainedOr : public QueryStageSubplanBase {
 public:
     void run() {
-        OldClientWriteContext ctx(&_txn, ns());
+        OldClientWriteContext ctx(&_txn, nss.ns());
         addIndex(BSON("b" << 1 << "a" << 1));
         addIndex(BSON("c" << 1 << "a" << 1));
 
@@ -392,7 +515,8 @@ public:
         insert(BSON("_id" << 3 << "a" << 1 << "c" << 3));
         insert(BSON("_id" << 4 << "a" << 1 << "c" << 4));
 
-        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(ns(), query));
+        auto cq = unittest::assertGet(
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions()));
 
         Collection* collection = ctx.getCollection();
 
@@ -405,7 +529,7 @@ public:
             new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
 
         // Plan selection should succeed due to falling back on regular planning.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(nullptr, PlanExecutor::YIELD_MANUAL);
         ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
         // Work the stage until it produces all results.
@@ -430,6 +554,58 @@ public:
     }
 };
 
+/**
+ * Test the subplan stage's ability to answer a rooted $or query with a $ne and a sort.
+ *
+ * Regression test for SERVER-19388.
+ */
+class QueryStageSubplanPlanRootedOrNE : public QueryStageSubplanBase {
+public:
+    void run() {
+        OldClientWriteContext ctx(&_txn, nss.ns());
+        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("a" << 1 << "c" << 1));
+
+        // Every doc matches.
+        insert(BSON("_id" << 1 << "a" << 1));
+        insert(BSON("_id" << 2 << "a" << 2));
+        insert(BSON("_id" << 3 << "a" << 3));
+        insert(BSON("_id" << 4));
+
+        BSONObj query = fromjson("{$or: [{a: 1}, {a: {$ne:1}}]}");
+        BSONObj sort = BSON("d" << 1);
+        BSONObj projection;
+        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(
+            nss, query, sort, projection, ExtensionsCallbackDisallowExtensions()));
+
+        Collection* collection = ctx.getCollection();
+
+        QueryPlannerParams plannerParams;
+        fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
+
+        WorkingSet ws;
+        std::unique_ptr<SubplanStage> subplan(
+            new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+        PlanYieldPolicy yieldPolicy(nullptr, PlanExecutor::YIELD_MANUAL);
+        ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+        size_t numResults = 0;
+        PlanStage::StageState stageState = PlanStage::NEED_TIME;
+        while (stageState != PlanStage::IS_EOF) {
+            WorkingSetID id = WorkingSet::INVALID_ID;
+            stageState = subplan->work(&id);
+            ASSERT_NE(stageState, PlanStage::DEAD);
+            ASSERT_NE(stageState, PlanStage::FAILURE);
+            if (stageState == PlanStage::ADVANCED) {
+                ++numResults;
+            }
+        }
+
+        ASSERT_EQ(numResults, 4U);
+    }
+};
+
 class All : public Suite {
 public:
     All() : Suite("query_stage_subplan") {}
@@ -437,9 +613,12 @@ public:
     void setupTests() {
         add<QueryStageSubplanGeo2dOr>();
         add<QueryStageSubplanPlanFromCache>();
+        add<QueryStageSubplanDontCacheZeroResults>();
+        add<QueryStageSubplanDontCacheTies>();
         add<QueryStageSubplanCanUseSubplanning>();
         add<QueryStageSubplanRewriteToRootedOr>();
-        add<QueryStageSubplanPlanRootedOr>();
+        add<QueryStageSubplanPlanContainedOr>();
+        add<QueryStageSubplanPlanRootedOrNE>();
     }
 };
 

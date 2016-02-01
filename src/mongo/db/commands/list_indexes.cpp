@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/cursor_manager.h"
@@ -41,16 +42,19 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/cursor_responses.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using std::string;
 using std::stringstream;
+using std::unique_ptr;
 using std::vector;
+using stdx::make_unique;
 
 /**
  * Lists the indexes for a given collection.
@@ -86,12 +90,25 @@ public:
         help << "list indexes for a collection";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::listIndexes);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+
+        // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
+        // 3.0 systems.
+        NamespaceString ns(parseNs(dbname, cmdObj));
+        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
+                                                           ActionType::listIndexes) ||
+            authzSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(dbname, "system.indexes")),
+                ActionType::find)) {
+            return Status::OK();
+        }
+
+        return Status(ErrorCodes::Unauthorized,
+                      str::stream()
+                          << "Not authorized to list indexes on collection: " << ns.coll());
     }
 
     CmdListIndexes() : Command("listIndexes") {}
@@ -143,8 +160,8 @@ public:
         }
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
 
-        std::unique_ptr<WorkingSet> ws(new WorkingSet());
-        std::unique_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
+        auto ws = make_unique<WorkingSet>();
+        auto root = make_unique<QueuedDataStage>(txn, ws.get());
 
         for (size_t i = 0; i < indexNames.size(); i++) {
             BSONObj indexSpec;
@@ -173,27 +190,36 @@ public:
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
-        const int byteLimit = MaxBytesToReturnToClientAtOnce;
-        for (long long objCount = 0; objCount < batchSize && firstBatch.len() < byteLimit;
-             objCount++) {
+        for (long long objCount = 0; objCount < batchSize; objCount++) {
             BSONObj next;
             PlanExecutor::ExecState state = exec->getNext(&next, NULL);
             if (state == PlanExecutor::IS_EOF) {
                 break;
             }
             invariant(state == PlanExecutor::ADVANCED);
+
+            // If we can't fit this result inside the current batch, then we stash it for later.
+            if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
+                exec->enqueue(next);
+                break;
+            }
+
             firstBatch.append(next);
         }
 
         CursorId cursorId = 0LL;
         if (!exec->isEOF()) {
             exec->saveState();
-            ClientCursor* cursor = new ClientCursor(
-                CursorManager::getGlobalCursorManager(), exec.release(), cursorNamespace);
+            exec->detachFromOperationContext();
+            ClientCursor* cursor =
+                new ClientCursor(CursorManager::getGlobalCursorManager(),
+                                 exec.release(),
+                                 cursorNamespace,
+                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
             cursorId = cursor->cursorid();
         }
 

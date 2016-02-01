@@ -30,6 +30,7 @@
 
 #include "mongo/db/catalog/coll_mod.h"
 
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
@@ -49,6 +50,10 @@ Status collMod(OperationContext* txn,
     AutoGetDb autoDb(txn, dbName, MODE_X);
     Database* const db = autoDb.getDb();
     Collection* coll = db ? db->getCollection(nss) : NULL;
+
+    // This can kill all cursors so don't allow running it while a background operation is in
+    // progress.
+    BackgroundOperation::assertNoBgOpInProgForNs(nss);
 
     // If db/collection does not exist, short circuit and return.
     if (!db || !coll) {
@@ -134,8 +139,8 @@ Status collMod(OperationContext* txn,
             auto status = coll->setValidationLevel(txn, e.String());
             if (!status.isOK())
                 errorStatus = std::move(status);
-        } else if (str::equals("validationState", e.fieldName())) {
-            auto status = coll->setValidationState(txn, e.String());
+        } else if (str::equals("validationAction", e.fieldName())) {
+            auto status = coll->setValidationAction(txn, e.String());
             if (!status.isOK())
                 errorStatus = std::move(status);
         } else {

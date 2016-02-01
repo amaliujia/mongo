@@ -33,7 +33,7 @@
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/fts/fts_query.h"
+#include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_util.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -43,7 +43,7 @@ namespace mongo {
 using std::unique_ptr;
 using std::vector;
 
-using fts::FTSQuery;
+using fts::FTSQueryImpl;
 using fts::FTSSpec;
 
 class OperationContext;
@@ -61,7 +61,7 @@ struct TextStageParams {
     BSONObj indexPrefix;
 
     // The text query.
-    FTSQuery query;
+    FTSQueryImpl query;
 };
 
 /**
@@ -69,31 +69,22 @@ struct TextStageParams {
  *
  * Output type: LOC_AND_OBJ.
  */
-class TextStage : public PlanStage {
+class TextStage final : public PlanStage {
 public:
     TextStage(OperationContext* txn,
               const TextStageParams& params,
               WorkingSet* ws,
               const MatchExpression* filter);
 
-    ~TextStage() final;
 
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
     bool isEOF() final;
-
-    void saveState() final;
-    void restoreState(OperationContext* opCtx) final;
-    void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
-
-    vector<PlanStage*> getChildren() const;
 
     StageType stageType() const final {
         return STAGE_TEXT;
     }
 
     std::unique_ptr<PlanStageStats> getStats();
-
-    const CommonStats* getCommonStats() const final;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -110,11 +101,7 @@ private:
     // Parameters of this text stage.
     TextStageParams _params;
 
-    // The root of the text query tree.
-    unique_ptr<PlanStage> _textTreeRoot;
-
     // Stats.
-    CommonStats _commonStats;
     TextStats _specificStats;
 };
 

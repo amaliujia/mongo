@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,7 +13,7 @@
  *	Lock/unlock a byte in a file.
  */
 int
-__wt_bytelock(WT_FH *fhp, wt_off_t byte, int lock)
+__wt_bytelock(WT_FH *fhp, wt_off_t byte, bool lock)
 {
 	struct flock fl;
 	WT_DECL_RET;

@@ -45,29 +45,40 @@ class DistributedLock;
 
 class LegacyDistLockManager : public DistLockManager {
 public:
-    explicit LegacyDistLockManager(ConnectionString configServer);
+    explicit LegacyDistLockManager(ConnectionString configServer, const std::string& processId);
 
     virtual ~LegacyDistLockManager() = default;
 
     virtual void startUp() override;
-    virtual void shutDown() override;
+    virtual void shutDown(OperationContext* txn, bool allowNetworking) override;
+
+    virtual std::string getProcessID() override;
 
     virtual StatusWith<DistLockManager::ScopedDistLock> lock(
+        OperationContext* txn,
         StringData name,
         StringData whyMessage,
         stdx::chrono::milliseconds waitFor,
         stdx::chrono::milliseconds lockTryInterval) override;
 
-    // For testing only.
-    void enablePinger(bool enable);
+    virtual void unlockAll(OperationContext* txn, const std::string& processID) override;
+
+    // For testing only.  Must be called before any calls to startUp().
+    static void disablePinger() {
+        _pingerEnabled = false;
+    }
 
 protected:
-    virtual void unlock(const DistLockHandle& lockHandle) BOOST_NOEXCEPT override;
+    virtual void unlock(OperationContext* txn,
+                        const DistLockHandle& lockHandle) BOOST_NOEXCEPT override;
 
-    virtual Status checkStatus(const DistLockHandle& lockHandle) override;
+    virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) override;
 
 private:
     const ConnectionString _configServer;
+
+    // Identifier of this process for determining ownership of distributed locks.
+    std::string _processId;
 
     stdx::mutex _mutex;
     stdx::condition_variable _noLocksCV;
@@ -76,8 +87,6 @@ private:
     std::unique_ptr<LegacyDistLockPinger> _pinger;
 
     bool _isStopped;
-
-    // For testing only.
-    bool _pingerEnabled;
+    static bool _pingerEnabled;
 };
 }

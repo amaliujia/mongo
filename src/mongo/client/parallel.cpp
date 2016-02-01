@@ -34,7 +34,6 @@
 
 #include "mongo/client/parallel.h"
 
-
 #include "mongo/client/connpool.h"
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclientcursor.h"
@@ -47,13 +46,11 @@
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/version_manager.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::shared_ptr;
-using std::endl;
 using std::list;
 using std::map;
 using std::set;
@@ -63,13 +60,13 @@ using std::vector;
 
 LabeledLevel pc("pcursor", 2);
 
-void ParallelSortClusteredCursor::init() {
+void ParallelSortClusteredCursor::init(OperationContext* txn) {
     if (_didInit)
         return;
     _didInit = true;
 
     if (!_qSpec.isEmpty()) {
-        fullInit();
+        fullInit(txn);
     } else {
         // You can only get here by using the legacy constructor
         // TODO: Eliminate this
@@ -77,17 +74,11 @@ void ParallelSortClusteredCursor::init() {
     }
 }
 
-string ParallelSortClusteredCursor::getNS() {
-    if (!_qSpec.isEmpty())
-        return _qSpec.ns();
-    return _ns;
-}
-
 /**
  * Throws a RecvStaleConfigException wrapping the stale error document in this cursor when the
- * ShardConfigStale flag is set or a command returns a SendStaleConfigCode error code.
+ * ShardConfigStale flag is set or a command returns a ErrorCodes::SendStaleConfig error code.
  */
-static void throwCursorStale(DBClientCursor* cursor) {
+void throwCursorStale(DBClientCursor* cursor) {
     verify(cursor);
 
     if (cursor->hasResultFlag(ResultFlag_ShardConfigStale)) {
@@ -102,7 +93,7 @@ static void throwCursorStale(DBClientCursor* cursor) {
         // flag on the cursor.
         // TODO: Standardize stale config reporting.
         BSONObj res = cursor->peekFirst();
-        if (res.hasField("code") && res["code"].Number() == SendStaleConfigCode) {
+        if (res.hasField("code") && res["code"].Number() == ErrorCodes::SendStaleConfig) {
             throw RecvStaleConfigException("command returned a stale config error", res);
         }
     }
@@ -120,144 +111,11 @@ static void throwCursorError(DBClientCursor* cursor) {
     }
 }
 
-void ParallelSortClusteredCursor::explain(BSONObjBuilder& b) {
-    // Note: by default we filter out allPlans and oldPlan in the shell's
-    // explain() function. If you add any recursive structures, make sure to
-    // edit the JS to make sure everything gets filtered.
-
-    // Return single shard output if we're versioned but not sharded, or
-    // if we specified only a single shard
-    // TODO:  We should really make this simpler - all queries via mongos
-    // *always* get the same explain format
-    if (!isSharded()) {
-        map<string, list<BSONObj>> out;
-        _explain(out);
-        verify(out.size() == 1);
-        list<BSONObj>& l = out.begin()->second;
-        verify(l.size() == 1);
-        b.appendElements(*(l.begin()));
-        return;
-    }
-
-    b.append("clusteredType", type());
-
-    string cursorType;
-    BSONObj indexBounds;
-    BSONObj oldPlan;
-
-    long long millis = 0;
-    double numExplains = 0;
-
-    long long nReturned = 0;
-    long long keysExamined = 0;
-    long long docsExamined = 0;
-
-    map<string, list<BSONObj>> out;
-    {
-        _explain(out);
-
-        BSONObjBuilder x(b.subobjStart("shards"));
-        for (map<string, list<BSONObj>>::iterator i = out.begin(); i != out.end(); ++i) {
-            const ShardId& shardId = i->first;
-            list<BSONObj> l = i->second;
-            BSONArrayBuilder y(x.subarrayStart(shardId));
-            for (list<BSONObj>::iterator j = l.begin(); j != l.end(); ++j) {
-                BSONObj temp = *j;
-
-                // If appending the next output from the shard is going to make the BSON
-                // too large, then don't add it. We make sure the BSON doesn't get bigger
-                // than the allowable "user size" for a BSONObj. This leaves a little bit
-                // of extra space which mongos can use to add extra data.
-                if ((x.len() + temp.objsize()) > BSONObjMaxUserSize) {
-                    y.append(BSON("warning"
-                                  << "shard output omitted due to nearing 16 MB limit"));
-                    break;
-                }
-
-                y.append(temp);
-
-                if (temp.hasField("executionStats")) {
-                    // Here we assume that the shard gave us back explain 2.0 style output.
-                    BSONObj execStats = temp["executionStats"].Obj();
-                    if (execStats.hasField("nReturned")) {
-                        nReturned += execStats["nReturned"].numberLong();
-                    }
-                    if (execStats.hasField("totalKeysExamined")) {
-                        keysExamined += execStats["totalKeysExamined"].numberLong();
-                    }
-                    if (execStats.hasField("totalDocsExamined")) {
-                        docsExamined += execStats["totalDocsExamined"].numberLong();
-                    }
-                    if (execStats.hasField("executionTimeMillis")) {
-                        millis += execStats["executionTimeMillis"].numberLong();
-                    }
-                } else {
-                    // Here we assume that the shard gave us back explain 1.0 style output.
-                    if (temp.hasField("n")) {
-                        nReturned += temp["n"].numberLong();
-                    }
-                    if (temp.hasField("nscanned")) {
-                        keysExamined += temp["nscanned"].numberLong();
-                    }
-                    if (temp.hasField("nscannedObjects")) {
-                        docsExamined += temp["nscannedObjects"].numberLong();
-                    }
-                    if (temp.hasField("millis")) {
-                        millis += temp["millis"].numberLong();
-                    }
-                    if (String == temp["cursor"].type()) {
-                        if (cursorType.empty()) {
-                            cursorType = temp["cursor"].String();
-                        } else if (cursorType != temp["cursor"].String()) {
-                            cursorType = "multiple";
-                        }
-                    }
-                    if (Object == temp["indexBounds"].type()) {
-                        indexBounds = temp["indexBounds"].Obj();
-                    }
-                    if (Object == temp["oldPlan"].type()) {
-                        oldPlan = temp["oldPlan"].Obj();
-                    }
-                }
-
-                numExplains++;
-            }
-            y.done();
-        }
-        x.done();
-    }
-
-    if (!cursorType.empty()) {
-        b.append("cursor", cursorType);
-    }
-
-    b.appendNumber("n", nReturned);
-    b.appendNumber("nscanned", keysExamined);
-    b.appendNumber("nscannedObjects", docsExamined);
-
-    b.appendNumber("millisShardTotal", millis);
-    b.append("millisShardAvg",
-             numExplains ? static_cast<int>(static_cast<double>(millis) / numExplains) : 0);
-    b.append("numQueries", (int)numExplains);
-    b.append("numShards", (int)out.size());
-
-    if (out.size() == 1) {
-        b.append("indexBounds", indexBounds);
-        if (!oldPlan.isEmpty()) {
-            // this is to stay in compliance with mongod behavior
-            // we should make this cleaner, i.e. {} == nothing
-            b.append("oldPlan", oldPlan);
-        }
-    } else {
-        // TODO: this is lame...
-    }
-}
-
 // --------  ParallelSortClusteredCursor -----------
 
 ParallelSortClusteredCursor::ParallelSortClusteredCursor(const QuerySpec& qSpec,
                                                          const CommandInfo& cInfo)
-    : _qSpec(qSpec), _cInfo(cInfo), _totalTries(0) {
+    : _qSpec(qSpec), _cInfo(cInfo), _totalTries(0), _cmChangeAttempted(false) {
     _done = false;
     _didInit = false;
 
@@ -393,9 +251,9 @@ void ParallelConnectionMetadata::cleanup(bool full) {
                     bool retry = false;
                     pcState->cursor->initLazyFinish(retry);
                 } catch (std::exception&) {
-                    warning() << "exception closing cursor" << endl;
+                    warning() << "exception closing cursor";
                 } catch (...) {
-                    warning() << "unknown exception closing cursor" << endl;
+                    warning() << "unknown exception closing cursor";
                 }
             }
         }
@@ -460,46 +318,9 @@ BSONObj ParallelConnectionMetadata::toBSON() const {
                         << "init" << initialized << "finish" << finished << "errored" << errored);
 }
 
-BSONObj ParallelSortClusteredCursor::toBSON() const {
-    BSONObjBuilder b;
-
-    b.append("tries", _totalTries);
-
-    {
-        BSONObjBuilder bb;
-        for (map<ShardId, PCMData>::const_iterator i = _cursorMap.begin(), end = _cursorMap.end();
-             i != end;
-             ++i) {
-            const auto shard = grid.shardRegistry()->getShard(i->first);
-            if (!shard) {
-                continue;
-            }
-
-            bb.append(shard->toString(), i->second.toBSON());
-        }
-        b.append("cursors", bb.obj().getOwned());
-    }
-
-    {
-        BSONObjBuilder bb;
-        for (map<string, int>::const_iterator i = _staleNSMap.begin(), end = _staleNSMap.end();
-             i != end;
-             ++i) {
-            bb.append(i->first, i->second);
-        }
-        b.append("staleTries", bb.obj().getOwned());
-    }
-
-    return b.obj().getOwned();
-}
-
-string ParallelSortClusteredCursor::toString() const {
-    return str::stream() << "PCursor : " << toBSON();
-}
-
-void ParallelSortClusteredCursor::fullInit() {
-    startInit();
-    finishInit();
+void ParallelSortClusteredCursor::fullInit(OperationContext* txn) {
+    startInit(txn);
+    finishInit(txn);
 }
 
 void ParallelSortClusteredCursor::_markStaleNS(const NamespaceString& staleNS,
@@ -523,10 +344,11 @@ void ParallelSortClusteredCursor::_markStaleNS(const NamespaceString& staleNS,
     forceReload = tries > 2;
 }
 
-void ParallelSortClusteredCursor::_handleStaleNS(const NamespaceString& staleNS,
+void ParallelSortClusteredCursor::_handleStaleNS(OperationContext* txn,
+                                                 const NamespaceString& staleNS,
                                                  bool forceReload,
                                                  bool fullReload) {
-    auto status = grid.catalogCache()->getDatabase(staleNS.db().toString());
+    auto status = grid.catalogCache()->getDatabase(txn, staleNS.db().toString());
     if (!status.isOK()) {
         warning() << "cannot reload database info for stale namespace " << staleNS.ns();
         return;
@@ -535,7 +357,7 @@ void ParallelSortClusteredCursor::_handleStaleNS(const NamespaceString& staleNS,
     shared_ptr<DBConfig> config = status.getValue();
 
     // Reload db if needed, make sure it works
-    if (fullReload && !config->reload()) {
+    if (fullReload && !config->reload(txn)) {
         // We didn't find the db after reload, the db may have been dropped, reset this ptr
         config.reset();
     }
@@ -544,16 +366,18 @@ void ParallelSortClusteredCursor::_handleStaleNS(const NamespaceString& staleNS,
         warning() << "cannot reload database info for stale namespace " << staleNS.ns();
     } else {
         // Reload chunk manager, potentially forcing the namespace
-        config->getChunkManagerIfExists(staleNS.ns(), true, forceReload);
+        config->getChunkManagerIfExists(txn, staleNS.ns(), true, forceReload);
     }
 }
 
-void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(PCStatePtr state,
-                                                               const ShardId& shardId,
-                                                               std::shared_ptr<Shard> primary,
-                                                               const NamespaceString& ns,
-                                                               const string& vinfo,
-                                                               ChunkManagerPtr manager) {
+void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
+    OperationContext* txn,
+    PCStatePtr state,
+    const ShardId& shardId,
+    std::shared_ptr<Shard> primary,
+    const NamespaceString& ns,
+    const string& vinfo,
+    std::shared_ptr<ChunkManager> manager) {
     if (manager) {
         state->manager = manager;
     } else if (primary) {
@@ -564,72 +388,67 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(PCStatePtr state,
 
     // Setup conn
     if (!state->conn) {
-        const auto shard = grid.shardRegistry()->getShard(shardId);
+        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
         state->conn.reset(new ShardConnection(shard->getConnString(), ns.ns(), manager));
     }
 
     const DBClientBase* rawConn = state->conn->getRawConn();
     bool allowShardVersionFailure = rawConn->type() == ConnectionString::SET &&
         DBClientReplicaSet::isSecondaryQuery(_qSpec.ns(), _qSpec.query(), _qSpec.options());
-    bool connIsDown = rawConn->isFailed();
-    if (allowShardVersionFailure && !connIsDown) {
-        // If the replica set connection believes that it has a valid primary that is up,
-        // confirm that the replica set monitor agrees that the suspected primary is indeed up.
+
+    // Skip shard version checking if primary is known to be down.
+    if (allowShardVersionFailure) {
         const DBClientReplicaSet* replConn = dynamic_cast<const DBClientReplicaSet*>(rawConn);
         invariant(replConn);
         ReplicaSetMonitorPtr rsMonitor = ReplicaSetMonitor::get(replConn->getSetName());
-        if (!rsMonitor->isHostUp(replConn->getSuspectedPrimaryHostAndPort())) {
-            connIsDown = true;
+        if (!rsMonitor->isKnownToHaveGoodPrimary()) {
+            state->conn->donotCheckVersion();
+
+            // A side effect of this short circuiting is the mongos will not be able figure out
+            // that the primary is now up on it's own and has to rely on other threads to refresh
+            // node states.
+
+            OCCASIONALLY {
+                const DBClientReplicaSet* repl = dynamic_cast<const DBClientReplicaSet*>(rawConn);
+                dassert(repl);
+                warning() << "Primary for " << repl->getServerAddress()
+                          << " was down before, bypassing setShardVersion."
+                          << " The local replica set view and targeting may be stale.";
+            }
+
+            return;
         }
     }
 
-    if (allowShardVersionFailure && connIsDown) {
-        // If we're doing a secondary-allowed query and the primary is down, don't attempt to
-        // set the shard version.
-
-        state->conn->donotCheckVersion();
-
-        // A side effect of this short circuiting is the mongos will not be able figure out that
-        // the primary is now up on it's own and has to rely on other threads to refresh node
-        // states.
-
-        OCCASIONALLY {
-            const DBClientReplicaSet* repl = dynamic_cast<const DBClientReplicaSet*>(rawConn);
-            dassert(repl);
-            warning() << "Primary for " << repl->getServerAddress()
-                      << " was down before, bypassing setShardVersion."
-                      << " The local replica set view and targeting may be stale." << endl;
+    try {
+        if (state->conn->setVersion()) {
+            LOG(pc) << "needed to set remote version on connection to value "
+                    << "compatible with " << vinfo;
         }
-    } else {
-        try {
-            if (state->conn->setVersion()) {
-                // It's actually okay if we set the version here, since either the
-                // manager will be verified as compatible, or if the manager doesn't
-                // exist, we don't care about version consistency
-                LOG(pc) << "needed to set remote version on connection to value "
-                        << "compatible with " << vinfo << endl;
-            }
-        } catch (const DBException&) {
-            if (allowShardVersionFailure) {
-                // It's okay if we don't set the version when talking to a secondary, we can
-                // be stale in any case.
+    } catch (const DBException& dbExcep) {
+        auto errCode = dbExcep.getCode();
+        if (allowShardVersionFailure &&
+            (ErrorCodes::isNotMasterError(ErrorCodes::fromInt(errCode)) ||
+             errCode == ErrorCodes::FailedToSatisfyReadPreference ||
+             errCode == 9001)) {  // socket exception
+            // It's okay if we don't set the version when talking to a secondary, we can
+            // be stale in any case.
 
-                OCCASIONALLY {
-                    const DBClientReplicaSet* repl =
-                        dynamic_cast<const DBClientReplicaSet*>(state->conn->getRawConn());
-                    dassert(repl);
-                    warning() << "Cannot contact primary for " << repl->getServerAddress()
-                              << " to check shard version."
-                              << " The local replica set view and targeting may be stale." << endl;
-                }
-            } else {
-                throw;
+            OCCASIONALLY {
+                const DBClientReplicaSet* repl =
+                    dynamic_cast<const DBClientReplicaSet*>(state->conn->getRawConn());
+                dassert(repl);
+                warning() << "Cannot contact primary for " << repl->getServerAddress()
+                          << " to check shard version."
+                          << " The local replica set view and targeting may be stale.";
             }
+        } else {
+            throw;
         }
     }
 }
 
-void ParallelSortClusteredCursor::startInit() {
+void ParallelSortClusteredCursor::startInit(OperationContext* txn) {
     const bool returnPartial = (_qSpec.options() & QueryOption_PartialResults);
     const NamespaceString nss(!_cInfo.isEmpty() ? _cInfo.versionedNS : _qSpec.ns());
 
@@ -644,7 +463,7 @@ void ParallelSortClusteredCursor::startInit() {
             prefix = "creating";
         }
     }
-    LOG(pc) << prefix << " pcursor over " << _qSpec << " and " << _cInfo << endl;
+    LOG(pc) << prefix << " pcursor over " << _qSpec << " and " << _cInfo;
 
     set<ShardId> shardIds;
     string vinfo;
@@ -652,10 +471,10 @@ void ParallelSortClusteredCursor::startInit() {
     {
         shared_ptr<DBConfig> config;
 
-        auto status = grid.catalogCache()->getDatabase(nss.db().toString());
-        if (status.isOK()) {
-            config = status.getValue();
-            config->getChunkManagerOrPrimary(nss.ns(), manager, primary);
+        auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
+        if (status.getStatus().code() != ErrorCodes::NamespaceNotFound) {
+            config = uassertStatusOK(status);
+            config->getChunkManagerOrPrimary(txn, nss.ns(), manager, primary);
         }
     }
 
@@ -665,8 +484,8 @@ void ParallelSortClusteredCursor::startInit() {
                                   << manager->getVersion().toString() << "]";
         }
 
-        manager->getShardIdsForQuery(shardIds,
-                                     !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter());
+        manager->getShardIdsForQuery(
+            txn, !_cInfo.isEmpty() ? _cInfo.cmdFilter : _qSpec.filter(), &shardIds);
     } else if (primary) {
         if (MONGO_unlikely(shouldLog(pc))) {
             vinfo = str::stream() << "[unsharded @ " << primary->toString() << "]";
@@ -680,7 +499,7 @@ void ParallelSortClusteredCursor::startInit() {
          ++i) {
         if (shardIds.find(i->first) == shardIds.end()) {
             LOG(pc) << "closing cursor on shard " << i->first
-                    << " as the connection is no longer required by " << vinfo << endl;
+                    << " as the connection is no longer required by " << vinfo;
 
             i->second.cleanup(true);
         }
@@ -696,7 +515,7 @@ void ParallelSortClusteredCursor::startInit() {
         PCMData& mdata = _cursorMap[shardId];
 
         LOG(pc) << "initializing on shard " << shardId << ", current connection state is "
-                << mdata.toBSON() << endl;
+                << mdata.toBSON();
 
         // This may be the first time connecting to this shard, if so we can get an error here
         try {
@@ -709,11 +528,11 @@ void ParallelSortClusteredCursor::startInit() {
                 bool compatibleManager = true;
 
                 if (primary && !state->primary)
-                    warning() << "Collection becoming unsharded detected" << endl;
+                    warning() << "Collection becoming unsharded detected";
                 if (manager && !state->manager)
-                    warning() << "Collection becoming sharded detected" << endl;
+                    warning() << "Collection becoming sharded detected";
                 if (primary && state->primary && primary != state->primary)
-                    warning() << "Weird shift of primary detected" << endl;
+                    warning() << "Weird shift of primary detected";
 
                 compatiblePrimary = primary && state->primary && primary == state->primary;
                 compatibleManager =
@@ -737,7 +556,7 @@ void ParallelSortClusteredCursor::startInit() {
             mdata.pcState.reset(new PCState());
             PCStatePtr state = mdata.pcState;
 
-            setupVersionAndHandleSlaveOk(state, shardId, primary, nss, vinfo, manager);
+            setupVersionAndHandleSlaveOk(txn, state, shardId, primary, nss, vinfo, manager);
 
             const string& ns = _qSpec.ns();
 
@@ -829,7 +648,7 @@ void ParallelSortClusteredCursor::startInit() {
 
             LOG(pc) << "initialized " << (isCommand() ? "command " : "query ")
                     << (lazyInit ? "(lazily) " : "(full) ") << "on shard " << shardId
-                    << ", current connection state is " << mdata.toBSON() << endl;
+                    << ", current connection state is " << mdata.toBSON();
         } catch (StaleConfigException& e) {
             // Our version isn't compatible with the current version anymore on at least one shard,
             // need to retry immediately
@@ -846,17 +665,17 @@ void ParallelSortClusteredCursor::startInit() {
             int logLevel = fullReload ? 0 : 1;
             LOG(pc + logLevel) << "stale config of ns " << staleNS
                                << " during initialization, will retry with forced : " << forceReload
-                               << ", full : " << fullReload << causedBy(e) << endl;
+                               << ", full : " << fullReload << causedBy(e);
 
             // This is somewhat strange
             if (staleNS != nss)
                 warning() << "versioned ns " << nss.ns() << " doesn't match stale config namespace "
-                          << staleNS << endl;
+                          << staleNS;
 
-            _handleStaleNS(staleNS, forceReload, fullReload);
+            _handleStaleNS(txn, staleNS, forceReload, fullReload);
 
             // Restart with new chunk manager
-            startInit();
+            startInit(txn);
             return;
         } catch (SocketException& e) {
             warning() << "socket exception when initializing on " << shardId
@@ -869,6 +688,15 @@ void ParallelSortClusteredCursor::startInit() {
             }
             throw;
         } catch (DBException& e) {
+            if (e.getCode() == ErrorCodes::IncompatibleCatalogManager) {
+                fassert(28792, !_cmChangeAttempted);
+                _cmChangeAttempted = true;
+
+                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
+                startInit(txn);
+                return;
+            }
+
             warning() << "db exception when initializing on " << shardId
                       << ", current connection state is " << mdata.toBSON() << causedBy(e);
             e._shard = shardId;
@@ -927,7 +755,7 @@ void ParallelSortClusteredCursor::startInit() {
     }
 }
 
-void ParallelSortClusteredCursor::finishInit() {
+void ParallelSortClusteredCursor::finishInit(OperationContext* txn) {
     bool returnPartial = (_qSpec.options() & QueryOption_PartialResults);
     bool specialVersion = _cInfo.versionedNS.size() > 0;
     string ns = specialVersion ? _cInfo.versionedNS : _qSpec.ns();
@@ -935,7 +763,7 @@ void ParallelSortClusteredCursor::finishInit() {
     bool retry = false;
     map<string, StaleConfigException> staleNSExceptions;
 
-    LOG(pc) << "finishing over " << _cursorMap.size() << " shards" << endl;
+    LOG(pc) << "finishing over " << _cursorMap.size() << " shards";
 
     for (map<ShardId, PCMData>::iterator i = _cursorMap.begin(), end = _cursorMap.end(); i != end;
          ++i) {
@@ -943,7 +771,7 @@ void ParallelSortClusteredCursor::finishInit() {
         PCMData& mdata = i->second;
 
         LOG(pc) << "finishing on shard " << shardId << ", current connection state is "
-                << mdata.toBSON() << endl;
+                << mdata.toBSON();
 
         // Ignore empty conns for now
         if (!mdata.pcState)
@@ -991,7 +819,7 @@ void ParallelSortClusteredCursor::finishInit() {
                 state->cursor->attach(state->conn.get());  // Closes connection for us
 
                 LOG(pc) << "finished on shard " << shardId << ", current connection state is "
-                        << mdata.toBSON() << endl;
+                        << mdata.toBSON();
             }
         } catch (RecvStaleConfigException& e) {
             retry = true;
@@ -1066,20 +894,20 @@ void ParallelSortClusteredCursor::finishInit() {
                 LOG(pc + logLevel)
                     << "stale config of ns " << staleNS
                     << " on finishing query, will retry with forced : " << forceReload
-                    << ", full : " << fullReload << causedBy(exception) << endl;
+                    << ", full : " << fullReload << causedBy(exception);
 
                 // This is somewhat strange
                 if (staleNS != ns)
                     warning() << "versioned ns " << ns << " doesn't match stale config namespace "
-                              << staleNS << endl;
+                              << staleNS;
 
-                _handleStaleNS(staleNS, forceReload, fullReload);
+                _handleStaleNS(txn, staleNS, forceReload, fullReload);
             }
         }
 
         // Re-establish connections we need to
-        startInit();
-        finishInit();
+        startInit(txn);
+        finishInit(txn);
         return;
     }
 
@@ -1090,7 +918,7 @@ void ParallelSortClusteredCursor::finishInit() {
 
         // Erase empty stuff
         if (!mdata.pcState) {
-            log() << "PCursor erasing empty state " << mdata.toBSON() << endl;
+            log() << "PCursor erasing empty state " << mdata.toBSON();
             _cursorMap.erase(i++);
             continue;
         } else
@@ -1120,7 +948,7 @@ void ParallelSortClusteredCursor::finishInit() {
         _cursors[index].reset(mdata.pcState->cursor.get(), &mdata);
 
         {
-            const auto shard = grid.shardRegistry()->getShard(i->first);
+            const auto shard = grid.shardRegistry()->getShard(txn, i->first);
             _servers.insert(shard->getConnString().toString());
         }
 
@@ -1130,37 +958,11 @@ void ParallelSortClusteredCursor::finishInit() {
     _numServers = _cursorMap.size();
 }
 
-bool ParallelSortClusteredCursor::isSharded() {
-    // LEGACY is always unsharded
-    if (_qSpec.isEmpty())
-        return false;
-    // We're always sharded if the number of cursors != 1
-    // TODO: Kept this way for compatibility with getPrimary(), but revisit
-    if (_cursorMap.size() != 1)
-        return true;
-    // Return if the single cursor is sharded
-    return NULL != _cursorMap.begin()->second.pcState->manager;
-}
-
-int ParallelSortClusteredCursor::getNumQueryShards() {
-    return _cursorMap.size();
-}
-
-std::shared_ptr<Shard> ParallelSortClusteredCursor::getQueryShard() {
-    return grid.shardRegistry()->getShard(_cursorMap.begin()->first);
-}
-
 void ParallelSortClusteredCursor::getQueryShardIds(set<ShardId>& shardIds) {
     for (map<ShardId, PCMData>::iterator i = _cursorMap.begin(), end = _cursorMap.end(); i != end;
          ++i) {
         shardIds.insert(i->first);
     }
-}
-
-std::shared_ptr<Shard> ParallelSortClusteredCursor::getPrimary() {
-    if (isSharded())
-        return std::shared_ptr<Shard>();
-    return _cursorMap.begin()->second.pcState->primary;
 }
 
 DBClientCursorPtr ParallelSortClusteredCursor::getShardCursor(const ShardId& shardId) {
@@ -1211,7 +1013,7 @@ void ParallelSortClusteredCursor::_oldInit() {
                  ++it) {
                 log() << serverHosts[*it] << ", ";
             }
-            log() << finishedQueries << " finished queries." << endl;
+            log() << finishedQueries << " finished queries.";
         }
 
         size_t num = 0;
@@ -1314,7 +1116,7 @@ void ParallelSortClusteredCursor::_oldInit() {
             try {
                 if (!_cursors[i].get()->initLazyFinish(retry)) {
                     warning() << "invalid result from " << conns[i]->getHost()
-                              << (retry ? ", retrying" : "") << endl;
+                              << (retry ? ", retrying" : "");
                     _cursors[i].reset(NULL, NULL);
 
                     if (!retry) {
@@ -1414,12 +1216,12 @@ void ParallelSortClusteredCursor::_oldInit() {
         } else if (throwException) {
             throw DBException(errMsg.str(), 14827);
         } else {
-            warning() << errMsg.str() << endl;
+            warning() << errMsg.str();
         }
     }
 
     if (retries > 0)
-        log() << "successfully finished parallel query after " << retries << " retries" << endl;
+        log() << "successfully finished parallel query after " << retries << " retries";
 }
 
 ParallelSortClusteredCursor::~ParallelSortClusteredCursor() {
@@ -1441,13 +1243,6 @@ ParallelSortClusteredCursor::~ParallelSortClusteredCursor() {
 
     // Just to be sure
     _done = true;
-}
-
-void ParallelSortClusteredCursor::setBatchSize(int newBatchSize) {
-    for (int i = 0; i < _numServers; i++) {
-        if (_cursors[i].get())
-            _cursors[i].get()->setBatchSize(newBatchSize);
-    }
 }
 
 bool ParallelSortClusteredCursor::more() {
@@ -1524,146 +1319,4 @@ BSONObj ParallelSortClusteredCursor::next() {
     return best;
 }
 
-void ParallelSortClusteredCursor::_explain(map<string, list<BSONObj>>& out) {
-    set<ShardId> shardIds;
-    getQueryShardIds(shardIds);
-
-    for (const ShardId& shardId : shardIds) {
-        list<BSONObj>& l = out[shardId];
-        l.push_back(getShardCursor(shardId)->peekFirst().getOwned());
-    }
-}
-
-// -----------------
-// ---- Future -----
-// -----------------
-
-Future::CommandResult::CommandResult(const string& server,
-                                     const string& db,
-                                     const BSONObj& cmd,
-                                     int options,
-                                     DBClientBase* conn,
-                                     bool useShardedConn)
-    : _server(server),
-      _db(db),
-      _options(options),
-      _cmd(cmd),
-      _conn(conn),
-      _useShardConn(useShardedConn),
-      _done(false) {
-    init();
-}
-
-void Future::CommandResult::init() {
-    try {
-        if (!_conn) {
-            if (_useShardConn) {
-                _connHolder.reset(new ShardConnection(
-                    uassertStatusOK(ConnectionString::parse(_server)), "", NULL));
-            } else {
-                _connHolder.reset(new ScopedDbConnection(_server));
-            }
-
-            _conn = _connHolder->get();
-        }
-
-        if (_conn->lazySupported()) {
-            _cursor.reset(
-                new DBClientCursor(_conn, _db + ".$cmd", _cmd, -1 /*limit*/, 0, NULL, _options, 0));
-            _cursor->initLazy();
-        } else {
-            _done = true;  // we set _done first because even if there is an error we're done
-            _ok = _conn->runCommand(_db, _cmd, _res, _options);
-        }
-    } catch (std::exception& e) {
-        error() << "Future::spawnCommand (part 1) exception: " << e.what() << endl;
-        _ok = false;
-        _done = true;
-    }
-}
-
-bool Future::CommandResult::join(int maxRetries) {
-    if (_done)
-        return _ok;
-
-
-    _ok = false;
-    for (int i = 1; i <= maxRetries; i++) {
-        try {
-            bool retry = false;
-            bool finished = _cursor->initLazyFinish(retry);
-
-            // Shouldn't need to communicate with server any more
-            if (_connHolder)
-                _connHolder->done();
-
-            uassert(
-                14812, str::stream() << "Error running command on server: " << _server, finished);
-            massert(14813, "Command returned nothing", _cursor->more());
-
-            // Rethrow stale config errors stored in this cursor for correct handling
-            throwCursorStale(_cursor.get());
-
-            _res = _cursor->nextSafe();
-            _ok = _res["ok"].trueValue();
-
-            break;
-        } catch (RecvStaleConfigException& e) {
-            verify(versionManager.isVersionableCB(_conn));
-
-            // For legacy reasons, we may not always have a namespace :-(
-            string staleNS = e.getns();
-            if (staleNS.size() == 0)
-                staleNS = _db;
-
-            if (i >= maxRetries) {
-                error() << "Future::spawnCommand (part 2) stale config exception" << causedBy(e)
-                        << endl;
-                throw e;
-            }
-
-            if (i >= maxRetries / 2) {
-                if (!versionManager.forceRemoteCheckShardVersionCB(staleNS)) {
-                    error() << "Future::spawnCommand (part 2) no config detected" << causedBy(e)
-                            << endl;
-                    throw e;
-                }
-            }
-
-            // We may not always have a collection, since we don't know from a generic command what
-            // collection is supposed to be acted on, if any
-            if (nsGetCollection(staleNS).size() == 0) {
-                warning() << "no collection namespace in stale config exception "
-                          << "for lazy command " << _cmd << ", could not refresh " << staleNS
-                          << endl;
-            } else {
-                versionManager.checkShardVersionCB(_conn, staleNS, false, 1);
-            }
-
-            LOG(i > 1 ? 0 : 1) << "retrying lazy command" << causedBy(e) << endl;
-
-            verify(_conn->lazySupported());
-            _done = false;
-            init();
-            continue;
-        } catch (std::exception& e) {
-            error() << "Future::spawnCommand (part 2) exception: " << causedBy(e) << endl;
-            break;
-        }
-    }
-
-    _done = true;
-    return _ok;
-}
-
-shared_ptr<Future::CommandResult> Future::spawnCommand(const string& server,
-                                                       const string& db,
-                                                       const BSONObj& cmd,
-                                                       int options,
-                                                       DBClientBase* conn,
-                                                       bool useShardConn) {
-    shared_ptr<Future::CommandResult> res(
-        new Future::CommandResult(server, db, cmd, options, conn, useShardConn));
-    return res;
-}
-}
+}  // namespace mongo

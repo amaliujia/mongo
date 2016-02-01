@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
@@ -56,6 +57,7 @@ const std::string CONFIG_HOST_PORT = "$dummy_config:27017";
 class NoChunkFixture : public mongo::unittest::Test {
 protected:
     void setUp() {
+        OperationContextNoop txn;
         _dummyConfig.reset(new MockRemoteDBServer(CONFIG_HOST_PORT));
         mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
         MockConnRegistry::get()->addServer(_dummyConfig.get());
@@ -88,11 +90,12 @@ protected:
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
         CatalogManagerLegacy catalogManager;
-        catalogManager.init(configLoc);
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        catalogManager.init(configLoc, lockProcessId);
 
         MetadataLoader loader;
         Status status = loader.makeCollectionMetadata(
-            &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
+            &txn, &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
         ASSERT_OK(status);
         ASSERT_EQUALS(0u, _metadata.getNumChunks());
     }
@@ -446,6 +449,7 @@ TEST_F(NoChunkFixture, PendingOrphanedDataRanges) {
 class SingleChunkFixture : public mongo::unittest::Test {
 protected:
     void setUp() {
+        OperationContextNoop txn;
         _dummyConfig.reset(new MockRemoteDBServer(CONFIG_HOST_PORT));
         mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
         MockConnRegistry::get()->addServer(_dummyConfig.get());
@@ -472,11 +476,12 @@ protected:
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
         CatalogManagerLegacy catalogManager;
-        catalogManager.init(configLoc);
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        catalogManager.init(configLoc, lockProcessId);
 
         MetadataLoader loader;
         Status status = loader.makeCollectionMetadata(
-            &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
+            &txn, &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
         ASSERT_OK(status);
     }
 
@@ -617,8 +622,7 @@ TEST_F(SingleChunkFixture, MinusChunkWithPending) {
 }
 
 TEST_F(SingleChunkFixture, SingleSplit) {
-    ChunkVersion version;
-    getCollMetadata().getCollVersion().cloneTo(&version);
+    ChunkVersion version = getCollMetadata().getCollVersion();
     version.incMinor();
 
     ChunkType chunk;
@@ -662,8 +666,7 @@ TEST_F(SingleChunkFixture, MultiSplit) {
     splitPoints.push_back(BSON("a" << 14));
     splitPoints.push_back(BSON("a" << 16));
 
-    ChunkVersion version;
-    getCollMetadata().getCollVersion().cloneTo(&version);
+    ChunkVersion version = getCollMetadata().getCollVersion();
     version.incMinor();
 
     cloned.reset(getCollMetadata().cloneSplit(chunk, splitPoints, version, &errMsg));
@@ -762,6 +765,7 @@ TEST_F(SingleChunkFixture, ChunkOrphanedDataRanges) {
 class SingleChunkMinMaxCompoundKeyFixture : public mongo::unittest::Test {
 protected:
     void setUp() {
+        OperationContextNoop txn;
         _dummyConfig.reset(new MockRemoteDBServer(CONFIG_HOST_PORT));
         mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
         MockConnRegistry::get()->addServer(_dummyConfig.get());
@@ -788,11 +792,12 @@ protected:
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
         CatalogManagerLegacy catalogManager;
-        catalogManager.init(configLoc);
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        catalogManager.init(configLoc, lockProcessId);
 
         MetadataLoader loader;
         Status status = loader.makeCollectionMetadata(
-            &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
+            &txn, &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
         ASSERT_OK(status);
     }
 
@@ -826,6 +831,7 @@ TEST_F(SingleChunkMinMaxCompoundKeyFixture, CompoudKeyBelongsToMe) {
 class TwoChunksWithGapCompoundKeyFixture : public mongo::unittest::Test {
 protected:
     void setUp() {
+        OperationContextNoop txn;
         _dummyConfig.reset(new MockRemoteDBServer(CONFIG_HOST_PORT));
         mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
         MockConnRegistry::get()->addServer(_dummyConfig.get());
@@ -862,11 +868,12 @@ protected:
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
         CatalogManagerLegacy catalogManager;
-        catalogManager.init(configLoc);
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        catalogManager.init(configLoc, lockProcessId);
 
         MetadataLoader loader;
         Status status = loader.makeCollectionMetadata(
-            &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
+            &txn, &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
         ASSERT_OK(status);
     }
 
@@ -1076,6 +1083,7 @@ TEST_F(TwoChunksWithGapCompoundKeyFixture, ChunkGapAndPendingOrphanedDataRanges)
 class ThreeChunkWithRangeGapFixture : public mongo::unittest::Test {
 protected:
     void setUp() {
+        OperationContextNoop txn;
         _dummyConfig.reset(new MockRemoteDBServer(CONFIG_HOST_PORT));
         mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
         MockConnRegistry::get()->addServer(_dummyConfig.get());
@@ -1131,11 +1139,12 @@ protected:
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
         CatalogManagerLegacy catalogManager;
-        catalogManager.init(configLoc);
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        catalogManager.init(configLoc, lockProcessId);
 
         MetadataLoader loader;
         Status status = loader.makeCollectionMetadata(
-            &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
+            &txn, &catalogManager, "test.foo", "shard0000", NULL, &_metadata);
         ASSERT_OK(status);
     }
 

@@ -34,6 +34,8 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
@@ -43,7 +45,7 @@ namespace mongo {
 
 using unittest::assertGet;
 
-const char* QueryPlannerTest::ns = "somebogus.ns";
+const NamespaceString QueryPlannerTest::nss("test.collection");
 
 void QueryPlannerTest::setUp() {
     internalQueryPlannerEnableHashIntersection = true;
@@ -165,7 +167,7 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
     // Clean up any previous state from a call to runQueryFull
     solns.clear();
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(ns,
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                      query,
                                                      sort,
                                                      proj,
@@ -175,7 +177,8 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
                                                      minObj,
                                                      maxObj,
                                                      snapshot,
-                                                     false);  // explain
+                                                     false,  // explain
+                                                     ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
 
     ASSERT_OK(QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector()));
@@ -230,7 +233,7 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                            bool snapshot) {
     solns.clear();
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(ns,
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                      query,
                                                      sort,
                                                      proj,
@@ -240,7 +243,8 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                                      minObj,
                                                      maxObj,
                                                      snapshot,
-                                                     false);  // explain
+                                                     false,  // explain
+                                                     ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
 
     Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector());
@@ -250,15 +254,13 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
 void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     solns.clear();
 
-    const NamespaceString nss(ns);
     invariant(nss.isValid());
 
     const bool isExplain = false;
     std::unique_ptr<LiteParsedQuery> lpq(
         assertGet(LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    WhereCallbackNoop whereCallback;
-    auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), whereCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
 
     Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector());
@@ -335,7 +337,8 @@ void QueryPlannerTest::assertHasOneSolutionOf(const std::vector<std::string>& so
 }
 
 std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
     if (!status.isOK()) {
         FAIL(str::stream() << "failed to parse query: " << obj.toString()
                            << ". Reason: " << status.getStatus().toString());

@@ -1,7 +1,9 @@
-// sync2.js
+(function () {
 
-var s = new ShardingTest( "sync2" , 3 , 50 , 2 , { sync : true } );
-s.stopBalancer()
+var s = new ShardingTest({ name: "sync2",
+                           shards: 3,
+                           mongos: 2,
+                           other: { sync : true } });
 
 var s2 = s._mongos[1];
 
@@ -83,7 +85,11 @@ for (i = 1; i < hashes.length; i++) {
         continue;
     }
     
-    assert.eq(hashes[0].numCollections , hashes[i].numCollections , "num collections does not match");
+    assert.eq(Object.keys(hashes[0].collections).length ,
+              Object.keys(hashes[i].collections).length ,
+              "number of collections do not match:\n" +
+              tojson(hashes[0].collections) + '\n' +
+              tojson(hashes[i].collections));
 
     for ( var k in hashes[0].collections ) {
         if (hashes[0].collections[k] == hashes[i].collections[k]) {
@@ -112,3 +118,5 @@ for (i = 1; i < hashes.length; i++) {
 }
 
 s.stop();
+
+})();

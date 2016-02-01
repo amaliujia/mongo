@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-2016 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -50,13 +50,18 @@ static const CONFIG default_cfg = {
 	0,				/* checkpoint operations */
 	0,				/* insert operations */
 	0,				/* read operations */
+	0,				/* truncate operations */
 	0,				/* update operations */
 	0,				/* insert key */
 	0,				/* checkpoint in progress */
 	0,				/* thread error */
 	0,				/* notify threads to stop */
 	0,				/* in warmup phase */
+	false,				/* Signal for idle cycle thread */
 	0,				/* total seconds running */
+	0,				/* has truncate */
+	{NULL, NULL},			/* the truncate queue */
+	{NULL, NULL},                   /* the config queue */
 
 #define	OPT_DEFINE_DEFAULT
 #include "wtperf_opt.i"
@@ -68,7 +73,6 @@ static const char * const debug_tconfig = "";
 
 static void	*checkpoint_worker(void *);
 static int	 create_tables(CONFIG *);
-static int	 create_uris(CONFIG *);
 static int	drop_all_tables(CONFIG *);
 static int	 execute_populate(CONFIG *);
 static int	 execute_workload(CONFIG *);
@@ -83,7 +87,7 @@ static int	 start_threads(CONFIG *,
 static int	 stop_threads(CONFIG *, u_int, CONFIG_THREAD *);
 static void	*thread_run_wtperf(void *);
 static void	*worker(void *);
-static void	worker_throttle(int64_t, int64_t *, struct timespec *);
+
 static uint64_t	 wtperf_rand(CONFIG_THREAD *);
 static uint64_t	 wtperf_value_range(CONFIG *);
 
@@ -97,16 +101,7 @@ static uint64_t	 wtperf_value_range(CONFIG *);
 static inline uint64_t
 get_next_incr(CONFIG *cfg)
 {
-	return (WT_ATOMIC_ADD8(cfg->insert_key, 1));
-}
-
-static inline void
-generate_key(CONFIG *cfg, char *key_buf, uint64_t keyno)
-{
-	/*
-	 * Don't change to snprintf, sprintf is faster in some tests.
-	 */
-	sprintf(key_buf, "%0*" PRIu64, cfg->key_sz - 1, keyno);
+	return (__wt_atomic_add64(&cfg->insert_key, 1));
 }
 
 static void
@@ -157,7 +152,7 @@ cb_asyncop(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *op, int ret, uint32_t flags)
 	switch (type) {
 	case WT_AOP_COMPACT:
 		tables = (uint32_t *)op->app_private;
-		WT_ATOMIC_ADD4(*tables, (uint32_t)-1);
+		(void)__wt_atomic_add32(tables, (uint32_t)-1);
 		break;
 	case WT_AOP_INSERT:
 		trk = &thread->insert;
@@ -192,7 +187,7 @@ cb_asyncop(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *op, int ret, uint32_t flags)
 		return (0);
 	if (ret == 0 || (ret == WT_NOTFOUND && type != WT_AOP_INSERT)) {
 		if (!cfg->in_warmup)
-			(void)WT_ATOMIC_ADD8(trk->ops, 1);
+			(void)__wt_atomic_add64(&trk->ops, 1);
 		return (0);
 	}
 err:
@@ -258,6 +253,8 @@ op_name(uint8_t *op)
 		return ("insert_rmw");
 	case WORKER_READ:
 		return ("read");
+	case WORKER_TRUNCATE:
+		return ("truncate");
 	case WORKER_UPDATE:
 		return ("update");
 	default:
@@ -375,21 +372,68 @@ err:		cfg->error = cfg->stop = 1;
 	return (NULL);
 }
 
+/*
+ * do_range_reads --
+ *	If configured to execute a sequence of next operations after each
+ *	search do them. Ensuring the keys we see are always in order.
+ */
+static int
+do_range_reads(CONFIG *cfg, WT_CURSOR *cursor)
+{
+	size_t range;
+	uint64_t next_val, prev_val;
+	char *range_key_buf;
+	char buf[512];
+	int ret;
+
+	ret = 0;
+
+	if (cfg->read_range == 0)
+		return (0);
+
+	memset(&buf[0], 0, 512 * sizeof(char));
+	range_key_buf = &buf[0];
+
+	/* Save where the first key is for comparisons. */
+	cursor->get_key(cursor, &range_key_buf);
+	extract_key(range_key_buf, &next_val);
+
+	for (range = 0; range < cfg->read_range; ++range) {
+		prev_val = next_val;
+		ret = cursor->next(cursor);
+		/* We are done if we reach the end. */
+		if (ret != 0)
+			break;
+
+		/* Retrieve and decode the key */
+		cursor->get_key(cursor, &range_key_buf);
+		extract_key(range_key_buf, &next_val);
+		if (next_val < prev_val) {
+			lprintf(cfg, EINVAL, 0,
+			    "Out of order keys %" PRIu64
+			    " came before %" PRIu64,
+			    prev_val, next_val);
+			return (EINVAL);
+		}
+	}
+	return (0);
+}
+
 static void *
 worker(void *arg)
 {
-	struct timespec start, stop, interval;
+	struct timespec start, stop;
 	CONFIG *cfg;
 	CONFIG_THREAD *thread;
 	TRACK *trk;
 	WT_CONNECTION *conn;
 	WT_CURSOR **cursors, *cursor, *tmp_cursor;
 	WT_SESSION *session;
-	int64_t ops, ops_per_txn, throttle_ops;
 	size_t i;
+	int64_t ops, ops_per_txn;
 	uint64_t next_val, usecs;
 	uint8_t *op, *op_end;
-	int measure_latency, ret;
+	int measure_latency, ret, truncated;
 	char *value_buf, *key_buf, *value;
 	char buf[512];
 
@@ -401,19 +445,13 @@ worker(void *arg)
 	ops_per_txn = thread->workload->ops_per_txn;
 	session = NULL;
 	trk = NULL;
-	throttle_ops = 0;
 
 	if ((ret = conn->open_session(
 	    conn, NULL, cfg->sess_config, &session)) != 0) {
 		lprintf(cfg, ret, 0, "worker: WT_CONNECTION.open_session");
 		goto err;
 	}
-	cursors = calloc(cfg->table_count, sizeof(WT_CURSOR *));
-	if (cursors == NULL) {
-		lprintf(cfg, ENOMEM, 0,
-		    "worker: couldn't allocate cursor array");
-		goto err;
-	}
+	cursors = dcalloc(cfg->table_count, sizeof(WT_CURSOR *));
 	for (i = 0; i < cfg->table_count_idle; i++) {
 		snprintf(buf, 512, "%s_idle%05d", cfg->uris[0], (int)i);
 		if ((ret = session->open_cursor(
@@ -439,10 +477,13 @@ worker(void *arg)
 	}
 	/* Setup the timer for throttling. */
 	if (thread->workload->throttle != 0 &&
-	    (ret = __wt_epoch(NULL, &interval)) != 0) {
-		lprintf(cfg, ret, 0, "Get time call failed");
+	    (ret = setup_throttle(thread)) != 0)
 		goto err;
-	}
+
+	/* Setup for truncate */
+	if (thread->workload->truncate != 0)
+		if ((ret = setup_truncate(cfg, thread, session)) != 0)
+			goto err;
 
 	key_buf = thread->key_buf;
 	value_buf = thread->value_buf;
@@ -486,6 +527,10 @@ worker(void *arg)
 			if (wtperf_value_range(cfg) < next_val)
 				continue;
 			break;
+		case WORKER_TRUNCATE:
+			/* Required but not used. */
+			next_val = wtperf_rand(thread);
+			break;
 		default:
 			goto err;		/* can't happen */
 		}
@@ -502,10 +547,9 @@ worker(void *arg)
 		 * is 0, to avoid first time latency spikes.
 		 */
 		measure_latency =
-		    cfg->sample_interval != 0 && trk->ops != 0 && (
-		    trk->ops % cfg->sample_rate == 0);
-		if (measure_latency &&
-		    (ret = __wt_epoch(NULL, &start)) != 0) {
+		    cfg->sample_interval != 0 && trk != NULL &&
+		    trk->ops != 0 && (trk->ops % cfg->sample_rate == 0);
+		if (measure_latency && (ret = __wt_epoch(NULL, &start)) != 0) {
 			lprintf(cfg, ret, 0, "Get time call failed");
 			goto err;
 		}
@@ -529,7 +573,14 @@ worker(void *arg)
 					    "get_value in read.");
 					goto err;
 				}
+				/*
+				 * If we want to read a range, then call next
+				 * for several operations, confirming that the
+				 * next key is in the correct order.
+				 */
+				ret = do_range_reads(cfg, cursor);
 			}
+
 			if (ret == 0 || ret == WT_NOTFOUND)
 				break;
 			goto op_err;
@@ -547,6 +598,18 @@ worker(void *arg)
 			cursor->set_value(cursor, value_buf);
 			if ((ret = cursor->insert(cursor)) == 0)
 				break;
+			goto op_err;
+		case WORKER_TRUNCATE:
+			if ((ret = run_truncate(
+			    cfg, thread, cursor, session, &truncated)) == 0) {
+				if (truncated)
+					trk = &thread->truncate;
+				else
+					trk = &thread->truncate_sleep;
+				/* Pause between truncate attempts */
+				(void)usleep(1000);
+				break;
+			}
 			goto op_err;
 		case WORKER_UPDATE:
 			if ((ret = cursor->search(cursor)) == 0) {
@@ -584,7 +647,34 @@ worker(void *arg)
 			if (ret == WT_NOTFOUND)
 				break;
 
-op_err:			lprintf(cfg, ret, 0,
+op_err:			if (ret == WT_ROLLBACK && ops_per_txn != 0) {
+				/*
+				 * If we are running with explicit transactions
+				 * configured and we hit a WT_ROLLBACK, then we
+				 * should rollback the current transaction and
+				 * attempt to continue.
+				 * This does break the guarantee of insertion
+				 * order in cases of ordered inserts, as we
+				 * aren't retrying here.
+				 */
+				lprintf(cfg, ret, 1,
+				    "%s for: %s, range: %"PRIu64, op_name(op),
+				    key_buf, wtperf_value_range(cfg));
+				if ((ret = session->rollback_transaction(
+				    session, NULL)) != 0) {
+					lprintf(cfg, ret, 0,
+					     "Failed rollback_transaction");
+					goto err;
+				}
+				if ((ret = session->begin_transaction(
+				    session, NULL)) != 0) {
+					lprintf(cfg, ret, 0,
+					    "Worker begin transaction failed");
+					goto err;
+				}
+				break;
+			}
+			lprintf(cfg, ret, 0,
 			    "%s failed for: %s, range: %"PRIu64,
 			    op_name(op), key_buf, wtperf_value_range(cfg));
 			goto err;
@@ -610,7 +700,7 @@ op_err:			lprintf(cfg, ret, 0,
 					goto err;
 				}
 				++trk->latency_ops;
-				usecs = ns_to_us(WT_TIMEDIFF(stop, start));
+				usecs = WT_TIMEDIFF_US(stop, start);
 				track_operation(trk, usecs);
 			}
 			/* Increment operation count */
@@ -628,7 +718,7 @@ op_err:			lprintf(cfg, ret, 0,
 			if ((ret = session->begin_transaction(
 			    session, NULL)) != 0) {
 				lprintf(cfg, ret, 0,
-				    "Worker transaction commit failed");
+				    "Worker begin transaction failed");
 				goto err;
 			}
 		}
@@ -638,13 +728,11 @@ op_err:			lprintf(cfg, ret, 0,
 			op = thread->workload->ops;
 
 		/*
-		 * Check throttling periodically to avoid taking too
-		 * many time samples.
+		 * Decrement throttle ops and check if we should sleep
+		 * and then get more work to perform.
 		 */
-		if (thread->workload->throttle != 0 &&
-		    throttle_ops++ % THROTTLE_OPS == 0)
-			worker_throttle(thread->workload->throttle,
-			     &throttle_ops, &interval);
+		if (--thread->throttle_cfg.ops_count == 0)
+			worker_throttle(thread);
 	}
 
 	if ((ret = session->close(session, NULL)) != 0) {
@@ -711,16 +799,33 @@ run_mix_schedule(CONFIG *cfg, WORKLOAD *workp)
 {
 	int64_t pct;
 
-	/* Confirm reads, inserts and updates cannot all be zero. */
-	if (workp->insert == 0 && workp->read == 0 && workp->update == 0) {
+	/* Confirm reads, inserts, truncates and updates cannot all be zero. */
+	if (workp->insert == 0 && workp->read == 0 &&
+	    workp->truncate == 0 && workp->update == 0) {
 		lprintf(cfg, EINVAL, 0, "no operations scheduled");
 		return (EINVAL);
 	}
 
 	/*
+	 * Handle truncate first - it's a special case that can't be used in
+	 * a mixed workload.
+	 */
+	if (workp->truncate != 0) {
+		if (workp->insert != 0 ||
+		    workp->read != 0 || workp->update != 0) {
+			lprintf(cfg, EINVAL, 0,
+			    "Can't configure truncate in a mixed workload");
+			return (EINVAL);
+		}
+		memset(workp->ops, WORKER_TRUNCATE, sizeof(workp->ops));
+		return (0);
+	}
+
+	/*
 	 * Check for a simple case where the thread is only doing insert or
-	 * update operations (because the default operation for a job-mix is
-	 * read, the subsequent code works fine if only reads are specified).
+	 * update operations (because the default operation for a
+	 * job-mix is read, the subsequent code works fine if only reads are
+	 * specified).
 	 */
 	if (workp->insert != 0 && workp->read == 0 && workp->update == 0) {
 		memset(workp->ops,
@@ -802,12 +907,7 @@ populate_thread(void *arg)
 	cursor_config =
 	    (cfg->populate_threads == 1 && !cfg->index) ? "bulk" : NULL;
 	/* Create the cursors. */
-	cursors = calloc(cfg->table_count, sizeof(WT_CURSOR *));
-	if (cursors == NULL) {
-		lprintf(cfg, ENOMEM, 0,
-		    "worker: couldn't allocate cursor array");
-		goto err;
-	}
+	cursors = dcalloc(cfg->table_count, sizeof(WT_CURSOR *));
 	for (i = 0; i < cfg->table_count; i++) {
 		if ((ret = session->open_cursor(
 		    session, cfg->uris[i], NULL,
@@ -840,10 +940,9 @@ populate_thread(void *arg)
 		cursor = cursors[op % cfg->table_count];
 		generate_key(cfg, key_buf, op);
 		measure_latency =
-		    cfg->sample_interval != 0 && trk->ops != 0 && (
-		    trk->ops % cfg->sample_rate == 0);
-		if (measure_latency &&
-		    (ret = __wt_epoch(NULL, &start)) != 0) {
+		    cfg->sample_interval != 0 &&
+		    trk->ops != 0 && (trk->ops % cfg->sample_rate == 0);
+		if (measure_latency && (ret = __wt_epoch(NULL, &start)) != 0) {
 			lprintf(cfg, ret, 0, "Get time call failed");
 			goto err;
 		}
@@ -877,7 +976,7 @@ populate_thread(void *arg)
 				goto err;
 			}
 			++trk->latency_ops;
-			usecs = ns_to_us(WT_TIMEDIFF(stop, start));
+			usecs = WT_TIMEDIFF_US(stop, start);
 			track_operation(trk, usecs);
 		}
 		++thread->insert.ops;	/* Same as trk->ops */
@@ -961,10 +1060,9 @@ populate_async(void *arg)
 	 * the time to process by workers.
 	 */
 	measure_latency =
-	    cfg->sample_interval != 0 && trk->ops != 0 && (
-	    trk->ops % cfg->sample_rate == 0);
-	if (measure_latency &&
-	    (ret = __wt_epoch(NULL, &start)) != 0) {
+	    cfg->sample_interval != 0 &&
+	    trk->ops != 0 && (trk->ops % cfg->sample_rate == 0);
+	if (measure_latency && (ret = __wt_epoch(NULL, &start)) != 0) {
 		lprintf(cfg, ret, 0, "Get time call failed");
 		goto err;
 	}
@@ -1006,12 +1104,11 @@ populate_async(void *arg)
 		goto err;
 	if (measure_latency) {
 		if ((ret = __wt_epoch(NULL, &stop)) != 0) {
-			lprintf(cfg, ret, 0,
-			    "Get time call failed");
+			lprintf(cfg, ret, 0, "Get time call failed");
 			goto err;
 		}
 		++trk->latency_ops;
-		usecs = ns_to_us(WT_TIMEDIFF(stop, start));
+		usecs = WT_TIMEDIFF_US(stop, start);
 		track_operation(trk, usecs);
 	}
 	if ((ret = session->close(session, NULL)) != 0) {
@@ -1040,9 +1137,10 @@ monitor(void *arg)
 	uint32_t read_avg, read_min, read_max;
 	uint32_t insert_avg, insert_min, insert_max;
 	uint32_t update_avg, update_min, update_max;
-	uint32_t latency_max;
+	uint32_t latency_max, level;
 	u_int i;
-	int ret;
+	int msg_err, ret;
+	const char *str;
 	char buf[64], *path;
 
 	cfg = (CONFIG *)arg;
@@ -1055,10 +1153,7 @@ monitor(void *arg)
 
 	/* Open the logging file. */
 	len = strlen(cfg->monitor_dir) + 100;
-	if ((path = malloc(len)) == NULL) {
-		(void)enomem(cfg);
-		goto err;
-	}
+	path = dmalloc(len);
 	snprintf(path, len, "%s/monitor", cfg->monitor_dir);
 	if ((fp = fopen(path, "w")) == NULL) {
 		lprintf(cfg, errno, 0, "%s", path);
@@ -1140,21 +1235,41 @@ monitor(void *arg)
 
 		if (latency_max != 0 &&
 		    (read_max > latency_max || insert_max > latency_max ||
-		     update_max > latency_max))
-			lprintf(cfg, WT_PANIC, 0,
-			    "max latency exceeded: threshold %" PRIu32
+		     update_max > latency_max)) {
+			if (cfg->max_latency_fatal) {
+				level = 1;
+				msg_err = WT_PANIC;
+				str = "ERROR";
+			} else {
+				level = 0;
+				msg_err = 0;
+				str = "WARNING";
+			}
+			lprintf(cfg, msg_err, level,
+			    "%s: max latency exceeded: threshold %" PRIu32
 			    " read max %" PRIu32 " insert max %" PRIu32
-			    " update max %" PRIu32, latency_max,
+			    " update max %" PRIu32, str, latency_max,
 			    read_max, insert_max, update_max);
+		}
 		if (min_thr != 0 &&
 		    ((cur_reads != 0 && cur_reads < min_thr) ||
 		    (cur_inserts != 0 && cur_inserts < min_thr) ||
-		    (cur_updates != 0 && cur_updates < min_thr)))
-			lprintf(cfg, WT_PANIC, 0,
-			    "minimum throughput not met: threshold %" PRIu64
+		    (cur_updates != 0 && cur_updates < min_thr))) {
+			if (cfg->min_throughput_fatal) {
+				level = 1;
+				msg_err = WT_PANIC;
+				str = "ERROR";
+			} else {
+				level = 0;
+				msg_err = 0;
+				str = "WARNING";
+			}
+			lprintf(cfg, msg_err, level,
+			    "%s: minimum throughput not met: threshold %" PRIu64
 			    " reads %" PRIu64 " inserts %" PRIu64
-			    " updates %" PRIu64, min_thr, cur_reads,
+			    " updates %" PRIu64, str, min_thr, cur_reads,
 			    cur_inserts, cur_updates);
+		}
 		last_reads = reads;
 		last_inserts = inserts;
 		last_updates = updates;
@@ -1245,9 +1360,11 @@ execute_populate(CONFIG *cfg)
 	struct timespec start, stop;
 	CONFIG_THREAD *popth;
 	WT_ASYNC_OP *asyncop;
+	pthread_t idle_table_cycle_thread;
 	size_t i;
-	uint64_t last_ops, msecs;
+	uint64_t last_ops, msecs, print_ops_sec;
 	uint32_t interval, tables;
+	double print_secs;
 	int elapsed, ret;
 	void *(*pfunc)(void *);
 
@@ -1256,11 +1373,13 @@ execute_populate(CONFIG *cfg)
 	    " populate thread(s) for %" PRIu32 " items",
 	    cfg->populate_threads, cfg->icount);
 
+	/* Start cycling idle tables if configured. */
+	if ((ret = start_idle_table_cycle(cfg, &idle_table_cycle_thread)) != 0)
+		return (ret);
+
 	cfg->insert_key = 0;
 
-	if ((cfg->popthreads =
-	    calloc(cfg->populate_threads, sizeof(CONFIG_THREAD))) == NULL)
-		return (enomem(cfg));
+	cfg->popthreads = dcalloc(cfg->populate_threads, sizeof(CONFIG_THREAD));
 	if (cfg->use_asyncops > 0) {
 		lprintf(cfg, 0, 1, "Starting %" PRIu32 " async thread(s)",
 		    cfg->async_threads);
@@ -1324,11 +1443,23 @@ execute_populate(CONFIG *cfg)
 	}
 
 	lprintf(cfg, 0, 1, "Finished load of %" PRIu32 " items", cfg->icount);
-	msecs = ns_to_ms(WT_TIMEDIFF(stop, start));
+	msecs = WT_TIMEDIFF_MS(stop, start);
+
+	/*
+	 * This is needed as the divisions will fail if the insert takes no time
+	 * which will only be the case when there is no data to insert.
+	 */
+	if (msecs == 0) {
+		print_secs = 0;
+		print_ops_sec = 0;
+	} else {
+		print_secs = (double)msecs / (double)MSEC_PER_SEC;
+		print_ops_sec =
+		    (uint64_t)((cfg->icount / msecs) / MSEC_PER_SEC);
+	}
 	lprintf(cfg, 0, 1,
 	    "Load time: %.2f\n" "load ops/sec: %" PRIu64,
-	    (double)msecs / (double)MSEC_PER_SEC,
-	    (uint64_t)((cfg->icount / msecs) / MSEC_PER_SEC));
+	    print_secs, print_ops_sec);
 
 	/*
 	 * If configured, compact to allow LSM merging to complete.  We
@@ -1370,9 +1501,14 @@ execute_populate(CONFIG *cfg)
 		}
 		lprintf(cfg, 0, 1,
 		    "Compact completed in %" PRIu64 " seconds",
-		    (uint64_t)(ns_to_sec(WT_TIMEDIFF(stop, start))));
+		    (uint64_t)(WT_TIMEDIFF_SEC(stop, start)));
 		assert(tables == 0);
 	}
+
+	/* Stop cycling idle tables. */
+	if ((ret = stop_idle_table_cycle(cfg, idle_table_cycle_thread)) != 0)
+		return (ret);
+
 	return (0);
 }
 
@@ -1381,6 +1517,8 @@ close_reopen(CONFIG *cfg)
 {
 	int ret;
 
+	if (!cfg->reopen_connection)
+		return (0);
 	/*
 	 * Reopen the connection.  We do this so that the workload phase always
 	 * starts with the on-disk files, and so that read-only workloads can
@@ -1420,27 +1558,31 @@ execute_workload(CONFIG *cfg)
 {
 	CONFIG_THREAD *threads;
 	WORKLOAD *workp;
-	uint64_t last_ckpts, last_inserts, last_reads, last_updates;
+	pthread_t idle_table_cycle_thread;
+	uint64_t last_ckpts, last_inserts, last_reads, last_truncates;
+	uint64_t last_updates;
 	uint32_t interval, run_ops, run_time;
 	u_int i;
 	int ret, t_ret;
 	void *(*pfunc)(void *);
 
 	cfg->insert_key = 0;
-	cfg->insert_ops = cfg->read_ops = cfg->update_ops = 0;
+	cfg->insert_ops = cfg->read_ops = cfg->truncate_ops = 0;
+	cfg->update_ops = 0;
 
-	last_ckpts = last_inserts = last_reads = last_updates = 0;
+	last_ckpts = last_inserts = last_reads = last_truncates = 0;
+	last_updates = 0;
 	ret = 0;
+
+	/* Start cycling idle tables. */
+	if ((ret = start_idle_table_cycle(cfg, &idle_table_cycle_thread)) != 0)
+		return (ret);
 
 	if (cfg->warmup != 0)
 		cfg->in_warmup = 1;
 
 	/* Allocate memory for the worker threads. */
-	if ((cfg->workers =
-	    calloc((size_t)cfg->workers_cnt, sizeof(CONFIG_THREAD))) == NULL) {
-		ret = enomem(cfg);
-		goto err;
-	}
+	cfg->workers = dcalloc((size_t)cfg->workers_cnt, sizeof(CONFIG_THREAD));
 
 	if (cfg->use_asyncops > 0) {
 		lprintf(cfg, 0, 1, "Starting %" PRIu32 " async thread(s)",
@@ -1454,9 +1596,11 @@ execute_workload(CONFIG *cfg)
 	    workp = cfg->workload; i < cfg->workload_cnt; ++i, ++workp) {
 		lprintf(cfg, 0, 1,
 		    "Starting workload #%d: %" PRId64 " threads, inserts=%"
-		    PRId64 ", reads=%" PRId64 ", updates=%" PRId64,
-		    i + 1,
-		    workp->threads, workp->insert, workp->read, workp->update);
+		    PRId64 ", reads=%" PRId64 ", updates=%" PRId64
+		    ", truncate=%" PRId64 ", throttle=%" PRId64,
+		    i + 1, workp->threads, workp->insert,
+		    workp->read, workp->update, workp->truncate,
+		    workp->throttle);
 
 		/* Figure out the workload's schedule. */
 		if ((ret = run_mix_schedule(cfg, workp)) != 0)
@@ -1496,6 +1640,7 @@ execute_workload(CONFIG *cfg)
 		cfg->insert_ops = sum_insert_ops(cfg);
 		cfg->read_ops = sum_read_ops(cfg);
 		cfg->update_ops = sum_update_ops(cfg);
+		cfg->truncate_ops = sum_truncate_ops(cfg);
 
 		/* If we're checking total operations, see if we're done. */
 		if (run_ops != 0 && run_ops <=
@@ -1510,21 +1655,27 @@ execute_workload(CONFIG *cfg)
 
 		lprintf(cfg, 0, 1,
 		    "%" PRIu64 " reads, %" PRIu64 " inserts, %" PRIu64
-		    " updates, %" PRIu64 " checkpoints in %" PRIu32
-		    " secs (%" PRIu32 " total secs)",
+		    " updates, %" PRIu64 " truncates, %" PRIu64
+		    " checkpoints in %" PRIu32 " secs (%" PRIu32 " total secs)",
 		    cfg->read_ops - last_reads,
 		    cfg->insert_ops - last_inserts,
 		    cfg->update_ops - last_updates,
+		    cfg->truncate_ops - last_truncates,
 		    cfg->ckpt_ops - last_ckpts,
 		    cfg->report_interval, cfg->totalsec);
 		last_reads = cfg->read_ops;
 		last_inserts = cfg->insert_ops;
 		last_updates = cfg->update_ops;
+		last_truncates = cfg->truncate_ops;
 		last_ckpts = cfg->ckpt_ops;
 	}
 
 	/* Notify the worker threads they are done. */
 err:	cfg->stop = 1;
+
+	/* Stop cycling idle tables. */
+	if ((ret = stop_idle_table_cycle(cfg, idle_table_cycle_thread)) != 0)
+		return (ret);
 
 	if ((t_ret = stop_threads(
 	    cfg, (u_int)cfg->workers_cnt, cfg->workers)) != 0 && ret == 0)
@@ -1607,27 +1758,17 @@ out:	return (ret);
 /*
  * Populate the uri array if more than one table is being used.
  */
-static int
+static void
 create_uris(CONFIG *cfg)
 {
 	size_t base_uri_len;
 	uint32_t i;
-	int ret;
 	char *uri;
 
-	ret = 0;
 	base_uri_len = strlen(cfg->base_uri);
-	cfg->uris = calloc(cfg->table_count, sizeof(char *));
-	if (cfg->uris == NULL) {
-		ret = ENOMEM;
-		goto err;
-	}
+	cfg->uris = dcalloc(cfg->table_count, sizeof(char *));
 	for (i = 0; i < cfg->table_count; i++) {
-		uri = cfg->uris[i] = calloc(base_uri_len + 5, 1);
-		if (uri == NULL) {
-			ret = ENOMEM;
-			goto err;
-		}
+		uri = cfg->uris[i] = dcalloc(base_uri_len + 5, 1);
 		/*
 		 * If there is only one table, just use base name.
 		 */
@@ -1636,13 +1777,6 @@ create_uris(CONFIG *cfg)
 		else
 			sprintf(uri, "%s%05d", cfg->base_uri, i);
 	}
-err:	if (ret != 0 && cfg->uris != NULL) {
-		for (i = 0; i < cfg->table_count; i++)
-			free(cfg->uris[i]);
-		free(cfg->uris);
-		cfg->uris = NULL;
-	}
-	return (ret);
 }
 
 static int
@@ -1724,40 +1858,22 @@ start_all_runs(CONFIG *cfg)
 		return (start_run(cfg));
 
 	/* Allocate an array to hold our config struct copies. */
-	configs = calloc(cfg->database_count, sizeof(CONFIG *));
-	if (configs == NULL)
-		return (ENOMEM);
+	configs = dcalloc(cfg->database_count, sizeof(CONFIG *));
 
 	/* Allocate an array to hold our thread IDs. */
-	threads = calloc(cfg->database_count, sizeof(pthread_t));
-	if (threads == NULL) {
-		ret = ENOMEM;
-		goto err;
-	}
+	threads = dcalloc(cfg->database_count, sizeof(pthread_t));
 
 	home_len = strlen(cfg->home);
 	cmd_len = (home_len * 2) + 30; /* Add some slop. */
-	cmd_buf = calloc(cmd_len, 1);
-	if (cmd_buf == NULL) {
-		ret = ENOMEM;
-		goto err;
-	}
+	cmd_buf = dcalloc(cmd_len, 1);
 	for (i = 0; i < cfg->database_count; i++) {
-		next_cfg = calloc(1, sizeof(CONFIG));
-		if (next_cfg == NULL) {
-			ret = ENOMEM;
-			goto err;
-		}
+		next_cfg = dcalloc(1, sizeof(CONFIG));
 		configs[i] = next_cfg;
 		if ((ret = config_assign(next_cfg, cfg)) != 0)
 			goto err;
 
 		/* Setup a unique home directory for each database. */
-		new_home = malloc(home_len + 5);
-		if (new_home == NULL) {
-			ret = ENOMEM;
-			goto err;
-		}
+		new_home = dmalloc(home_len + 5);
 		snprintf(new_home, home_len + 5, "%s/D%02d", cfg->home, (int)i);
 		next_cfg->home = new_home;
 
@@ -1824,7 +1940,7 @@ start_run(CONFIG *cfg)
 	monitor_created = ret = 0;
 					/* [-Wconditional-uninitialized] */
 	memset(&monitor_thread, 0, sizeof(monitor_thread));
-	
+
 	if ((ret = setup_log_file(cfg)) != 0)
 		goto err;
 
@@ -1847,8 +1963,7 @@ start_run(CONFIG *cfg)
 			    ret, 0, "Error loading Helium: %s", helium_buf);
 	}
 
-	if ((ret = create_uris(cfg)) != 0)
-		goto err;
+	create_uris(cfg);
 	if ((ret = create_tables(cfg)) != 0)
 		goto err;
 
@@ -1885,12 +2000,8 @@ start_run(CONFIG *cfg)
 			lprintf(cfg, 0, 1,
 			    "Starting %" PRIu32 " checkpoint thread(s)",
 			    cfg->checkpoint_threads);
-			if ((cfg->ckptthreads =
-			    calloc(cfg->checkpoint_threads,
-			    sizeof(CONFIG_THREAD))) == NULL) {
-				ret = enomem(cfg);
-				goto err;
-			}
+			cfg->ckptthreads = dcalloc(
+			     cfg->checkpoint_threads, sizeof(CONFIG_THREAD));
 			if (start_threads(cfg, NULL, cfg->ckptthreads,
 			    cfg->checkpoint_threads, checkpoint_worker) != 0)
 				goto err;
@@ -1902,6 +2013,7 @@ start_run(CONFIG *cfg)
 		/* One final summation of the operations we've completed. */
 		cfg->read_ops = sum_read_ops(cfg);
 		cfg->insert_ops = sum_insert_ops(cfg);
+		cfg->truncate_ops = sum_truncate_ops(cfg);
 		cfg->update_ops = sum_update_ops(cfg);
 		cfg->ckpt_ops = sum_ckpt_ops(cfg);
 		total_ops = cfg->read_ops + cfg->insert_ops + cfg->update_ops;
@@ -1916,6 +2028,11 @@ start_run(CONFIG *cfg)
 		    "%%) %" PRIu64 " ops/sec",
 		    cfg->insert_ops, (cfg->insert_ops * 100) / total_ops,
 		    cfg->insert_ops / cfg->run_time);
+		lprintf(cfg, 0, 1,
+		    "Executed %" PRIu64 " truncate operations (%" PRIu64
+		    "%%) %" PRIu64 " ops/sec",
+		    cfg->truncate_ops, (cfg->truncate_ops * 100) / total_ops,
+		    cfg->truncate_ops / cfg->run_time);
 		lprintf(cfg, 0, 1,
 		    "Executed %" PRIu64 " update operations (%" PRIu64
 		    "%%) %" PRIu64 " ops/sec",
@@ -1996,14 +2113,16 @@ main(int argc, char *argv[])
 	if (config_assign(cfg, &default_cfg))
 		goto err;
 
+	TAILQ_INIT(&cfg->config_head);
+
 	/* Do a basic validation of options, and home is needed before open. */
 	while ((ch = __wt_getopt("wtperf", argc, argv, opts)) != EOF)
 		switch (ch) {
 		case 'C':
 			if (user_cconfig == NULL)
-				user_cconfig = strdup(__wt_optarg);
+				user_cconfig = dstrdup(__wt_optarg);
 			else {
-				user_cconfig = realloc(user_cconfig,
+				user_cconfig = drealloc(user_cconfig,
 				    strlen(user_cconfig) +
 				    strlen(__wt_optarg) + 2);
 				strcat(user_cconfig, ",");
@@ -2018,9 +2137,9 @@ main(int argc, char *argv[])
 			break;
 		case 'T':
 			if (user_tconfig == NULL)
-				user_tconfig = strdup(__wt_optarg);
+				user_tconfig = dstrdup(__wt_optarg);
 			else {
-				user_tconfig = realloc(user_tconfig,
+				user_tconfig = drealloc(user_tconfig,
 				    strlen(user_tconfig) +
 				    strlen(__wt_optarg) + 2);
 				strcat(user_tconfig, ",");
@@ -2062,14 +2181,25 @@ main(int argc, char *argv[])
 			break;
 		}
 
+	if (cfg->populate_threads == 0 && cfg->icount != 0) {
+		lprintf(cfg, 1, 0,
+		    "Cannot have 0 populate threads when icount is set\n");
+		goto err;
+	}
+
 	cfg->async_config = NULL;
 	/*
 	 * If the user specified async_threads we use async for all ops.
 	 * If the user wants compaction, then we also enable async for
 	 * the compact operation, but not for the workloads.
 	 */
-	if (cfg->async_threads > 0)
+	if (cfg->async_threads > 0) {
+		if (cfg->has_truncate > 0) {
+			lprintf(cfg, 1, 0, "Cannot run truncate and async\n");
+			goto err;
+		}
 		cfg->use_asyncops = 1;
+	}
 	if (cfg->compact && cfg->async_threads == 0)
 		cfg->async_threads = 2;
 	if (cfg->async_threads > 0) {
@@ -2080,10 +2210,7 @@ main(int argc, char *argv[])
 		 * to 4096 if needed.
 		 */
 		req_len = strlen(",async=(enabled=true,threads=)") + 4;
-		if ((cfg->async_config = calloc(req_len, 1)) == NULL) {
-			ret = enomem(cfg);
-			goto err;
-		}
+		cfg->async_config = dcalloc(req_len, 1);
 		snprintf(cfg->async_config, req_len,
 		    ",async=(enabled=true,threads=%d)",
 		    cfg->async_threads);
@@ -2091,13 +2218,22 @@ main(int argc, char *argv[])
 	if ((ret = config_compress(cfg)) != 0)
 		goto err;
 
+	/* You can't have truncate on a random collection. */
+	if (cfg->has_truncate && cfg->random_range) {
+		lprintf(cfg, 1, 0, "Cannot run truncate and random_range\n");
+		goto err;
+	}
+
+	/* We can't run truncate with more than one table. */
+	if (cfg->has_truncate && cfg->table_count > 1) {
+		lprintf(cfg, 1, 0, "Cannot truncate more than 1 table\n");
+		goto err;
+	}
+
 	/* Build the URI from the table name. */
 	req_len = strlen("table:") +
 	    strlen(HELIUM_NAME) + strlen(cfg->table_name) + 2;
-	if ((cfg->base_uri = calloc(req_len, 1)) == NULL) {
-		ret = enomem(cfg);
-		goto err;
-	}
+	cfg->base_uri = dcalloc(req_len, 1);
 	snprintf(cfg->base_uri, req_len, "table:%s%s%s",
 	    cfg->helium_mount == NULL ? "" : HELIUM_NAME,
 	    cfg->helium_mount == NULL ? "" : "/",
@@ -2116,10 +2252,7 @@ main(int argc, char *argv[])
 			req_len += strlen(cfg->async_config);
 		if (cfg->compress_ext != NULL)
 			req_len += strlen(cfg->compress_ext);
-		if ((cc_buf = calloc(req_len, 1)) == NULL) {
-			ret = enomem(cfg);
-			goto err;
-		}
+		cc_buf = dcalloc(req_len, 1);
 		/*
 		 * This is getting hard to parse.
 		 */
@@ -2144,10 +2277,7 @@ main(int argc, char *argv[])
 			req_len += strlen(cfg->compress_table);
 		if (cfg->index)
 			req_len += strlen(INDEX_COL_NAMES);
-		if ((tc_buf = calloc(req_len, 1)) == NULL) {
-			ret = enomem(cfg);
-			goto err;
-		}
+		tc_buf = dcalloc(req_len, 1);
 		/*
 		 * This is getting hard to parse.
 		 */
@@ -2166,10 +2296,7 @@ main(int argc, char *argv[])
 	if (cfg->log_partial && cfg->table_count > 1) {
 		req_len = strlen(cfg->table_config) +
 		    strlen(LOG_PARTIAL_CONFIG) + 1;
-		if ((cfg->partial_config = calloc(req_len, 1)) == NULL) {
-			ret = enomem(cfg);
-			goto err;
-		}
+		cfg->partial_config = dcalloc(req_len, 1);
 		snprintf((char *)cfg->partial_config, req_len, "%s%s",
 		    (char *)cfg->table_config, LOG_PARTIAL_CONFIG);
 	}
@@ -2177,6 +2304,9 @@ main(int argc, char *argv[])
 	/* Sanity-check the configuration. */
 	if ((ret = config_sanity(cfg)) != 0)
 		goto err;
+
+	/* Write a copy of the config. */
+	config_to_file(cfg);
 
 	/* Display the configuration. */
 	if (cfg->verbose > 1)
@@ -2203,7 +2333,7 @@ start_threads(CONFIG *cfg,
     WORKLOAD *workp, CONFIG_THREAD *base, u_int num, void *(*func)(void *))
 {
 	CONFIG_THREAD *thread;
-	u_int i, j;
+	u_int i;
 	int ret;
 
 	/* Initialize the threads. */
@@ -2212,15 +2342,13 @@ start_threads(CONFIG *cfg,
 		thread->workload = workp;
 
 		/*
-		 * We don't want the threads executing in lock-step, move each
-		 * new RNG state further along in the sequence.
+		 * We don't want the threads executing in lock-step, seed each
+		 * one differently.
 		 */
-		if (i == 0)
-			__wt_random_init(&thread->rnd);
-		else
-			thread->rnd = (thread - 1)->rnd;
-		for (j = 0; j < 1000; ++j)
-			(void)__wt_random(&thread->rnd);
+		if ((ret = __wt_random_init_seed(NULL, &thread->rnd)) != 0) {
+			lprintf(cfg, ret, 0, "Error initializing RNG");
+			return (ret);
+		}
 
 		/*
 		 * Every thread gets a key/data buffer because we don't bother
@@ -2228,10 +2356,8 @@ start_threads(CONFIG *cfg,
 		 * don't, it's not enough memory to bother.  These buffers hold
 		 * strings: trailing NUL is included in the size.
 		 */
-		if ((thread->key_buf = calloc(cfg->key_sz, 1)) == NULL)
-			return (enomem(cfg));
-		if ((thread->value_buf = calloc(cfg->value_sz, 1)) == NULL)
-			return (enomem(cfg));
+		thread->key_buf = dcalloc(cfg->key_sz, 1);
+		thread->value_buf = dcalloc(cfg->value_sz, 1);
 		/*
 		 * Initialize and then toss in a bit of random values if needed.
 		 */
@@ -2291,35 +2417,6 @@ stop_threads(CONFIG *cfg, u_int num, CONFIG_THREAD *threads)
 	return (0);
 }
 
-/*
- * TODO: Spread the stalls out, so we don't flood at the start of each
- * second and then pause. Doing this every 10th of a second is probably enough
- */
-static void
-worker_throttle(int64_t throttle, int64_t *ops, struct timespec *interval)
-{
-	struct timespec now;
-	uint64_t usecs_to_complete;
-	if (*ops < throttle)
-		return;
-
-	/* Ignore errors, we don't really care. */
-	if (__wt_epoch(NULL, &now) != 0)
-		return;
-
-	/*
-	 * If we've completed enough operations, reset the counters.
-	 * If we did enough operations in less than a second, sleep for
-	 * the rest of the second.
-	 */
-	usecs_to_complete = ns_to_us(WT_TIMEDIFF(now, *interval));
-	if (usecs_to_complete < USEC_PER_SEC)
-		(void)usleep((useconds_t)(USEC_PER_SEC - usecs_to_complete));
-
-	*ops = 0;
-	*interval = now;
-}
-
 static int
 drop_all_tables(CONFIG *cfg)
 {
@@ -2346,7 +2443,7 @@ drop_all_tables(CONFIG *cfg)
 		}
 	}
 	(void)__wt_epoch(NULL, &stop);
-	msecs = ns_to_ms(WT_TIMEDIFF(stop, start));
+	msecs = WT_TIMEDIFF_MS(stop, start);
 	lprintf(cfg, 0, 1,
 	    "Executed %" PRIu32 " drop operations average time %" PRIu64 "ms",
 	    cfg->table_count, msecs / cfg->table_count);
@@ -2361,7 +2458,12 @@ wtperf_value_range(CONFIG *cfg)
 {
 	if (cfg->random_range)
 		return (cfg->icount + cfg->random_range);
-
+	/*
+	 * It is legal to configure a zero size populate phase, hide that
+	 * from other code by pretending the range is 1 in that case.
+	 */
+	if (cfg->icount + cfg->insert_key == 0)
+		return (1);
 	return (cfg->icount + cfg->insert_key - (u_int)(cfg->workers_cnt + 1));
 }
 

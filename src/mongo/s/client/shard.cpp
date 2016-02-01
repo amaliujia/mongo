@@ -50,20 +50,16 @@ using std::stringstream;
 Shard::Shard(const ShardId& id,
              const ConnectionString& connStr,
              std::unique_ptr<RemoteCommandTargeter> targeter)
-    : _id(id), _cs(connStr), _targeter(std::move(targeter)) {}
+    : _id(id), _cs(connStr), _targeter(targeter.release()) {}
 
 Shard::~Shard() = default;
 
-ShardPtr Shard::lookupRSName(const string& name) {
-    return grid.shardRegistry()->lookupRSName(name);
+bool Shard::isConfig() const {
+    return _id == "config";
 }
 
 std::string Shard::toString() const {
     return _id + ":" + _cs.toString();
-}
-
-void Shard::reloadShardInfo() {
-    grid.shardRegistry()->reload();
 }
 
 }  // namespace mongo

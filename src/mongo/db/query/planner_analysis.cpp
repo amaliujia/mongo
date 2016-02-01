@@ -30,9 +30,13 @@
 
 #include "mongo/db/query/planner_analysis.h"
 
+#include <set>
 #include <vector>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/s2_common.h"
+#include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/util/log.h"
@@ -209,7 +213,7 @@ void explodeScan(IndexScanNode* isn,
 
         // Copy the filter, if there is one.
         if (isn->filter.get()) {
-            child->filter = std::move(isn->filter->shallowClone());
+            child->filter = isn->filter->shallowClone();
         }
 
         // Create child bounds.
@@ -254,9 +258,59 @@ bool hasNode(QuerySolutionNode* root, StageType type) {
     return false;
 }
 
+void geoSkipValidationOn(const std::set<StringData>& twoDSphereFields,
+                         QuerySolutionNode* solnRoot) {
+    // If there is a GeoMatchExpression in the tree on a field with a 2dsphere index,
+    // we can skip validation since it was validated on insertion. This only applies to
+    // 2dsphere index version >= 3.
+    //
+    // This does not mean that there is necessarily an IXSCAN using this 2dsphere index,
+    // only that there exists a 2dsphere index on this field.
+    MatchExpression* expr = solnRoot->filter.get();
+    if (expr) {
+        StringData nodeField = expr->path();
+        if (expr->matchType() == MatchExpression::GEO &&
+            twoDSphereFields.find(nodeField) != twoDSphereFields.end()) {
+            GeoMatchExpression* gme = static_cast<GeoMatchExpression*>(expr);
+            gme->setCanSkipValidation(true);
+        }
+    }
+
+    for (QuerySolutionNode* child : solnRoot->children) {
+        geoSkipValidationOn(twoDSphereFields, child);
+    }
+}
+
 }  // namespace
 
 // static
+void QueryPlannerAnalysis::analyzeGeo(const QueryPlannerParams& params,
+                                      QuerySolutionNode* solnRoot) {
+    // Get field names of all 2dsphere indexes with version >= 3.
+    std::set<StringData> twoDSphereFields;
+    for (const IndexEntry& indexEntry : params.indices) {
+        if (indexEntry.type != IndexType::INDEX_2DSPHERE) {
+            continue;
+        }
+
+        S2IndexingParams params;
+        ExpressionParams::parse2dsphereParams(indexEntry.infoObj, &params);
+
+        if (params.indexVersion < S2_INDEX_VERSION_3) {
+            continue;
+        }
+
+        for (auto elt : indexEntry.keyPattern) {
+            if (elt.type() == BSONType::String && elt.String() == "2dsphere") {
+                twoDSphereFields.insert(elt.fieldName());
+            }
+        }
+    }
+    if (twoDSphereFields.size() > 0) {
+        geoSkipValidationOn(twoDSphereFields, solnRoot);
+    }
+}
+
 BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
     BSONObjBuilder sortBob;
     BSONObjIterator kpIt(indexKeyPattern);
@@ -265,8 +319,9 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
         if (elt.type() == mongo::String) {
             break;
         }
-        long long val = elt.safeNumberLong();
-        int sortOrder = val >= 0 ? 1 : -1;
+        // The canonical check as to whether a key pattern element is "ascending" or "descending" is
+        // (elt.number() >= 0). This is defined by the Ordering class.
+        int sortOrder = (elt.number() >= 0) ? 1 : -1;
         sortBob.append(elt.fieldName(), sortOrder);
     }
     return sortBob.obj();
@@ -456,10 +511,16 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
         solnRoot = fetch;
     }
 
-    // And build the full sort stage.
+    // And build the full sort stage. The sort stage has to have a sort key generating stage
+    // as its child, supplying it with the appropriate sort keys.
+    SortKeyGeneratorNode* keyGenNode = new SortKeyGeneratorNode();
+    keyGenNode->queryObj = lpq.getFilter();
+    keyGenNode->sortSpec = sortObj;
+    keyGenNode->children.push_back(solnRoot);
+    solnRoot = keyGenNode;
+
     SortNode* sort = new SortNode();
     sort->pattern = sortObj;
-    sort->query = lpq.getFilter();
     sort->children.push_back(solnRoot);
     solnRoot = sort;
     // When setting the limit on the sort, we need to consider both
@@ -467,15 +528,17 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     // N + M items so that the skip stage can discard the first M results.
     if (lpq.getLimit()) {
         // We have a true limit. The limit can be combined with the SORT stage.
-        sort->limit = static_cast<size_t>(*lpq.getLimit()) + static_cast<size_t>(lpq.getSkip());
-    } else if (!lpq.isFromFindCommand() && lpq.getBatchSize()) {
+        sort->limit =
+            static_cast<size_t>(*lpq.getLimit()) + static_cast<size_t>(lpq.getSkip().value_or(0));
+    } else if (lpq.getNToReturn()) {
         // We have an ntoreturn specified by an OP_QUERY style find. This is used
         // by clients to mean both batchSize and limit.
         //
         // Overflow here would be bad and could cause a nonsense limit. Cast
         // skip and limit values to unsigned ints to make sure that the
         // sum is never stored as signed. (See SERVER-13537).
-        sort->limit = static_cast<size_t>(*lpq.getBatchSize()) + static_cast<size_t>(lpq.getSkip());
+        sort->limit = static_cast<size_t>(*lpq.getNToReturn()) +
+            static_cast<size_t>(lpq.getSkip().value_or(0));
 
         // This is a SORT with a limit. The wire protocol has a single quantity
         // called "numToReturn" which could mean either limit or batchSize.
@@ -497,6 +560,9 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
         // with the topK first. If the client wants a limit, they'll get the efficiency
         // of topK. If they want a batchSize, the other OR branch will deliver the missing
         // results. The OR stage handles deduping.
+        //
+        // We must also add an ENSURE_SORTED node above the OR to ensure that the final results are
+        // in correct sorted order, which may not be true if the data is concurrently modified.
         if (lpq.wantMore() && params.options & QueryPlannerParams::SPLIT_LIMITED_SORT &&
             !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) &&
             !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO) &&
@@ -511,7 +577,12 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
             SortNode* sortClone = static_cast<SortNode*>(sort->clone());
             sortClone->limit = 0;
             orn->children.push_back(sortClone);
-            solnRoot = orn;
+
+            // Add ENSURE_SORTED above the OR.
+            EnsureSortedNode* esn = new EnsureSortedNode();
+            esn->pattern = sort->pattern;
+            esn->children.push_back(orn);
+            solnRoot = esn;
         }
     } else {
         sort->limit = 0;
@@ -531,6 +602,8 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
     soln->indexFilterApplied = params.indexFiltersApplied;
 
     solnRoot->computeProperties();
+
+    analyzeGeo(params, solnRoot);
 
     // solnRoot finds all our results.  Let's see what transformations we must perform to the
     // data.
@@ -592,25 +665,28 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
     //
     // 3. There is an index-provided sort.  Ditto above comment about merging.
     //
+    // 4. There is a SORT that is not at the root of solution tree. Ditto above comment about
+    // merging.
+    //
     // TODO: do we want some kind of pre-planning step where we look for certain nodes and cache
     // them?  We do lookups in the tree a few times.  This may not matter as most trees are
     // shallow in terms of query nodes.
-    bool cannotKeepFlagged = hasNode(solnRoot, STAGE_TEXT) ||
+    const bool hasNotRootSort = hasSortStage && STAGE_SORT != solnRoot->getType();
+
+    const bool cannotKeepFlagged = hasNode(solnRoot, STAGE_TEXT) ||
         hasNode(solnRoot, STAGE_GEO_NEAR_2D) || hasNode(solnRoot, STAGE_GEO_NEAR_2DSPHERE) ||
-        (!lpq.getSort().isEmpty() && !hasSortStage);
+        (!lpq.getSort().isEmpty() && !hasSortStage) || hasNotRootSort;
 
-    // Only these stages can produce flagged results.  A stage has to hold state past one call
-    // to work(...) in order to possibly flag a result.
-    bool couldProduceFlagged =
-        hasAndHashStage || hasNode(solnRoot, STAGE_AND_SORTED) || hasNode(solnRoot, STAGE_FETCH);
+    // Only index intersection stages ever produce flagged results.
+    const bool couldProduceFlagged = hasAndHashStage || hasNode(solnRoot, STAGE_AND_SORTED);
 
-    bool shouldAddMutation = !cannotKeepFlagged && couldProduceFlagged;
+    const bool shouldAddMutation = !cannotKeepFlagged && couldProduceFlagged;
 
     if (shouldAddMutation && (params.options & QueryPlannerParams::KEEP_MUTATIONS)) {
         KeepMutationsNode* keep = new KeepMutationsNode();
 
         // We must run the entire expression tree to make sure the document is still valid.
-        keep->filter = std::move(query.root()->shallowClone());
+        keep->filter = query.root()->shallowClone();
 
         if (STAGE_SORT == solnRoot->getType()) {
             // We want to insert the invalidated results before the sort stage, if there is one.
@@ -696,6 +772,30 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
                     }
                 }
             }
+
+            // If we have a $meta sortKey, just use the project default path, as currently the
+            // project fast paths cannot handle $meta sortKey projections.
+            if (query.getProj()->wantSortKey()) {
+                projType = ProjectionNode::DEFAULT;
+                LOG(5) << "PROJECTION: needs $meta sortKey, using DEFAULT path instead";
+            }
+        }
+        // If we don't have a covered project, and we're not allowed to put an uncovered one in,
+        // bail out.
+        if (solnRoot->fetched() &&
+            (params.options & QueryPlannerParams::NO_UNCOVERED_PROJECTIONS)) {
+            delete solnRoot;
+            return nullptr;
+        }
+
+        // If there's no sort stage but we have a sortKey meta-projection, we need to add a stage to
+        // generate the sort key computed data.
+        if (!hasSortStage && query.getProj()->wantSortKey()) {
+            SortKeyGeneratorNode* keyGenNode = new SortKeyGeneratorNode();
+            keyGenNode->queryObj = lpq.getFilter();
+            keyGenNode->sortSpec = lpq.getSort();
+            keyGenNode->children.push_back(solnRoot);
+            solnRoot = keyGenNode;
         }
 
         // We now know we have whatever data is required for the projection.
@@ -715,9 +815,9 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
         }
     }
 
-    if (0 != lpq.getSkip()) {
+    if (lpq.getSkip()) {
         SkipNode* skip = new SkipNode();
-        skip->skip = lpq.getSkip();
+        skip->skip = *lpq.getSkip();
         skip->children.push_back(solnRoot);
         solnRoot = skip;
     }
@@ -734,11 +834,11 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
             limit->limit = *lpq.getLimit();
             limit->children.push_back(solnRoot);
             solnRoot = limit;
-        } else if (!lpq.isFromFindCommand() && lpq.getBatchSize() && !lpq.wantMore()) {
+        } else if (lpq.getNToReturn() && !lpq.wantMore()) {
             // We have a "legacy limit", i.e. a negative ntoreturn value from an OP_QUERY style
             // find.
             LimitNode* limit = new LimitNode();
-            limit->limit = *lpq.getBatchSize();
+            limit->limit = *lpq.getNToReturn();
             limit->children.push_back(solnRoot);
             solnRoot = limit;
         }

@@ -32,7 +32,6 @@
 
 #include <vector>
 
-#include "mongo/client/connpool.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
@@ -43,7 +42,6 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/config.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -54,7 +52,8 @@ using std::shared_ptr;
 using std::string;
 using mongoutils::str::stream;
 
-static Status runApplyOpsCmd(const std::vector<ChunkType>&,
+static Status runApplyOpsCmd(OperationContext* txn,
+                             const std::vector<ChunkType>&,
                              const ChunkVersion&,
                              const ChunkVersion&);
 
@@ -68,23 +67,10 @@ bool mergeChunks(OperationContext* txn,
                  const BSONObj& maxKey,
                  const OID& epoch,
                  string* errMsg) {
-    //
-    // Get sharding state up-to-date
-    //
-
-    ConnectionString configLoc = ConnectionString::parse(shardingState.getConfigServer(), *errMsg);
-    if (!configLoc.isValid()) {
-        warning() << *errMsg;
-        return false;
-    }
-
-    //
     // Get the distributed lock
-    //
-
     string whyMessage = stream() << "merging chunks in " << nss.ns() << " from " << minKey << " to "
                                  << maxKey;
-    auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(nss.ns(), whyMessage);
+    auto scopedDistLock = grid.forwardingCatalogManager()->distLock(txn, nss.ns(), whyMessage);
 
     if (!scopedDistLock.isOK()) {
         *errMsg = stream() << "could not acquire collection lock for " << nss.ns()
@@ -95,12 +81,14 @@ bool mergeChunks(OperationContext* txn,
         return false;
     }
 
+    ShardingState* shardingState = ShardingState::get(txn);
+
     //
     // We now have the collection lock, refresh metadata to latest version and sanity check
     //
 
     ChunkVersion shardVersion;
-    Status status = shardingState.refreshMetadataNow(txn, nss.ns(), &shardVersion);
+    Status status = shardingState->refreshMetadataNow(txn, nss.ns(), &shardVersion);
 
     if (!status.isOK()) {
         *errMsg = str::stream() << "could not merge chunks, failed to refresh metadata for "
@@ -120,7 +108,7 @@ bool mergeChunks(OperationContext* txn,
         return false;
     }
 
-    shared_ptr<CollectionMetadata> metadata = shardingState.getCollectionMetadata(nss.ns());
+    shared_ptr<CollectionMetadata> metadata = shardingState->getCollectionMetadata(nss.ns());
 
     if (!metadata || metadata->getKeyPattern().isEmpty()) {
         *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
@@ -155,7 +143,7 @@ bool mergeChunks(OperationContext* txn,
     itChunk.setMin(minKey);
     itChunk.setMax(minKey);
     itChunk.setNS(nss.ns());
-    itChunk.setShard(shardingState.getShardName());
+    itChunk.setShard(shardingState->getShardName());
 
     while (itChunk.getMax().woCompare(maxKey) < 0 &&
            metadata->getNextChunk(itChunk.getMax(), &itChunk)) {
@@ -165,7 +153,7 @@ bool mergeChunks(OperationContext* txn,
     if (chunksToMerge.empty()) {
         *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
                            << " range starting at " << minKey << " and ending at " << maxKey
-                           << " does not belong to shard " << shardingState.getShardName();
+                           << " does not belong to shard " << shardingState->getShardName();
 
         warning() << *errMsg;
         return false;
@@ -183,7 +171,7 @@ bool mergeChunks(OperationContext* txn,
     if (!minKeyInRange) {
         *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
                            << " range starting at " << minKey << " does not belong to shard "
-                           << shardingState.getShardName();
+                           << shardingState->getShardName();
 
         warning() << *errMsg;
         return false;
@@ -197,7 +185,7 @@ bool mergeChunks(OperationContext* txn,
     if (!maxKeyInRange) {
         *errMsg = stream() << "could not merge chunks, collection " << nss.ns()
                            << " range ending at " << maxKey << " does not belong to shard "
-                           << shardingState.getShardName();
+                           << shardingState->getShardName();
 
         warning() << *errMsg;
         return false;
@@ -241,7 +229,7 @@ bool mergeChunks(OperationContext* txn,
     //
     // Run apply ops command
     //
-    Status applyOpsStatus = runApplyOpsCmd(chunksToMerge, shardVersion, mergeVersion);
+    Status applyOpsStatus = runApplyOpsCmd(txn, chunksToMerge, shardVersion, mergeVersion);
     if (!applyOpsStatus.isOK()) {
         warning() << applyOpsStatus;
         return false;
@@ -255,7 +243,8 @@ bool mergeChunks(OperationContext* txn,
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock writeLk(txn->lockState(), nss.db(), MODE_IX);
         Lock::CollectionLock collLock(txn->lockState(), nss.ns(), MODE_X);
-        shardingState.mergeChunks(txn, nss.ns(), minKey, maxKey, mergeVersion);
+
+        shardingState->mergeChunks(txn, nss.ns(), minKey, maxKey, mergeVersion);
     }
 
     //
@@ -264,8 +253,7 @@ bool mergeChunks(OperationContext* txn,
 
     BSONObj mergeLogEntry = buildMergeLogEntry(chunksToMerge, shardVersion, mergeVersion);
 
-    grid.catalogManager()->logChange(
-        txn->getClient()->clientAddress(true), "merge", nss.ns(), mergeLogEntry);
+    grid.catalogManager(txn)->logChange(txn, "merge", nss.ns(), mergeLogEntry);
 
     return true;
 }
@@ -341,7 +329,8 @@ BSONArray buildOpPrecond(const string& ns,
     return preCond.arr();
 }
 
-Status runApplyOpsCmd(const std::vector<ChunkType>& chunksToMerge,
+Status runApplyOpsCmd(OperationContext* txn,
+                      const std::vector<ChunkType>& chunksToMerge,
                       const ChunkVersion& currShardVersion,
                       const ChunkVersion& newMergedVersion) {
     BSONArrayBuilder updatesB;
@@ -365,6 +354,6 @@ Status runApplyOpsCmd(const std::vector<ChunkType>& chunksToMerge,
     }
 
     BSONArray preCond = buildOpPrecond(firstChunk.getNS(), firstChunk.getShard(), currShardVersion);
-    return grid.catalogManager()->applyChunkOpsDeprecated(updatesB.arr(), preCond);
+    return grid.catalogManager(txn)->applyChunkOpsDeprecated(txn, updatesB.arr(), preCond);
 }
 }

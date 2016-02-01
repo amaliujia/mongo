@@ -64,6 +64,8 @@ namespace repl {
 namespace {
 
 using executor::NetworkInterfaceMock;
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
 
 class CheckQuorumTest : public mongo::unittest::Test {
 protected:
@@ -672,10 +674,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
                                                                                      << "h3:1")
                                               << BSON("_id" << 4 << "host"
                                                             << "h4:1"
-                                                            << "votes" << 0)
+                                                            << "votes" << 0 << "priority" << 0)
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"
-                                                            << "votes" << 0))));
+                                                            << "votes" << 0 << "priority" << 0))));
     const int myConfigIndex = 3;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 
@@ -782,10 +784,10 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
                                                                                      << "h3:1")
                                               << BSON("_id" << 4 << "host"
                                                             << "h4:1"
-                                                            << "votes" << 0)
+                                                            << "votes" << 0 << "priority" << 0)
                                               << BSON("_id" << 5 << "host"
                                                             << "h5:1"
-                                                            << "votes" << 0))));
+                                                            << "votes" << 0 << "priority" << 0))));
     const int myConfigIndex = 3;
     const BSONObj hbRequest = makeHeartbeatRequest(rsConfig, myConfigIndex);
 

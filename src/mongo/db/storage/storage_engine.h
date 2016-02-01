@@ -122,6 +122,17 @@ public:
          * on restart.
          */
         virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const = 0;
+
+        /**
+         * Returns whether the engine supports read-only mode. If read-only mode is enabled, the
+         * engine may be started on a read-only filesystem (either mounted read-only or with
+         * read-only permissions). If readOnly mode is enabled, it is undefined behavior to call
+         * methods that write data (e.g. insertRecord). This method is provided on the Factory
+         * because it must be called before the storageEngine is instantiated.
+         */
+        virtual bool supportsReadOnly() const {
+            return false;
+        }
     };
 
     /**
@@ -190,6 +201,41 @@ public:
      * @return number of files flushed
      */
     virtual int flushAllFiles(bool sync) = 0;
+
+    /**
+     * Transitions the storage engine into backup mode.
+     *
+     * During backup mode the storage engine must stabilize its on-disk files, and avoid
+     * any internal processing that may involve file I/O, such as online compaction, so
+     * a filesystem level backup may be performed.
+     *
+     * Storage engines that do not support this feature should use the default implementation.
+     * Storage engines that implement this must also implement endBackup().
+     *
+     * For Storage engines that implement beginBackup the _inBackupMode variable is provided
+     * to avoid multiple instance enterting/leaving backup concurrently.
+     *
+     * If this function returns an OK status, MongoDB can call endBackup to signal the storage
+     * engine that filesystem writes may continue. This function should return a non-OK status if
+     * filesystem changes cannot be stopped to allow for online backup. If the function should be
+     * retried, returns a non-OK status. This function may throw a WriteConflictException, which
+     * should trigger a retry by the caller. All other exceptions should be treated as errors.
+     */
+    virtual Status beginBackup(OperationContext* txn) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    /**
+     * Transitions the storage engine out of backup mode.
+     *
+     * Storage engines that do not support this feature should use the default implementation.
+     *
+     * Storage engines implementing this feature should fassert when unable to leave backup mode.
+     */
+    virtual void endBackup(OperationContext* txn) {
+        return;
+    }
 
     /**
      * Recover as much data as possible from a potentially corrupt RecordStore.

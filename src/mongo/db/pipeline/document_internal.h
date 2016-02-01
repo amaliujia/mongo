@@ -31,6 +31,7 @@
 #include <third_party/murmurhash3/MurmurHash3.h>
 
 #include <boost/intrusive_ptr.hpp>
+#include <bitset>
 
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/db/pipeline/value.h"
@@ -181,20 +182,27 @@ private:
 /// Storage class used by both Document and MutableDocument
 class DocumentStorage : public RefCountable {
 public:
-    // Note: default constructor should zero-init to support emptyDoc()
     DocumentStorage()
         : _buffer(NULL),
           _bufferEnd(NULL),
           _usedBytes(0),
           _numFields(0),
           _hashTabMask(0),
-          _hasTextScore(false),
-          _textScore(0) {}
+          _metaFields(),
+          _textScore(0),
+          _randVal(0) {}
+
     ~DocumentStorage();
 
+    enum MetaType : char {
+        TEXT_SCORE,
+        RAND_VAL,
+
+        NUM_FIELDS
+    };
+
     static const DocumentStorage& emptyDoc() {
-        static const char emptyBytes[sizeof(DocumentStorage)] = {0};
-        return *reinterpret_cast<const DocumentStorage*>(emptyBytes);
+        return kEmptyDoc;
     }
 
     size_t size() const {
@@ -270,17 +278,31 @@ public:
         if (source.hasTextScore()) {
             setTextScore(source.getTextScore());
         }
+        if (source.hasRandMetaField()) {
+            setRandMetaField(source.getRandMetaField());
+        }
     }
 
     bool hasTextScore() const {
-        return _hasTextScore;
+        return _metaFields.test(MetaType::TEXT_SCORE);
     }
     double getTextScore() const {
         return _textScore;
     }
     void setTextScore(double score) {
-        _hasTextScore = true;
+        _metaFields.set(MetaType::TEXT_SCORE);
         _textScore = score;
+    }
+
+    bool hasRandMetaField() const {
+        return _metaFields.test(MetaType::RAND_VAL);
+    }
+    double getRandMetaField() const {
+        return _randVal;
+    }
+    void setRandMetaField(double val) {
+        _metaFields.set(MetaType::RAND_VAL);
+        _randVal = val;
     }
 
 private:
@@ -361,8 +383,12 @@ private:
     unsigned _numFields;    // this includes removed fields
     unsigned _hashTabMask;  // equal to hashTabBuckets()-1 but used more often
 
-    bool _hasTextScore;  // When adding more metadata fields, this should become a bitvector
+    std::bitset<MetaType::NUM_FIELDS> _metaFields;
     double _textScore;
+    double _randVal;
     // When adding a field, make sure to update clone() method
+
+    // Defined in document.cpp
+    static const DocumentStorage kEmptyDoc;
 };
 }

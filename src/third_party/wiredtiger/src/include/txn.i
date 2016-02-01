@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -105,19 +105,20 @@ __wt_txn_oldest_id(WT_SESSION_IMPL *session)
 {
 	WT_BTREE *btree;
 	WT_TXN_GLOBAL *txn_global;
-	uint64_t checkpoint_snap_min, oldest_id;
-	uint32_t checkpoint_id;
+	uint64_t checkpoint_gen, checkpoint_pinned, oldest_id;
 
 	txn_global = &S2C(session)->txn_global;
 	btree = S2BT_SAFE(session);
 
 	/*
 	 * Take a local copy of these IDs in case they are updated while we are
-	 * checking visibility.
+	 * checking visibility.  Only the generation needs to be carefully
+	 * ordered: if a checkpoint is starting and the generation is bumped,
+	 * we take the minimum of the other two IDs, which is what we want.
 	 */
-	checkpoint_id = txn_global->checkpoint_id;
-	checkpoint_snap_min = txn_global->checkpoint_snap_min;
 	oldest_id = txn_global->oldest_id;
+	WT_ORDERED_READ(checkpoint_gen, txn_global->checkpoint_gen);
+	checkpoint_pinned = txn_global->checkpoint_pinned;
 
 	/*
 	 * Checkpoint transactions often fall behind ordinary application
@@ -129,17 +130,23 @@ __wt_txn_oldest_id(WT_SESSION_IMPL *session)
 	 * checkpoint, or this handle is up to date with the active checkpoint
 	 * then it's safe to ignore the checkpoint ID in the visibility check.
 	 */
-	if (checkpoint_snap_min != WT_TXN_NONE &&
-	    checkpoint_id != session->id && (btree == NULL ||
-	    btree->checkpoint_gen != txn_global->checkpoint_gen) &&
-	    WT_TXNID_LT(checkpoint_snap_min, oldest_id))
-		/*
-		 * Use the checkpoint ID for the visibility check if it is the
-		 * oldest ID in the system.
-		 */
-		oldest_id = checkpoint_snap_min;
+	if (checkpoint_pinned == WT_TXN_NONE ||
+	    WT_TXNID_LT(oldest_id, checkpoint_pinned) ||
+	    WT_SESSION_IS_CHECKPOINT(session) ||
+	    (btree != NULL && btree->checkpoint_gen == checkpoint_gen))
+		return (oldest_id);
 
-	return (oldest_id);
+	return (checkpoint_pinned);
+}
+
+/*
+ * __wt_txn_committed --
+ *	Return if a transaction has been committed.
+ */
+static inline bool
+__wt_txn_committed(WT_SESSION_IMPL *session, uint64_t id)
+{
+	return (WT_TXNID_LT(id, S2C(session)->txn_global.last_running));
 }
 
 /*
@@ -148,7 +155,7 @@ __wt_txn_oldest_id(WT_SESSION_IMPL *session)
  *	all sessions in the system will see the transaction ID including the
  *	ID that belongs to a running checkpoint.
  */
-static inline int
+static inline bool
 __wt_txn_visible_all(WT_SESSION_IMPL *session, uint64_t id)
 {
 	uint64_t oldest_id;
@@ -162,46 +169,36 @@ __wt_txn_visible_all(WT_SESSION_IMPL *session, uint64_t id)
  * __wt_txn_visible --
  *	Can the current transaction see the given ID?
  */
-static inline int
+static inline bool
 __wt_txn_visible(WT_SESSION_IMPL *session, uint64_t id)
 {
 	WT_TXN *txn;
-	int found;
+	bool found;
 
 	txn = &session->txn;
 
 	/* Changes with no associated transaction are always visible. */
 	if (id == WT_TXN_NONE)
-		return (1);
+		return (true);
 
 	/* Nobody sees the results of aborted transactions. */
 	if (id == WT_TXN_ABORTED)
-		return (0);
+		return (false);
+
+	/* Read-uncommitted transactions see all other changes. */
+	if (txn->isolation == WT_ISO_READ_UNCOMMITTED)
+		return (true);
 
 	/*
-	 * Eviction only sees globally visible updates, or if there is a
-	 * checkpoint transaction running, use its transaction.
+	 * If we don't have a transactional snapshot, only make stable updates
+	 * visible.
 	 */
-	if (txn->isolation == WT_ISO_EVICTION)
+	if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
 		return (__wt_txn_visible_all(session, id));
-
-	/*
-	 * Read-uncommitted transactions see all other changes.
-	 *
-	 * All metadata reads are at read-uncommitted isolation.  That's
-	 * because once a schema-level operation completes, subsequent
-	 * operations must see the current version of checkpoint metadata, or
-	 * they may try to read blocks that may have been freed from a file.
-	 * Metadata updates use non-transactional techniques (such as the
-	 * schema and metadata locks) to protect access to in-flight updates.
-	 */
-	if (txn->isolation == WT_ISO_READ_UNCOMMITTED ||
-	    session->dhandle == session->meta_dhandle)
-		return (1);
 
 	/* Transactions see their own changes. */
 	if (id == txn->id)
-		return (1);
+		return (true);
 
 	/*
 	 * WT_ISO_SNAPSHOT, WT_ISO_READ_COMMITTED: the ID is visible if it is
@@ -213,9 +210,9 @@ __wt_txn_visible(WT_SESSION_IMPL *session, uint64_t id)
 	 * snapshot is empty.
 	 */
 	if (WT_TXNID_LE(txn->snap_max, id))
-		return (0);
+		return (false);
 	if (txn->snapshot_count == 0 || WT_TXNID_LT(id, txn->snap_min))
-		return (1);
+		return (true);
 
 	WT_BINARY_SEARCH(id, txn->snapshot, txn->snapshot_count, found);
 	return (!found);
@@ -263,13 +260,13 @@ __wt_txn_begin(WT_SESSION_IMPL *session, const char *cfg[])
 		 * We're about to allocate a snapshot: if we need to block for
 		 * eviction, it's better to do it beforehand.
 		 */
-		WT_RET(__wt_cache_eviction_check(session, 0, NULL));
+		WT_RET(__wt_cache_eviction_check(session, false, NULL));
 
 		__wt_txn_get_snapshot(session);
 	}
 
 	F_SET(txn, WT_TXN_RUNNING);
-	return (0);
+	return (false);
 }
 
 /*
@@ -287,23 +284,6 @@ __wt_txn_autocommit_check(WT_SESSION_IMPL *session)
 		return (__wt_txn_begin(session, NULL));
 	}
 	return (0);
-}
-
-/*
- * __wt_txn_new_id --
- *	Allocate a new transaction ID.
- */
-static inline uint64_t
-__wt_txn_new_id(WT_SESSION_IMPL *session)
-{
-	/*
-	 * We want the global value to lead the allocated values, so that any
-	 * allocated transaction ID eventually becomes globally visible.  When
-	 * there are no transactions running, the oldest_id will reach the
-	 * global current ID, so we want post-increment semantics.  Our atomic
-	 * add primitive does pre-increment, so adjust the result here.
-	 */
-	return (WT_ATOMIC_ADD8(S2C(session)->txn_global.current, 1) - 1);
 }
 
 /*
@@ -327,9 +307,57 @@ __wt_txn_idle_cache_check(WT_SESSION_IMPL *session)
 	 */
 	if (F_ISSET(txn, WT_TXN_RUNNING) &&
 	    !F_ISSET(txn, WT_TXN_HAS_ID) && txn_state->snap_min == WT_TXN_NONE)
-		WT_RET(__wt_cache_eviction_check(session, 0, NULL));
+		WT_RET(__wt_cache_eviction_check(session, false, NULL));
 
 	return (0);
+}
+
+/*
+ * __wt_txn_id_alloc --
+ *	Allocate a new transaction ID.
+ */
+static inline uint64_t
+__wt_txn_id_alloc(WT_SESSION_IMPL *session, bool publish)
+{
+	WT_TXN_GLOBAL *txn_global;
+	uint64_t id;
+
+	txn_global = &S2C(session)->txn_global;
+
+	/*
+	 * Allocating transaction IDs involves several steps.
+	 *
+	 * Firstly, we do an atomic increment to allocate a unique ID.  The
+	 * field we increment is not used anywhere else.
+	 *
+	 * Then we optionally publish the allocated ID into the global
+	 * transaction table.  It is critical that this becomes visible before
+	 * the global current value moves past our ID, or some concurrent
+	 * reader could get a snapshot that makes our changes visible before we
+	 * commit.
+	 *
+	 * Lastly, we spin to update the current ID.  This is the only place
+	 * that the current ID is updated, and it is in the same cache line as
+	 * the field we allocate from, so we should usually succeed on the
+	 * first try.
+	 *
+	 * We want the global value to lead the allocated values, so that any
+	 * allocated transaction ID eventually becomes globally visible.  When
+	 * there are no transactions running, the oldest_id will reach the
+	 * global current ID, so we want post-increment semantics.  Our atomic
+	 * add primitive does pre-increment, so adjust the result here.
+	 */
+	 __wt_spin_lock(session, &txn_global->id_lock);
+	id = txn_global->current;
+
+	if (publish) {
+		session->txn.id = id;
+		WT_PUBLISH(WT_SESSION_TXN_STATE(session)->id, id);
+	}
+
+	++txn_global->current;
+	 __wt_spin_unlock(session, &txn_global->id_lock);
+	return (id);
 }
 
 /*
@@ -340,56 +368,27 @@ __wt_txn_idle_cache_check(WT_SESSION_IMPL *session)
 static inline int
 __wt_txn_id_check(WT_SESSION_IMPL *session)
 {
-	WT_CONNECTION_IMPL *conn;
 	WT_TXN *txn;
-	WT_TXN_GLOBAL *txn_global;
-	WT_TXN_STATE *txn_state;
 
 	txn = &session->txn;
 
 	WT_ASSERT(session, F_ISSET(txn, WT_TXN_RUNNING));
 
+	if (F_ISSET(txn, WT_TXN_HAS_ID))
+		return (0);
+
 	/* If the transaction is idle, check that the cache isn't full. */
 	WT_RET(__wt_txn_idle_cache_check(session));
 
-	if (!F_ISSET(txn, WT_TXN_HAS_ID)) {
-		conn = S2C(session);
-		txn_global = &conn->txn_global;
-		txn_state = &txn_global->states[session->id];
+	(void)__wt_txn_id_alloc(session, true);
 
-		WT_ASSERT(session, txn_state->id == WT_TXN_NONE);
-
-		/*
-		 * Allocate a transaction ID.
-		 *
-		 * We use an atomic compare and swap to ensure that we get a
-		 * unique ID that is published before the global counter is
-		 * updated.
-		 *
-		 * If two threads race to allocate an ID, only the latest ID
-		 * will proceed.  The winning thread can be sure its snapshot
-		 * contains all of the earlier active IDs.  Threads that race
-		 * and get an earlier ID may not appear in the snapshot, but
-		 * they will loop and allocate a new ID before proceeding to
-		 * make any updates.
-		 *
-		 * This potentially wastes transaction IDs when threads race to
-		 * begin transactions: that is the price we pay to keep this
-		 * path latch free.
-		 */
-		do {
-			txn_state->id = txn->id = txn_global->current;
-		} while (!WT_ATOMIC_CAS8(
-		    txn_global->current, txn->id, txn->id + 1));
-
-		/*
-		 * If we have used 64-bits of transaction IDs, there is nothing
-		 * more we can do.
-		 */
-		if (txn->id == WT_TXN_ABORTED)
-			WT_RET_MSG(session, ENOMEM, "Out of transaction IDs");
-		F_SET(txn, WT_TXN_HAS_ID);
-	}
+	/*
+	 * If we have used 64-bits of transaction IDs, there is nothing
+	 * more we can do.
+	 */
+	if (txn->id == WT_TXN_ABORTED)
+		WT_RET_MSG(session, ENOMEM, "Out of transaction IDs");
+	F_SET(txn, WT_TXN_HAS_ID);
 
 	return (0);
 }
@@ -428,9 +427,15 @@ __wt_txn_read_last(WT_SESSION_IMPL *session)
 
 	txn = &session->txn;
 
-	/* Release the snap_min ID we put in the global table. */
-	if (!F_ISSET(txn, WT_TXN_RUNNING) ||
-	    txn->isolation != WT_ISO_SNAPSHOT)
+	/*
+	 * Release the snap_min ID we put in the global table.
+	 *
+	 * If the isolation has been temporarily forced, don't touch the
+	 * snapshot here: it will be restored by WT_WITH_TXN_ISOLATION.
+	 */
+	if ((!F_ISSET(txn, WT_TXN_RUNNING) ||
+	    txn->isolation != WT_ISO_SNAPSHOT) &&
+	    txn->forced_iso == 0)
 		__wt_txn_release_snapshot(session);
 }
 
@@ -447,31 +452,29 @@ __wt_txn_cursor_op(WT_SESSION_IMPL *session)
 
 	txn = &session->txn;
 	txn_global = &S2C(session)->txn_global;
-	txn_state = &txn_global->states[session->id];
+	txn_state = WT_SESSION_TXN_STATE(session);
 
 	/*
-	 * If there is no transaction running (so we don't have an ID), and no
-	 * snapshot allocated, put an ID in the global table to prevent any
-	 * update that we are reading from being trimmed to save memory.  Do a
-	 * read before the write because this shared data is accessed a lot.
+	 * We are about to read data, which means we need to protect against
+	 * updates being freed from underneath this cursor. Read-uncommitted
+	 * isolation protects values by putting a transaction ID in the global
+	 * table to prevent any update that we are reading from being freed.
+	 * Other isolation levels get a snapshot to protect their reads.
 	 *
 	 * !!!
-	 * Note:  We are updating the global table unprotected, so the
-	 * oldest_id may move past this ID if a scan races with this
-	 * value being published.  That said, read-uncommitted operations
-	 * always take the most recent version of a value, so for that version
-	 * to be freed, two newer versions would have to be committed.	Putting
-	 * this snap_min ID in the table prevents the oldest ID from moving
+	 * Note:  We are updating the global table unprotected, so the global
+	 * oldest_id may move past our snap_min if a scan races with this value
+	 * being published. That said, read-uncommitted operations always see
+	 * the most recent update for each record that has not been aborted
+	 * regardless of the snap_min value published here.  Even if there is a
+	 * race while publishing this ID, it prevents the oldest ID from moving
 	 * further forward, so that once a read-uncommitted cursor is
 	 * positioned on a value, it can't be freed.
 	 */
-	if (txn->isolation == WT_ISO_READ_UNCOMMITTED &&
-	    !F_ISSET(txn, WT_TXN_HAS_ID) &&
-	    WT_TXNID_LT(txn_state->snap_min, txn_global->last_running))
-		txn_state->snap_min = txn_global->last_running;
-
-	if (txn->isolation != WT_ISO_READ_UNCOMMITTED &&
-	    !F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
+	if (txn->isolation == WT_ISO_READ_UNCOMMITTED) {
+		if (txn_state->snap_min == WT_TXN_NONE)
+			txn_state->snap_min = txn_global->last_running;
+	} else if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
 		__wt_txn_get_snapshot(session);
 }
 
@@ -479,7 +482,7 @@ __wt_txn_cursor_op(WT_SESSION_IMPL *session)
  * __wt_txn_am_oldest --
  *	Am I the oldest transaction in the system?
  */
-static inline int
+static inline bool
 __wt_txn_am_oldest(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
@@ -494,12 +497,12 @@ __wt_txn_am_oldest(WT_SESSION_IMPL *session)
 	txn_global = &conn->txn_global;
 
 	if (txn->id == WT_TXN_NONE)
-		return (0);
+		return (false);
 
 	WT_ORDERED_READ(session_cnt, conn->session_cnt);
 	for (i = 0, s = txn_global->states; i < session_cnt; i++, s++)
 		if ((id = s->id) != WT_TXN_NONE && WT_TXNID_LT(id, txn->id))
-			return (0);
+			return (false);
 
-	return (1);
+	return (true);
 }

@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/client.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
@@ -36,9 +37,14 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/client/dbclient_multi_command.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_explain.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/cluster_write.h"
+#include "mongo/s/dbclient_shard_resolver.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batch_upconvert.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
@@ -91,6 +97,7 @@ public:
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
+                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
         BatchedCommandRequest request(_writeType);
 
@@ -105,7 +112,9 @@ public:
         }
 
         BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        int options = 0;
+        ClusterExplain::wrapAsExplain(
+            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
@@ -113,14 +122,14 @@ public:
         // Target the command to the shards based on the singleton batch item.
         BatchItemRef targetingBatchItem(&request, 0);
         vector<Strategy::CommandResult> shardResults;
-        Status status = Strategy::commandOpWrite(
-            dbname, explainCmdBob.obj(), targetingBatchItem, &shardResults);
+        Status status =
+            _commandOpWrite(txn, dbname, explainCmdBob.obj(), targetingBatchItem, &shardResults);
         if (!status.isOK()) {
             return status;
         }
 
         return ClusterExplain::buildExplainResult(
-            shardResults, ClusterExplain::kWriteOnShards, timer.millis(), out);
+            txn, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), out);
     }
 
     virtual bool run(OperationContext* txn,
@@ -147,7 +156,7 @@ public:
                 response.setErrCode(ErrorCodes::FailedToParse);
                 response.setErrMessage(errmsg);
             } else {
-                writer.write(request, &response);
+                writer.write(txn, request, &response);
             }
 
             dassert(response.isValid(NULL));
@@ -184,9 +193,8 @@ public:
         }
 
         // Save the last opTimes written on each shard for this client, to allow GLE to work
-        if (haveClient() && writer.getStats().hasShardStats()) {
-            ClusterLastErrorInfo::get(cc())
-                .addHostOpTimes(writer.getStats().getShardStats().getWriteOpTimes());
+        if (haveClient()) {
+            ClusterLastErrorInfo::get(cc()).addHostOpTimes(writer.getStats().getWriteOpTimes());
         }
 
         // TODO
@@ -209,6 +217,92 @@ protected:
 private:
     // Type of batch (e.g. insert, update).
     const BatchedCommandRequest::BatchType _writeType;
+
+    /**
+     * Executes a write command against a particular database, and targets the command based on
+     * a write operation.
+     *
+     * Does *not* retry or retarget if the metadata is stale.
+     */
+    static Status _commandOpWrite(OperationContext* txn,
+                                  const std::string& dbName,
+                                  const BSONObj& command,
+                                  BatchItemRef targetingBatchItem,
+                                  std::vector<Strategy::CommandResult>* results) {
+        // Note that this implementation will not handle targeting retries and does not completely
+        // emulate write behavior
+        TargeterStats stats;
+        ChunkManagerTargeter targeter(
+            NamespaceString(targetingBatchItem.getRequest()->getTargetingNS()), &stats);
+        Status status = targeter.init(txn);
+        if (!status.isOK())
+            return status;
+
+        OwnedPointerVector<ShardEndpoint> endpointsOwned;
+        vector<ShardEndpoint*>& endpoints = endpointsOwned.mutableVector();
+
+        if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
+            ShardEndpoint* endpoint;
+            Status status = targeter.targetInsert(txn, targetingBatchItem.getDocument(), &endpoint);
+            if (!status.isOK())
+                return status;
+            endpoints.push_back(endpoint);
+        } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
+            Status status = targeter.targetUpdate(txn, *targetingBatchItem.getUpdate(), &endpoints);
+            if (!status.isOK())
+                return status;
+        } else {
+            invariant(targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Delete);
+            Status status = targeter.targetDelete(txn, *targetingBatchItem.getDelete(), &endpoints);
+            if (!status.isOK())
+                return status;
+        }
+
+        DBClientShardResolver resolver;
+        DBClientMultiCommand dispatcher;
+
+        // Assemble requests
+        for (vector<ShardEndpoint*>::const_iterator it = endpoints.begin(); it != endpoints.end();
+             ++it) {
+            const ShardEndpoint* endpoint = *it;
+
+            ConnectionString host;
+            Status status = resolver.chooseWriteHost(txn, endpoint->shardName, &host);
+            if (!status.isOK())
+                return status;
+
+            dispatcher.addCommand(host, dbName, command);
+        }
+
+        // Errors reported when recv'ing responses
+        dispatcher.sendAll();
+        Status dispatchStatus = Status::OK();
+
+        // Recv responses
+        while (dispatcher.numPending() > 0) {
+            ConnectionString host;
+            RawBSONSerializable response;
+
+            Status status = dispatcher.recvAny(&host, &response);
+            if (!status.isOK()) {
+                // We always need to recv() all the sent operations
+                dispatchStatus = status;
+                continue;
+            }
+
+            Strategy::CommandResult result;
+            result.target = host;
+            {
+                const auto shard = grid.shardRegistry()->getShard(txn, host.toString());
+                result.shardTargetId = shard->getId();
+            }
+            result.result = response.toBSON();
+
+            results->push_back(result);
+        }
+
+        return dispatchStatus;
+    }
 };
 
 

@@ -169,21 +169,12 @@ void MockDBClientConnection::insert(const string& ns, const vector<BSONObj>& obj
     }
 }
 
-void MockDBClientConnection::remove(const string& ns, Query query, bool justOne) {
-    remove(ns, query, (justOne ? RemoveOption_JustOne : 0));
-}
-
 void MockDBClientConnection::remove(const string& ns, Query query, int flags) {
     _remoteServer->remove(ns, query, flags);
 }
 
 void MockDBClientConnection::killCursor(long long cursorID) {
     verify(false);  // unimplemented
-}
-
-bool MockDBClientConnection::callRead(mongo::Message& toSend, mongo::Message& response) {
-    verify(false);  // unimplemented
-    return false;
 }
 
 bool MockDBClientConnection::call(mongo::Message& toSend,
@@ -195,10 +186,6 @@ bool MockDBClientConnection::call(mongo::Message& toSend,
 }
 
 void MockDBClientConnection::say(mongo::Message& toSend, bool isRetry, string* actualServer) {
-    verify(false);  // unimplemented
-}
-
-void MockDBClientConnection::sayPiggyBack(mongo::Message& toSend) {
     verify(false);  // unimplemented
 }
 

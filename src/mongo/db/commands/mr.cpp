@@ -32,6 +32,8 @@
 
 #include "mongo/db/commands/mr.h"
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -41,6 +43,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -48,18 +51,23 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/matcher/matcher.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/operation_shard_version.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
@@ -68,6 +76,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -346,13 +355,16 @@ void State::dropTempCollections() {
         _txn->setReplicatedWrites(false);
         ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
 
-        ScopedTransaction scopedXact(_txn, MODE_IX);
-        Lock::DBLock lk(_txn->lockState(), nsToDatabaseSubstring(_config.incLong), MODE_X);
-        if (Database* db = dbHolder().get(_txn, _config.incLong)) {
-            WriteUnitOfWork wunit(_txn);
-            db->dropCollection(_txn, _config.incLong);
-            wunit.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            ScopedTransaction scopedXact(_txn, MODE_IX);
+            Lock::DBLock lk(_txn->lockState(), nsToDatabaseSubstring(_config.incLong), MODE_X);
+            if (Database* db = dbHolder().get(_txn, _config.incLong)) {
+                WriteUnitOfWork wunit(_txn);
+                db->dropCollection(_txn, _config.incLong);
+                wunit.commit();
+            }
         }
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R dropTempCollections", _config.incLong)
 
         ShardConnection::forgetNS(_config.incLong);
     }
@@ -373,26 +385,30 @@ void State::prepTempCollection() {
         _txn->setReplicatedWrites(false);
         ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
 
-        OldClientWriteContext incCtx(_txn, _config.incLong);
-        WriteUnitOfWork wuow(_txn);
-        Collection* incColl = incCtx.getCollection();
-        invariant(!incColl);
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            OldClientWriteContext incCtx(_txn, _config.incLong);
+            WriteUnitOfWork wuow(_txn);
+            Collection* incColl = incCtx.getCollection();
+            invariant(!incColl);
 
-        CollectionOptions options;
-        options.setNoIdIndex();
-        options.temp = true;
-        incColl = incCtx.db()->createCollection(_txn, _config.incLong, options);
-        invariant(incColl);
+            CollectionOptions options;
+            options.setNoIdIndex();
+            options.temp = true;
+            incColl = incCtx.db()->createCollection(_txn, _config.incLong, options);
+            invariant(incColl);
 
-        BSONObj indexSpec = BSON("key" << BSON("0" << 1) << "ns" << _config.incLong << "name"
-                                       << "_temp_0");
-        Status status = incColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, indexSpec);
-        if (!status.isOK()) {
-            uasserted(17305,
-                      str::stream() << "createIndex failed for mr incLong ns: " << _config.incLong
-                                    << " err: " << status.code());
+            BSONObj indexSpec = BSON("key" << BSON("0" << 1) << "ns" << _config.incLong << "name"
+                                           << "_temp_0");
+            Status status =
+                incColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, indexSpec);
+            if (!status.isOK()) {
+                uasserted(17305,
+                          str::stream() << "createIndex failed for mr incLong ns: "
+                                        << _config.incLong << " err: " << status.code());
+            }
+            wuow.commit();
         }
-        wuow.commit();
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R prepTempCollection", _config.incLong);
     }
 
     CollectionOptions finalOptions;
@@ -426,7 +442,7 @@ void State::prepTempCollection() {
         }
     }
 
-    {
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         // create temp collection and insert the indexes from temporary storage
         OldClientWriteContext tempCtx(_txn, _config.tempNamespace);
         WriteUnitOfWork wuow(_txn);
@@ -456,6 +472,7 @@ void State::prepTempCollection() {
         }
         wuow.commit();
     }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R prepTempCollection", _config.tempNamespace)
 }
 
 /**
@@ -558,7 +575,7 @@ long long State::postProcessCollection(OperationContext* txn, CurOp* op, Progres
  *
  * TODO: make count work with versioning
  */
-unsigned long long _safeCount(Client* client,
+unsigned long long _safeCount(OperationContext* txn,
                               // Can't be const b/c count isn't
                               /* const */ DBDirectClient& db,
                               const string& ns,
@@ -566,7 +583,7 @@ unsigned long long _safeCount(Client* client,
                               int options = 0,
                               int limit = 0,
                               int skip = 0) {
-    ShardForceVersionOkModeBlock ignoreVersion(client);  // ignore versioning here
+    OperationShardVersion::IgnoreVersioningBlock ignoreVersion(txn, NamespaceString(ns));
     return db.count(ns, query, options, limit, skip);
 }
 
@@ -577,13 +594,11 @@ unsigned long long _safeCount(Client* client,
 long long State::postProcessCollectionNonAtomic(OperationContext* txn,
                                                 CurOp* op,
                                                 ProgressMeterHolder& pm) {
-    auto client = txn->getClient();
-
     if (_config.outputOptions.finalNamespace == _config.tempNamespace)
-        return _safeCount(client, _db, _config.outputOptions.finalNamespace);
+        return _safeCount(txn, _db, _config.outputOptions.finalNamespace);
 
     if (_config.outputOptions.outType == Config::REPLACE ||
-        _safeCount(client, _db, _config.outputOptions.finalNamespace) == 0) {
+        _safeCount(txn, _db, _config.outputOptions.finalNamespace) == 0) {
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lock(txn->lockState());  // TODO(erh): why global???
         // replace: just rename from temp to final collection name, dropping previous collection
@@ -602,7 +617,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
     } else if (_config.outputOptions.outType == Config::MERGE) {
         // merge: upsert new docs into old collection
         {
-            const auto count = _safeCount(client, _db, _config.tempNamespace, BSONObj());
+            const auto count = _safeCount(txn, _db, _config.tempNamespace, BSONObj());
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->setMessage_inlock(
                 "m/r: merge post processing", "M/R Merge Post Processing Progress", count);
@@ -624,7 +639,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         BSONList values;
 
         {
-            const auto count = _safeCount(client, _db, _config.tempNamespace, BSONObj());
+            const auto count = _safeCount(txn, _db, _config.tempNamespace, BSONObj());
             stdx::lock_guard<Client> lk(*txn->getClient());
             op->setMessage_inlock(
                 "m/r: reduce post processing", "M/R Reduce Post Processing Progress", count);
@@ -660,7 +675,7 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
         pm.finished();
     }
 
-    return _safeCount(txn->getClient(), _db, _config.outputOptions.finalNamespace);
+    return _safeCount(txn, _db, _config.outputOptions.finalNamespace);
 }
 
 /**
@@ -669,24 +684,31 @@ long long State::postProcessCollectionNonAtomic(OperationContext* txn,
 void State::insert(const string& ns, const BSONObj& o) {
     verify(_onDisk);
 
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        OldClientWriteContext ctx(_txn, ns);
+        WriteUnitOfWork wuow(_txn);
+        NamespaceString nss(ns);
+        uassert(ErrorCodes::NotMaster,
+                "no longer master",
+                repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss));
+        Collection* coll = getCollectionOrUassert(ctx.db(), ns);
 
-    OldClientWriteContext ctx(_txn, ns);
-    WriteUnitOfWork wuow(_txn);
-    NamespaceString nss(ns);
-    uassert(ErrorCodes::NotMaster,
-            "no longer master",
-            repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss));
-    Collection* coll = getCollectionOrUassert(ctx.db(), ns);
+        BSONObjBuilder b;
+        if (!o.hasField("_id")) {
+            b.appendOID("_id", NULL, true);
+        }
+        b.appendElements(o);
+        BSONObj bo = b.obj();
 
-    BSONObjBuilder b;
-    if (!o.hasField("_id")) {
-        b.appendOID("_id", NULL, true);
+        StatusWith<BSONObj> res = fixDocumentForInsert(bo);
+        uassertStatusOK(res.getStatus());
+        if (!res.getValue().isEmpty()) {
+            bo = res.getValue();
+        }
+        uassertStatusOK(coll->insertDocument(_txn, bo, true));
+        wuow.commit();
     }
-    b.appendElements(o);
-    BSONObj bo = b.obj();
-
-    uassertStatusOK(coll->insertDocument(_txn, bo, true).getStatus());
-    wuow.commit();
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insert", ns);
 }
 
 /**
@@ -695,14 +717,28 @@ void State::insert(const string& ns, const BSONObj& o) {
 void State::_insertToInc(BSONObj& o) {
     verify(_onDisk);
 
-    OldClientWriteContext ctx(_txn, _config.incLong);
-    WriteUnitOfWork wuow(_txn);
-    Collection* coll = getCollectionOrUassert(ctx.db(), _config.incLong);
-    bool shouldReplicateWrites = _txn->writesAreReplicated();
-    _txn->setReplicatedWrites(false);
-    ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
-    uassertStatusOK(coll->insertDocument(_txn, o, true, false).getStatus());
-    wuow.commit();
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        OldClientWriteContext ctx(_txn, _config.incLong);
+        WriteUnitOfWork wuow(_txn);
+        Collection* coll = getCollectionOrUassert(ctx.db(), _config.incLong);
+        bool shouldReplicateWrites = _txn->writesAreReplicated();
+        _txn->setReplicatedWrites(false);
+        ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, _txn, shouldReplicateWrites);
+
+        // The documents inserted into the incremental collection are of the form
+        // {"0": <key>, "1": <value>}, so we cannot call fixDocumentForInsert(o) here because the
+        // check that the document has an "_id" field would fail. Instead, we directly verify that
+        // the size of the document to insert is smaller than 16MB.
+        if (o.objsize() > BSONObjMaxUserSize) {
+            uasserted(ErrorCodes::BadValue,
+                      str::stream() << "object to insert too large for incremental collection"
+                                    << ". size in bytes: " << o.objsize()
+                                    << ", max size: " << BSONObjMaxUserSize);
+        }
+        uassertStatusOK(coll->insertDocument(_txn, o, true, false));
+        wuow.commit();
+    }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "M/R insertToInc", _config.incLong);
 }
 
 State::State(OperationContext* txn, const Config& c)
@@ -716,12 +752,8 @@ bool State::sourceExists() {
 }
 
 long long State::incomingDocuments() {
-    return _safeCount(_txn->getClient(),
-                      _db,
-                      _config.ns,
-                      _config.filter,
-                      QueryOption_SlaveOk,
-                      (unsigned)_config.limit);
+    return _safeCount(
+        _txn, _db, _config.ns, _config.filter, QueryOption_SlaveOk, (unsigned)_config.limit);
 }
 
 State::~State() {
@@ -752,8 +784,10 @@ void State::init() {
     // setup js
     const string userToken =
         AuthorizationSession::get(ClientBasic::getCurrent())->getAuthenticatedUserNamesToken();
-    _scope.reset(globalScriptEngine->getPooledScope(_txn, _config.dbname, "mapreduce" + userToken)
-                     .release());
+    _scope.reset(globalScriptEngine->newScopeForCurrentThread());
+    _scope->registerOperation(_txn);
+    _scope->setLocalDB(_config.dbname);
+    _scope->loadStored(_txn, true);
 
     if (!_config.scopeSetup.isEmpty())
         _scope->init(&_config.scopeSetup);
@@ -967,7 +1001,7 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
     verify(_temp->size() == 0);
     BSONObj sortKey = BSON("0" << 1);
 
-    {
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         OldClientWriteContext incCtx(_txn, _config.incLong);
         WriteUnitOfWork wuow(_txn);
         Collection* incColl = getCollectionOrUassert(incCtx.db(), _config.incLong);
@@ -987,6 +1021,7 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
         verify(foundIndex);
         wuow.commit();
     }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "finalReduce", _config.incLong);
 
     unique_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(_txn, _config.incLong));
 
@@ -1003,10 +1038,10 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
     }
 
     const NamespaceString nss(_config.incLong);
-    const WhereCallbackReal whereCallback(_txn, nss.db());
+    const ExtensionsCallbackReal extensionsCallback(_txn, &nss);
 
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(_config.incLong, BSONObj(), sortKey, BSONObj(), whereCallback);
+        CanonicalQuery::canonicalize(nss, BSONObj(), sortKey, BSONObj(), extensionsCallback);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1048,7 +1083,7 @@ void State::finalReduce(CurOp* op, ProgressMeterHolder& pm) {
         prev = o;
         all.push_back(o);
 
-        if (!exec->restoreState(_txn)) {
+        if (!exec->restoreState()) {
             break;
         }
 
@@ -1237,8 +1272,8 @@ public:
         return true;
     }
 
-    bool supportsReadMajority() const final {
-        return true;
+    std::size_t reserveBytesForReply() const override {
+        return FindCommon::kInitReplyBufferSize;
     }
 
     virtual void help(stringstream& help) const {
@@ -1299,8 +1334,8 @@ public:
 
             // Get metadata before we check our version, to make sure it doesn't increment
             // in the meantime.  Need to do this in the same lock scope as the block.
-            if (shardingState.needCollectionMetadata(client, config.ns)) {
-                collMetadata = shardingState.getCollectionMetadata(config.ns);
+            if (ShardingState::get(txn)->needCollectionMetadata(txn, config.ns)) {
+                collMetadata = ShardingState::get(txn)->getCollectionMetadata(config.ns);
             }
         }
 
@@ -1362,10 +1397,10 @@ public:
                 unique_ptr<ScopedTransaction> scopedXact(new ScopedTransaction(txn, MODE_IS));
                 unique_ptr<AutoGetDb> scopedAutoDb(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                const WhereCallbackReal whereCallback(txn, nss.db());
+                const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
                 auto statusWithCQ = CanonicalQuery::canonicalize(
-                    config.ns, config.filter, config.sort, BSONObj(), whereCallback);
+                    nss, config.filter, config.sort, BSONObj(), extensionsCallback);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1427,7 +1462,7 @@ public:
                         scopedXact.reset(new ScopedTransaction(txn, MODE_IS));
                         scopedAutoDb.reset(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                        exec->restoreState(txn);
+                        exec->restoreState();
 
                         // Need to reload the database, in case it was dropped after we
                         // released the lock
@@ -1450,6 +1485,11 @@ public:
                     if (config.limit && numInputs >= config.limit)
                         break;
                 }
+
+                // Record the indexes used by the PlanExecutor.
+                PlanSummaryStats stats;
+                Explain::getSummaryStats(*exec, &stats);
+                coll->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
             }
             pm.finished();
 
@@ -1519,6 +1559,26 @@ public:
 
 } mapReduceCommand;
 
+namespace {
+Status _checkForCatalogManagerChange(ForwardingCatalogManager* catalogManager,
+                                     CatalogManager::ConfigServerMode initialConfigServerMode) {
+    Status status = catalogManager->checkForPendingCatalogChange();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    auto currentConfigServerMode = catalogManager->getMode();
+    if (currentConfigServerMode != initialConfigServerMode) {
+        invariant(initialConfigServerMode == CatalogManager::ConfigServerMode::SCCC &&
+                  currentConfigServerMode == CatalogManager::ConfigServerMode::CSRS);
+        return Status(ErrorCodes::IncompatibleCatalogManager,
+                      "CatalogManager was swapped from SCCC to CSRS mode during mapreduce."
+                      "Aborting mapreduce to unblock mongos.");
+    }
+    return Status::OK();
+}
+}  // namespace
+
 /**
  * This class represents a map/reduce command executed on the output server of a sharded env
  */
@@ -1551,11 +1611,25 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
+        if (!grid.shardRegistry()) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::CommandNotSupported,
+                       str::stream() << "Can not execute mapReduce with output database "
+                                     << dbname));
+        }
+
+        // Store the initial catalog manager mode so we can check if it changes at any point.
+        CatalogManager::ConfigServerMode initialConfigServerMode =
+            grid.catalogManager(txn)->getMode();
+
+
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(txn);
 
         ShardedConnectionInfo::addHook();
+
         // legacy name
         string shardedOutputCollection = cmdObj["shardedOutputCollection"].valuestrsafe();
         verify(shardedOutputCollection.size() > 0);
@@ -1590,7 +1664,15 @@ public:
             BSONObjIterator i(shardCounts);
             while (i.more()) {
                 BSONElement e = i.next();
-                servers.insert(e.fieldName());
+                std::string server = e.fieldName();
+                servers.insert(server);
+
+                if (!grid.shardRegistry()->getShard(txn, server)) {
+                    return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::ShardNotFound,
+                               str::stream() << "Shard not found for server: " << server));
+                }
             }
         }
 
@@ -1610,7 +1692,7 @@ public:
                 result.append("result", config.outputOptions.collectionName);
         }
 
-        auto status = grid.catalogCache()->getDatabase(dbname);
+        auto status = grid.catalogCache()->getDatabase(txn, dbname);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
@@ -1619,11 +1701,11 @@ public:
 
         vector<ChunkPtr> chunks;
         if (confOut->isSharded(config.outputOptions.finalNamespace)) {
-            ChunkManagerPtr cm = confOut->getChunkManager(config.outputOptions.finalNamespace);
+            ChunkManagerPtr cm = confOut->getChunkManager(txn, config.outputOptions.finalNamespace);
 
             // Fetch result from other shards 1 chunk at a time. It would be better to do
             // just one big $or query, but then the sorting would not be efficient.
-            const string shardName = shardingState.getShardName();
+            const string shardName = ShardingState::get(txn)->getShardName();
             const ChunkMap& chunkMap = cm->getChunkMap();
 
             for (ChunkMap::const_iterator it = chunkMap.begin(); it != chunkMap.end(); ++it) {
@@ -1639,6 +1721,12 @@ public:
         BSONObj query;
         BSONArrayBuilder chunkSizes;
         while (true) {
+            Status status = _checkForCatalogManagerChange(grid.forwardingCatalogManager(),
+                                                          initialConfigServerMode);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
             ChunkPtr chunk;
             if (chunks.size() > 0) {
                 chunk = chunks[index];
@@ -1653,10 +1741,16 @@ public:
             BSONObj sortKey = BSON("_id" << 1);
             ParallelSortClusteredCursor cursor(
                 servers, inputNS, Query(query).sort(sortKey), QueryOption_NoCursorTimeout);
-            cursor.init();
+            cursor.init(txn);
             int chunkSize = 0;
 
             while (cursor.more() || !values.empty()) {
+                status = _checkForCatalogManagerChange(grid.forwardingCatalogManager(),
+                                                       initialConfigServerMode);
+                if (!status.isOK()) {
+                    return appendCommandStatus(result, status);
+                }
+
                 BSONObj t;
                 if (cursor.more()) {
                     t = cursor.next().getOwned();

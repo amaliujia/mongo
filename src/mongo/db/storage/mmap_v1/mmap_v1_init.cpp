@@ -34,7 +34,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
 
@@ -67,6 +67,10 @@ public:
         BSONObjBuilder builder;
         builder.appendBool("directoryPerDB", params.directoryperdb);
         return builder.obj();
+    }
+
+    bool supportsReadOnly() const override {
+        return true;
     }
 };
 

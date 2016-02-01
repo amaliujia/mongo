@@ -41,6 +41,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
@@ -117,7 +118,8 @@ public:
         s->setNumber("notANumberVal", std::numeric_limits<double>::quiet_NaN());
         ASSERT(!s->getBoolean("notANumberVal"));
 
-        s->setElement("nullVal", BSONObjBuilder().appendNull("null").obj().getField("null"));
+        auto obj = BSONObjBuilder().appendNull("null").obj();
+        s->setElement("nullVal", obj.getField("null"), obj);
         ASSERT(!s->getBoolean("nullVal"));
 
         s->setNumber("zeroVal", 0);
@@ -128,7 +130,7 @@ public:
 class SimpleFunctions {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         s->invoke("x=5;", 0, 0);
         ASSERT(5 == s->getNumber("x"));
@@ -150,8 +152,6 @@ public:
         BSONObj obj = BSON("" << 11.0);
         s->invoke("function( z ){ return 5 + z; }", &obj, 0);
         ASSERT_EQUALS(16, s->getNumber("__returnValue"));
-
-        delete s;
     }
 };
 
@@ -196,7 +196,7 @@ private:
 class ExecLogError {
 public:
     void run() {
-        Scope* scope = globalScriptEngine->newScope();
+        unique_ptr<Scope> scope(globalScriptEngine->newScope());
 
         // No error is logged when reportError == false.
         ASSERT(!scope->exec("notAFunction()", "foo", false, false, false));
@@ -208,7 +208,15 @@ public:
 
         // An error is logged for an invalid statement when reportError == true.
         ASSERT(!scope->exec("notAFunction()", "foo", false, true, false));
-        ASSERT(_logger.logged());
+
+        // Don't check if we're using SpiderMonkey. Our threading model breaks
+        // this test
+        // TODO: figure out a way to check for SpiderMonkey
+        auto ivs = globalScriptEngine->getInterpreterVersionString();
+        std::string prefix("MozJS");
+        if (ivs.compare(0, prefix.length(), prefix) != 0) {
+            ASSERT(_logger.logged());
+        }
     }
 
 private:
@@ -219,7 +227,7 @@ private:
 class InvokeLogError {
 public:
     void run() {
-        Scope* scope = globalScriptEngine->newScope();
+        unique_ptr<Scope> scope(globalScriptEngine->newScope());
 
         // No error is logged for a valid statement.
         ASSERT_EQUALS(0, scope->invoke("validStatement = true", 0, 0));
@@ -231,7 +239,15 @@ public:
         } catch (const DBException&) {
             // ignore the exception; just test that we logged something
         }
-        ASSERT(_logger.logged());
+
+        // Don't check if we're using SpiderMonkey. Our threading model breaks
+        // this test
+        // TODO: figure out a way to check for SpiderMonkey
+        auto ivs = globalScriptEngine->getInterpreterVersionString();
+        std::string prefix("MozJS");
+        if (ivs.compare(0, prefix.length(), prefix) != 0) {
+            ASSERT(_logger.logged());
+        }
     }
 
 private:
@@ -241,7 +257,7 @@ private:
 class ObjectMapping {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         BSONObj o = BSON("x" << 17.0 << "y"
                              << "eliot"
@@ -292,15 +308,13 @@ public:
 
         s->invoke("x = 5; for( ; x <10; x++){ a = 1; }", 0, &o);
         ASSERT_EQUALS(10, s->getNumber("x"));
-
-        delete s;
     }
 };
 
 class ObjectDecoding {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         s->invoke("z = { num : 1 };", 0, 0);
         BSONObj out = s->getObject("z");
@@ -316,8 +330,6 @@ public:
         s->setObject("blah", o);
         out = s->getObject("blah");
         ASSERT_EQUALS(17, out["x"].number());
-
-        delete s;
     }
 };
 
@@ -325,7 +337,7 @@ class JSOIDTests {
 public:
     void run() {
 #ifdef MOZJS
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         s->localConnect("blah");
 
@@ -349,8 +361,6 @@ public:
         ASSERT_EQUALS(125, out["a"].number());
         ASSERT_EQUALS(jstOID, out["_id"].type());
         ASSERT_EQUALS(out["_id"].__oid().str(), save.str());
-
-        delete s;
 #endif
     }
 };
@@ -358,7 +368,7 @@ public:
 class SetImplicit {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         BSONObj o = BSON("foo"
                          << "bar");
@@ -380,7 +390,7 @@ public:
 class ObjectModReadonlyTests {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         BSONObj o = BSON("x" << 17 << "y"
                              << "eliot"
@@ -389,25 +399,13 @@ public:
                              << "zz" << BSONObj());
         s->setObject("blah", o, true);
 
-        s->invoke("blah.y = 'e'", 0, 0);
-        BSONObj out = s->getObject("blah");
-        ASSERT(strlen(out["y"].valuestr()) > 1);
+        BSONObj out;
 
-        s->invoke("blah.a = 19;", 0, 0);
-        out = s->getObject("blah");
-        ASSERT(out["a"].eoo());
-
-        s->invoke("blah.zz.a = 19;", 0, 0);
-        out = s->getObject("blah");
-        ASSERT(out["zz"].embeddedObject()["a"].eoo());
-
-        s->setObject("blah.zz", BSON("a" << 19));
-        out = s->getObject("blah");
-        ASSERT(out["zz"].embeddedObject()["a"].eoo());
-
-        s->invoke("delete blah['x']", 0, 0);
-        out = s->getObject("blah");
-        ASSERT(!out["x"].eoo());
+        ASSERT_THROWS(s->invoke("blah.y = 'e'", 0, 0), mongo::UserException);
+        ASSERT_THROWS(s->invoke("blah.a = 19;", 0, 0), mongo::UserException);
+        ASSERT_THROWS(s->invoke("blah.zz.a = 19;", 0, 0), mongo::UserException);
+        ASSERT_THROWS(s->invoke("blah.zz = { a : 19 };", 0, 0), mongo::UserException);
+        ASSERT_THROWS(s->invoke("delete blah['x']", 0, 0), mongo::UserException);
 
         // read-only object itself can be overwritten
         s->invoke("blah = {}", 0, 0);
@@ -423,15 +421,13 @@ public:
         //            out = s->getObject( "blah" );
         //            ASSERT_EQUALS( 1.0, out[ "a" ].embeddedObject()[ 0 ].number() );
         //            ASSERT_EQUALS( 3.0, out[ "a" ].embeddedObject()[ 2 ].number() );
-
-        delete s;
     }
 };
 
 class OtherJSTypes {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         {
             // date
@@ -522,15 +518,13 @@ public:
             out = s->getObject("x");
             ASSERT_EQUALS(Symbol, out.firstElement().type());
         }
-
-        delete s;
     }
 };
 
 class SpecialDBTypes {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         BSONObjBuilder b;
         b.appendTimestamp("a", 123456789);
@@ -558,15 +552,13 @@ public:
         ASSERT_EQUALS(9876U, out["d"].timestampInc());
         ASSERT_EQUALS(Date_t::fromMillisSinceEpoch(1234000), out["d"].timestampTime());
         ASSERT_EQUALS(Date_t::fromMillisSinceEpoch(123456789), out["a"].date());
-
-        delete s;
     }
 };
 
 class TypeConservation {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         //  --  A  --
 
@@ -658,8 +650,6 @@ public:
         //            ASSERT_EQUALS( NumberDouble , out["b"].type() );
         //            ASSERT_EQUALS( NumberDouble , out["a"].type() );
         //
-
-        delete s;
     }
 };
 
@@ -795,12 +785,77 @@ public:
     }
 };
 
-class InvalidTimestamp {
+class NumberDecimal {
+public:
+    void run() {
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+        BSONObjBuilder b;
+        Decimal128 val = Decimal128("2.010");
+        b.append("a", val);
+        BSONObj in = b.obj();
+        s->setObject("a", in);
+
+        // Test the scope object
+        BSONObj out = s->getObject("a");
+        ASSERT_EQUALS(mongo::NumberDecimal, out.firstElement().type());
+        ASSERT_TRUE(val.isEqual(out.firstElement().numberDecimal()));
+
+        ASSERT(s->exec("b = {b:a.a}", "foo", false, true, false));
+        out = s->getObject("b");
+        ASSERT_EQUALS(mongo::NumberDecimal, out.firstElement().type());
+        ASSERT_TRUE(val.isEqual(out.firstElement().numberDecimal()));
+
+        // Test that the appropriate string output is generated
+        ASSERT(s->exec("c = {c:a.a.toString()}", "foo", false, true, false));
+        out = s->getObject("c");
+        stringstream ss;
+        ss << "NumberDecimal(\"" << val.toString() << "\")";
+        ASSERT_EQUALS(ss.str(), out.firstElement().valuestr());
+    }
+};
+
+class NumberDecimalGetFromScope {
+public:
+    void run() {
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+        ASSERT(s->exec("a = 5;", "a", false, true, false));
+        ASSERT_TRUE(Decimal128(5).isEqual(s->getNumberDecimal("a")));
+    }
+};
+
+class NumberDecimalBigObject {
 public:
     void run() {
         unique_ptr<Scope> s(globalScriptEngine->newScope());
 
-        // Timestamp 't' component cannot exceed max for int32_t.
+        BSONObj in;
+        {
+            BSONObjBuilder b;
+            b.append("a", 5);
+            b.append("b", Decimal128("1.5E-3000"));
+            b.append("c", Decimal128("1.5E-1"));
+            b.append("d", Decimal128("1.5E3000"));
+            b.append("e", Decimal128("Infinity"));
+            b.append("f", Decimal128("NaN"));
+            in = b.obj();
+        }
+        s->setObject("a", in);
+
+        ASSERT(s->exec("x = tojson( a ); ", "foo", false, true, false));
+        string outString = s->getString("x");
+
+        ASSERT(s->exec((string) "y = " + outString, "foo2", false, true, false));
+        BSONObj out = s->getObject("y");
+        ASSERT_EQUALS(in, out);
+    }
+};
+
+class MaxTimestamp {
+public:
+    void run() {
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+
+        // Timestamp 't' component can exceed max for int32_t.
         BSONObj in;
         {
             BSONObjBuilder b;
@@ -812,7 +867,7 @@ public:
         }
         s->setObject("a", in);
 
-        ASSERT_FALSE(s->exec("x = tojson( a ); ", "foo", false, true, false));
+        ASSERT(s->exec("x = tojson( a ); ", "foo", false, true, false));
     }
 };
 
@@ -827,7 +882,7 @@ public:
     }
 
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         for (int i = 5; i < 100; i += 10) {
             s->setObject("a", build(i), false);
@@ -836,8 +891,6 @@ public:
             s->setObject("a", build(5), true);
             s->invokeSafe("tojson( a )", 0, 0);
         }
-
-        delete s;
     }
 };
 
@@ -1029,7 +1082,7 @@ public:
 class CodeTests {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         {
             BSONObjBuilder b;
@@ -1051,9 +1104,6 @@ public:
         // s->invokeSafe( "foo.d() " , BSONObj() );
         // out = s->getObject( "out" );
         // ASSERT_EQUALS( 18 , out["d"].number() );
-
-
-        delete s;
     }
 };
 
@@ -1455,17 +1505,8 @@ class Undefined : public TestRoundTrip {
         return b.obj();
     }
 
-    // Don't need to return anything because we are overriding both jsonOut and jsonIn
     virtual string json() const {
-        return "";
-    }
-
-    // undefined values come out as null in the shell.  See SERVER-6102.
-    virtual string jsonIn() const {
         return "{ \"a\" : undefined }";
-    }
-    virtual string jsonOut() const {
-        return "{ \"a\" : null }";
     }
 };
 
@@ -1798,6 +1839,116 @@ public:
     }
 };
 
+class NumberDecimal : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("2.010"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"+2.010\") }";
+    }
+};
+
+class NumberDecimalNegative : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("-4.018"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"-4018E-3\") }";
+    }
+};
+
+class NumberDecimalMax : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("+9.999999999999999999999999999999999E6144"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"+9999999999999999999999999999999999E6111\") }";
+    }
+};
+
+class NumberDecimalMin : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("0.000000000000000000000000000000001E-6143"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"+1E-6176\") }";
+    }
+};
+
+class NumberDecimalPositiveZero : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("0"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"0\") }";
+    }
+};
+
+class NumberDecimalNegativeZero : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("-0"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"-0\") }";
+    }
+};
+
+class NumberDecimalPositiveNaN : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("NaN"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"NaN\") }";
+    }
+};
+
+class NumberDecimalNegativeNaN : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("-NaN"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"-NaN\") }";
+    }
+};
+
+class NumberDecimalPositiveInfinity : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("1E999999"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"+Inf\") }";
+    }
+};
+
+class NumberDecimalNegativeInfinity : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("-1E999999"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"-Inf\") }";
+    }
+};
+
+class NumberDecimalPrecision : public TestRoundTrip {
+public:
+    virtual BSONObj bson() const {
+        return BSON("decimal" << Decimal128("5.00"));
+    }
+    virtual string json() const {
+        return "{ \"decimal\": NumberDecimal(\"+500E-2\") }";
+    }
+};
+
 class UUID : public TestRoundTrip {
     virtual BSONObj bson() const {
         BSONObjBuilder b;
@@ -1935,7 +2086,7 @@ public:
     }
 
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         const char* foo = "asdas\0asdasd";
         const char* base64 = "YXNkYXMAYXNkYXNk";
@@ -1979,22 +2130,19 @@ public:
         out["f"].binData(len);
         ASSERT_EQUALS(0, len);
         ASSERT_EQUALS(128, out["f"].binDataType());
-
-        delete s;
     }
 };
 
 class VarTests {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         ASSERT(s->exec("a = 5;", "a", false, true, false));
         ASSERT_EQUALS(5, s->getNumber("a"));
 
         ASSERT(s->exec("var b = 6;", "b", false, true, false));
         ASSERT_EQUALS(6, s->getNumber("b"));
-        delete s;
     }
 };
 
@@ -2093,7 +2241,7 @@ public:
 class NoReturnSpecified {
 public:
     void run() {
-        Scope* s = globalScriptEngine->newScope();
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
 
         s->invoke("x=5;", 0, 0);
         ASSERT_EQUALS(5, s->getNumber("__returnValue"));
@@ -2128,20 +2276,67 @@ public:
         s->invoke("String(' return ')", 0, 0);
         ASSERT_EQUALS(" return ", s->getString("__returnValue"));
 
-        // This should fail so we set the expected __returnValue to undefined
-        s->invoke(";x = 5", 0, 0);
-        ASSERT_EQUALS("undefined", s->getString("__returnValue"));
-
         s->invoke("String(\"'return\")", 0, 0);
         ASSERT_EQUALS("'return", s->getString("__returnValue"));
 
         s->invoke("String('\"return')", 0, 0);
         ASSERT_EQUALS("\"return", s->getString("__returnValue"));
+    }
+};
 
-        // A fail case
-        s->invoke("return$ = 0", 0, 0);
-        // Checks to confirm that the result is NaN
-        ASSERT(s->getNumber("__returnValue") != s->getNumber("__returnValue"));
+class RecursiveInvoke {
+public:
+    static BSONObj callback(const BSONObj& args, void* data) {
+        auto scope = static_cast<Scope*>(data);
+
+        scope->invoke("x = 10;", 0, 0);
+
+        return BSONObj();
+    }
+
+    void run() {
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+
+        s->injectNative("foo", callback, s.get());
+        s->invoke("var x = 1; foo();", 0, 0);
+        ASSERT_EQUALS(s->getNumberInt("x"), 10);
+    }
+};
+
+class ErrorCodeFromInvoke {
+public:
+    void run() {
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+
+        {
+            bool threwException = false;
+            try {
+                s->invoke("\"use strict\"; x = 10;", 0, 0);
+            } catch (...) {
+                threwException = true;
+
+                auto status = exceptionToStatus();
+
+                ASSERT_EQUALS(status.code(), ErrorCodes::JSInterpreterFailure);
+            }
+
+            ASSERT(threwException);
+        }
+
+        {
+            bool threwException = false;
+            try {
+                s->invoke("UUID(1,2,3,4,5);", 0, 0);
+            } catch (...) {
+                threwException = true;
+
+                auto status = exceptionToStatus();
+
+                ASSERT_EQUALS(status.code(), ErrorCodes::BadValue);
+            }
+
+            ASSERT(threwException);
+        }
     }
 };
 
@@ -2175,7 +2370,14 @@ public:
         add<TypeConservation>();
         add<NumberLong>();
         add<NumberLong2>();
-        add<InvalidTimestamp>();
+
+        if (Decimal128::enabled) {
+            add<NumberDecimal>();
+            add<NumberDecimalGetFromScope>();
+            add<NumberDecimalBigObject>();
+        }
+
+        add<MaxTimestamp>();
         add<RenameTest>();
 
         add<WeirdObjects>();
@@ -2194,6 +2396,9 @@ public:
         add<InvalidStoredJS>();
 
         add<NoReturnSpecified>();
+
+        add<RecursiveInvoke>();
+        add<ErrorCodeFromInvoke>();
 
         add<RoundTripTests::DBRefTest>();
         add<RoundTripTests::DBPointerTest>();
@@ -2241,6 +2446,21 @@ public:
         add<RoundTripTests::NumberLong>();
         add<RoundTripTests::NumberInt>();
         add<RoundTripTests::Number>();
+
+        if (Decimal128::enabled) {
+            add<RoundTripTests::NumberDecimal>();
+            add<RoundTripTests::NumberDecimalNegative>();
+            add<RoundTripTests::NumberDecimalMax>();
+            add<RoundTripTests::NumberDecimalMin>();
+            add<RoundTripTests::NumberDecimalPositiveZero>();
+            add<RoundTripTests::NumberDecimalNegativeZero>();
+            add<RoundTripTests::NumberDecimalPositiveNaN>();
+            add<RoundTripTests::NumberDecimalNegativeNaN>();
+            add<RoundTripTests::NumberDecimalPositiveInfinity>();
+            add<RoundTripTests::NumberDecimalNegativeInfinity>();
+            add<RoundTripTests::NumberDecimalPrecision>();
+        }
+
         add<RoundTripTests::UUID>();
         add<RoundTripTests::HexData>();
         add<RoundTripTests::MD5>();

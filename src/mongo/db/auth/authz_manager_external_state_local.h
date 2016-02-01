@@ -54,23 +54,18 @@ class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
 
-    /**
-     * Takes a user document, and processes it with the RoleGraph, in order to recursively
-     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
-     * and 'warnings' fields.
-     */
-    void resolveUserRoles(mutablebson::Document* userDoc, const std::vector<RoleName>& directRoles);
-
     virtual Status initialize(OperationContext* txn);
 
     virtual Status getStoredAuthorizationVersion(OperationContext* txn, int* outVersion);
     virtual Status getUserDescription(OperationContext* txn,
                                       const UserName& userName,
                                       BSONObj* result);
-    virtual Status getRoleDescription(const RoleName& roleName,
+    virtual Status getRoleDescription(OperationContext* txn,
+                                      const RoleName& roleName,
                                       bool showPrivileges,
                                       BSONObj* result);
-    virtual Status getRoleDescriptionsForDB(const std::string dbname,
+    virtual Status getRoleDescriptionsForDB(OperationContext* txn,
+                                            const std::string dbname,
                                             bool showPrivileges,
                                             bool showBuiltinRoles,
                                             std::vector<BSONObj>* result);
@@ -100,7 +95,7 @@ public:
                          const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
 
     virtual void logOp(
-        OperationContext* txn, const char* op, const char* ns, const BSONObj& o, BSONObj* o2);
+        OperationContext* txn, const char* op, const char* ns, const BSONObj& o, const BSONObj* o2);
 
 protected:
     AuthzManagerExternalStateLocal() = default;
@@ -130,6 +125,15 @@ private:
     Status _getRoleDescription_inlock(const RoleName& roleName,
                                       bool showPrivileges,
                                       BSONObj* result);
+
+    /**
+     * Takes a user document, and processes it with the RoleGraph, in order to recursively
+     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
+     * and 'warnings' fields.
+     */
+    void _resolveUserRoles(mutablebson::Document* userDoc,
+                           const std::vector<RoleName>& directRoles);
+
     /**
      * Eventually consistent, in-memory representation of all roles in the system (both
      * user-defined and built-in).  Synchronized via _roleGraphMutex.

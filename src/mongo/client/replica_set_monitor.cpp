@@ -67,15 +67,21 @@ typedef ReplicaSetMonitor::ScanStatePtr ScanStatePtr;
 typedef ReplicaSetMonitor::SetState SetState;
 typedef ReplicaSetMonitor::SetStatePtr SetStatePtr;
 typedef ReplicaSetMonitor::Refresher Refresher;
-typedef Refresher::NextStep NextStep;
 typedef ScanState::UnconfirmedReplies UnconfirmedReplies;
 typedef SetState::Node Node;
 typedef SetState::Nodes Nodes;
 
 const double socketTimeoutSecs = 5;
 
+// Intentionally chosen to compare worse than all known latencies.
+const int64_t unknownLatency = numeric_limits<int64_t>::max();
+
+const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly, TagSet());
+const Milliseconds kFindHostMaxBackOffTime(500);
+
 // TODO: Move to ReplicaSetMonitorManager
-ReplicaSetMonitor::ConfigChangeHook configChangeHook;
+ReplicaSetMonitor::ConfigChangeHook asyncConfigChangeHook;
+ReplicaSetMonitor::ConfigChangeHook syncConfigChangeHook;
 
 // global background job responsible for checking every X amount of time
 class ReplicaSetMonitorWatcher : public BackgroundJob {
@@ -156,7 +162,6 @@ protected:
     }
 
     void checkAllSets() {
-        // make a copy so we can quickly unlock setsLock
         for (const string& setName : globalRSMonitorManager.getAllSetNames()) {
             LOG(1) << "checking replica set: " << setName;
 
@@ -167,12 +172,11 @@ protected:
 
             m->startOrContinueRefresh().refreshAll();
 
-            const int numFails = m->getConsecutiveFailedScans();
-            if (numFails >= ReplicaSetMonitor::maxConsecutiveFailedChecks) {
-                log() << "Replica set " << m->getName() << " was down for " << numFails
-                      << " checks in a row. Stopping polled monitoring of the set.";
+            if (!m->isSetUsable()) {
+                log() << "Stopping periodic monitoring of set " << m->getName()
+                      << " because none of the hosts could be contacted for an extended period of "
+                         "time.";
 
-                // locks setsLock
                 ReplicaSetMonitor::remove(m->getName());
             }
         }
@@ -195,6 +199,7 @@ StaticObserver staticObserver;
 bool isMaster(const Node& node) {
     return node.isMaster;
 }
+
 bool compareLatencies(const Node* lhs, const Node* rhs) {
     // NOTE: this automatically compares Node::unknownLatency worse than all others.
     return lhs->latencyMicros < rhs->latencyMicros;
@@ -248,56 +253,67 @@ struct HostNotIn {
     }
     const std::set<HostAndPort>& _hosts;
 };
+
 }  // namespace
 
 // At 1 check every 10 seconds, 30 checks takes 5 minutes
-int ReplicaSetMonitor::maxConsecutiveFailedChecks = 30;
+std::atomic<int> ReplicaSetMonitor::maxConsecutiveFailedChecks(30);  // NOLINT
+
+// If we cannot find a host after 15 seconds of refreshing, give up
+const Seconds ReplicaSetMonitor::kDefaultFindHostTimeout(15);
 
 // Defaults to random selection as required by the spec
 bool ReplicaSetMonitor::useDeterministicHostSelection = false;
 
 ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort>& seeds)
-    : _state(std::make_shared<SetState>(name, seeds)) {
-    log() << "starting new replica set monitor for replica set " << name << " with seeds ";
+    : _state(std::make_shared<SetState>(name, seeds)) {}
 
-    for (std::set<HostAndPort>::const_iterator it = seeds.begin(); it != seeds.end(); ++it) {
-        if (it != seeds.begin()) {
-            log() << ',';
-        }
-
-        log() << *it;
-    }
-}
-
-HostAndPort ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria) {
+StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
+                                                            Milliseconds maxWait) {
     {
+        // Fast path, for the failure-free case
         stdx::lock_guard<stdx::mutex> lk(_state->mutex);
         HostAndPort out = _state->getMatchingHost(criteria);
         if (!out.empty())
             return out;
     }
 
-    {
-        Refresher refresher = startOrContinueRefresh();
+    const auto startTimeMs = Date_t::now();
+
+    while (true) {
+        // We might not have found any matching hosts due to the scan, which just completed may have
+        // seen stale data from before we joined. Therefore we should participate in a new scan to
+        // make sure all hosts are contacted at least once (possibly by other threads) before this
+        // function gives up.
+        Refresher refresher(startOrContinueRefresh());
+
         HostAndPort out = refresher.refreshUntilMatches(criteria);
-        if (!out.empty() || refresher.startedNewScan())
+        if (!out.empty())
             return out;
+
+        if (!isSetUsable()) {
+            return Status(ErrorCodes::ReplicaSetNotFound,
+                          str::stream() << "None of the hosts for replica set " << getName()
+                                        << " could be contacted.");
+        }
+
+        const Milliseconds remaining = maxWait - (Date_t::now() - startTimeMs);
+
+        if (remaining < kFindHostMaxBackOffTime) {
+            break;
+        }
+
+        // Back-off so we don't spam the replica set hosts too much
+        sleepFor(kFindHostMaxBackOffTime);
     }
 
-    // We didn't find any matching hosts and the scan we just finished may have stale data from
-    // before we joined. Therefore we should participate in a new scan to make sure all hosts
-    // are contacted at least once (possibly by other threads) before this function gives up.
-
-    return startOrContinueRefresh().refreshUntilMatches(criteria);
+    return Status(ErrorCodes::FailedToSatisfyReadPreference,
+                  str::stream() << "could not find host matching read preference "
+                                << criteria.toString() << " for set " << getName());
 }
 
 HostAndPort ReplicaSetMonitor::getMasterOrUassert() {
-    const ReadPreferenceSetting masterOnly(ReadPreference::PrimaryOnly, TagSet());
-    HostAndPort master = getHostOrRefresh(masterOnly);
-    uassert(10009,
-            str::stream() << "ReplicaSetMonitor no master found for set: " << getName(),
-            !master.empty());
-    return master;
+    return uassertStatusOK(getHostOrRefresh(kPrimaryOnlyReadPreference));
 }
 
 Refresher ReplicaSetMonitor::startOrContinueRefresh() {
@@ -328,9 +344,33 @@ bool ReplicaSetMonitor::isHostUp(const HostAndPort& host) const {
     return node ? node->isUp : false;
 }
 
-int ReplicaSetMonitor::getConsecutiveFailedScans() const {
+int ReplicaSetMonitor::getMinWireVersion() const {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    return _state->consecutiveFailedScans;
+    int minVersion = 0;
+    for (const auto& host : _state->nodes) {
+        if (host.isUp) {
+            minVersion = std::max(minVersion, host.minWireVersion);
+        }
+    }
+
+    return minVersion;
+}
+
+int ReplicaSetMonitor::getMaxWireVersion() const {
+    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
+    int maxVersion = std::numeric_limits<int>::max();
+    for (const auto& host : _state->nodes) {
+        if (host.isUp) {
+            maxVersion = std::min(maxVersion, host.maxWireVersion);
+        }
+    }
+
+    return maxVersion;
+}
+
+bool ReplicaSetMonitor::isSetUsable() const {
+    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
+    return _state->isUsable();
 }
 
 std::string ReplicaSetMonitor::getName() const {
@@ -340,7 +380,7 @@ std::string ReplicaSetMonitor::getName() const {
 
 std::string ReplicaSetMonitor::getServerAddress() const {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    return _state->getServerAddress();
+    return _state->getConfirmedServerAddress();
 }
 
 bool ReplicaSetMonitor::contains(const HostAndPort& host) const {
@@ -367,9 +407,14 @@ void ReplicaSetMonitor::remove(const string& name) {
     globalConnPool.removeHost(name);
 }
 
-void ReplicaSetMonitor::setConfigChangeHook(ConfigChangeHook hook) {
-    massert(13610, "ConfigChangeHook already specified", !configChangeHook);
-    configChangeHook = hook;
+void ReplicaSetMonitor::setAsynchronousConfigChangeHook(ConfigChangeHook hook) {
+    invariant(!asyncConfigChangeHook);
+    asyncConfigChangeHook = hook;
+}
+
+void ReplicaSetMonitor::setSynchronousConfigChangeHook(ConfigChangeHook hook) {
+    invariant(!syncConfigChangeHook);
+    syncConfigChangeHook = hook;
 }
 
 // TODO move to correct order with non-statics before pushing
@@ -414,6 +459,18 @@ void ReplicaSetMonitor::cleanup() {
     globalRSMonitorManager.removeAllMonitors();
 }
 
+bool ReplicaSetMonitor::isKnownToHaveGoodPrimary() const {
+    stdx::lock_guard<stdx::mutex> lk(_state->mutex);
+
+    for (const auto& node : _state->nodes) {
+        if (node.isMaster) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 Refresher::Refresher(const SetStatePtr& setState)
     : _set(setState), _scan(setState->currentScan), _startedNewScan(false) {
     if (_scan)
@@ -426,12 +483,20 @@ Refresher::Refresher(const SetStatePtr& setState)
 }
 
 Refresher::NextStep Refresher::getNextStep() {
-    if (_scan != _set->currentScan)
-        return NextStep(NextStep::DONE);  // No longer the current scan.
+    // If the set is faulty, don't try anymore
+    if (!_set->isUsable()) {
+        return NextStep(NextStep::DONE);
+    }
+
+    // No longer the current scan
+    if (_scan != _set->currentScan) {
+        return NextStep(NextStep::DONE);
+    }
 
     // Wait for all dispatched hosts to return before trying any fallback hosts.
-    if (_scan->hostsToScan.empty() && !_scan->waitingFor.empty())
+    if (_scan->hostsToScan.empty() && !_scan->waitingFor.empty()) {
         return NextStep(NextStep::WAIT);
+    }
 
     // If we haven't yet found a master, try contacting unconfirmed hosts
     if (_scan->hostsToScan.empty() && !_scan->foundUpMaster) {
@@ -454,10 +519,19 @@ Refresher::NextStep Refresher::getNextStep() {
 
             // NOTE: we don't modify seedNodes or notify about set membership change in this
             // case since it hasn't been confirmed by a master.
+            const string oldAddr = _set->getUnconfirmedServerAddress();
             for (UnconfirmedReplies::iterator it = _scan->unconfirmedReplies.begin();
                  it != _scan->unconfirmedReplies.end();
                  ++it) {
                 _set->findOrCreateNode(it->host)->update(*it);
+            }
+
+            const string newAddr = _set->getUnconfirmedServerAddress();
+            if (oldAddr != newAddr && syncConfigChangeHook) {
+                // Run the syncConfigChangeHook because the ShardRegistry needs to know about any
+                // node we might talk to.  Don't run the asyncConfigChangeHook because we don't
+                // want to update the seed list stored on the config servers with unconfirmed hosts.
+                syncConfigChangeHook(_set->name, _set->getUnconfirmedServerAddress());
             }
         }
 
@@ -472,7 +546,9 @@ Refresher::NextStep Refresher::getNextStep() {
                   << " more failed checks";
         }
 
-        _set->currentScan.reset();  // Makes sure all other Refreshers in this round return DONE
+        // Makes sure all other Refreshers in this round return DONE
+        _set->currentScan.reset();
+
         return NextStep(NextStep::DONE);
     }
 
@@ -481,6 +557,7 @@ Refresher::NextStep Refresher::getNextStep() {
     _scan->hostsToScan.pop_front();
     _scan->waitingFor.insert(host);
     _scan->triedHosts.insert(host);
+
     return NextStep(NextStep::CONTACT_HOST, host);
 }
 
@@ -498,8 +575,19 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
     }
 
     if (reply.setName != _set->name) {
-        warning() << "node: " << from << " isn't a part of set: " << _set->name
-                  << " ismaster: " << replyObj;
+        if (reply.raw["isreplicaset"].trueValue()) {
+            // The reply came from a node in the state referred to as RSGhost in the SDAM
+            // spec. RSGhost corresponds to either REMOVED or STARTUP member states. In any event,
+            // if a reply from a ghost offers a list of possible other members of the replica set,
+            // and if this refresher has yet to find the replica set master, we add hosts listed in
+            // the reply to the list of possible replica set members.
+            if (!_scan->foundUpMaster) {
+                _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
+            }
+        } else {
+            warning() << "node: " << from << " isn't a part of set: " << _set->name
+                      << " ismaster: " << replyObj;
+        }
         failedHost(from);
         return;
     }
@@ -635,17 +723,21 @@ bool Refresher::receivedIsMasterFromMaster(const IsMasterReply& reply) {
     }
 
     if (reply.normalHosts != _set->seedNodes) {
-        const string oldAddr = _set->getServerAddress();
+        const string oldAddr = _set->getConfirmedServerAddress();
         _set->seedNodes = reply.normalHosts;
 
         // LogLevel can be pretty low, since replica set reconfiguration should be pretty rare
         // and we want to record our changes
-        log() << "changing hosts to " << _set->getServerAddress() << " from " << oldAddr;
+        log() << "changing hosts to " << _set->getConfirmedServerAddress() << " from " << oldAddr;
 
-        if (configChangeHook) {
+        if (syncConfigChangeHook) {
+            syncConfigChangeHook(_set->name, _set->getConfirmedServerAddress());
+        }
+
+        if (asyncConfigChangeHook) {
             // call from a separate thread to avoid blocking and holding lock while potentially
             // going over the network
-            stdx::thread bg(configChangeHook, _set->name, _set->getServerAddress());
+            stdx::thread bg(asyncConfigChangeHook, _set->name, _set->getConfirmedServerAddress());
             bg.detach();
         }
     }
@@ -695,14 +787,14 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
         }
 
         const NextStep ns = getNextStep();
+        DEV _set->checkInvariants();
+
         switch (ns.step) {
             case NextStep::DONE:
-                DEV _set->checkInvariants();
-                // getNextStep may have updated nodes if no master was found.
+                // getNextStep may have updated nodes if no master was found
                 return criteria ? _set->getMatchingHost(*criteria) : HostAndPort();
 
             case NextStep::WAIT:  // TODO consider treating as DONE for refreshAll
-                DEV _set->checkInvariants();
                 _set->cv.wait(lk);
                 continue;
 
@@ -710,7 +802,6 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
                 BSONObj reply;  // empty on error
                 int64_t pingMicros = 0;
 
-                DEV _set->checkInvariants();
                 lk.unlock();  // relocked after attempting to call isMaster
                 try {
                     ScopedDbConnection conn(ConnectionString(ns.host), socketTimeoutSecs);
@@ -750,6 +841,9 @@ void IsMasterReply::parse(const BSONObj& obj) {
         hidden = raw["hidden"].trueValue();
         secondary = raw["secondary"].trueValue();
 
+        minWireVersion = raw["minWireVersion"].numberInt();
+        maxWireVersion = raw["maxWireVersion"].numberInt();
+
         // hidden nodes can't be master, even if they claim to be.
         isMaster = !hidden && raw["ismaster"].trueValue();
 
@@ -776,7 +870,14 @@ void IsMasterReply::parse(const BSONObj& obj) {
     }
 }
 
-const int64_t Node::unknownLatency = numeric_limits<int64_t>::max();
+Node::Node(const HostAndPort& host) : host(host), latencyMicros(unknownLatency) {}
+
+void Node::markFailed() {
+    LOG(1) << "Marking host " << host << " as failed";
+
+    isUp = false;
+    isMaster = false;
+}
 
 bool Node::matches(const ReadPreference pref) const {
     if (!isUp)
@@ -813,6 +914,9 @@ void Node::update(const IsMasterReply& reply) {
     // send any operations to them.
     isUp = !reply.hidden && (reply.isMaster || reply.secondary);
     isMaster = reply.isMaster;
+
+    minWireVersion = reply.minWireVersion;
+    maxWireVersion = reply.maxWireVersion;
 
     // save a copy if unchanged
     if (!tags.binaryEqual(reply.tags))
@@ -851,6 +955,10 @@ SetState::SetState(StringData name, const std::set<HostAndPort>& seedNodes)
     }
 
     DEV checkInvariants();
+}
+
+bool SetState::isUsable() const {
+    return consecutiveFailedScans < maxConsecutiveFailedChecks;
 }
 
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
@@ -929,6 +1037,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
 
             return HostAndPort();
         }
+
         default:
             uassert(16337, "Unknown read preference", false);
             break;
@@ -966,7 +1075,7 @@ void SetState::updateNodeIfInNodes(const IsMasterReply& reply) {
     node->update(reply);
 }
 
-std::string SetState::getServerAddress() const {
+std::string SetState::getConfirmedServerAddress() const {
     StringBuilder ss;
     if (!name.empty())
         ss << name << "/";
@@ -976,6 +1085,20 @@ std::string SetState::getServerAddress() const {
         if (it != seedNodes.begin())
             ss << ",";
         it->append(ss);
+    }
+
+    return ss.str();
+}
+
+std::string SetState::getUnconfirmedServerAddress() const {
+    StringBuilder ss;
+    if (!name.empty())
+        ss << name << "/";
+
+    for (std::vector<Node>::const_iterator it = nodes.begin(); it != nodes.end(); ++it) {
+        if (it != nodes.begin())
+            ss << ",";
+        it->host.append(ss);
     }
 
     return ss.str();

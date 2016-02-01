@@ -49,7 +49,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/s/d_state.h"
 
 namespace mongo {
 
@@ -132,7 +131,7 @@ bool WriteCmd::run(OperationContext* txn,
         return appendCommandStatus(result, Status(ErrorCodes::FailedToParse, errMsg));
     }
 
-    StatusWith<WriteConcernOptions> wcStatus = extractWriteConcern(cmdObj);
+    StatusWith<WriteConcernOptions> wcStatus = extractWriteConcern(txn, cmdObj, dbName);
 
     if (!wcStatus.isOK()) {
         return appendCommandStatus(result, wcStatus.getStatus());
@@ -152,6 +151,7 @@ Status WriteCmd::explain(OperationContext* txn,
                          const std::string& dbname,
                          const BSONObj& cmdObj,
                          ExplainCommon::Verbosity verbosity,
+                         const rpc::ServerSelectionMetadata&,
                          BSONObjBuilder* out) const {
     // For now we only explain update and delete write commands.
     if (BatchedCommandRequest::BatchType_Update != _writeType &&
@@ -211,8 +211,6 @@ Status WriteCmd::explain(OperationContext* txn,
         AutoGetDb autoDb(txn, request.getNS().db(), MODE_IX);
         Lock::CollectionLock colLock(txn->lockState(), request.getNS().ns(), MODE_IX);
 
-        ensureShardVersionOKOrThrow(txn->getClient(), request.getNS().ns());
-
         // Get a pointer to the (possibly NULL) collection.
         Collection* collection = NULL;
         if (autoDb.getDb()) {
@@ -248,8 +246,6 @@ Status WriteCmd::explain(OperationContext* txn,
         // info is more accurate.
         AutoGetDb autoDb(txn, request.getNS().db(), MODE_IX);
         Lock::CollectionLock colLock(txn->lockState(), request.getNS().ns(), MODE_IX);
-
-        ensureShardVersionOKOrThrow(txn->getClient(), request.getNS().ns());
 
         // Get a pointer to the (possibly NULL) collection.
         Collection* collection = NULL;

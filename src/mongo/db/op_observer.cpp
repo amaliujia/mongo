@@ -40,61 +40,90 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
+
+using std::vector;
 
 void OpObserver::onCreateIndex(OperationContext* txn,
                                const std::string& ns,
                                BSONObj indexDoc,
                                bool fromMigrate) {
-    repl::_logOp(txn, "i", ns.c_str(), indexDoc, nullptr, fromMigrate);
-
-    getGlobalAuthorizationManager()->logOp(txn, "i", ns.c_str(), indexDoc, nullptr);
-    logOpForSharding(txn, "i", ns.c_str(), indexDoc, nullptr, fromMigrate);
+    repl::logOp(txn, "i", ns.c_str(), indexDoc, nullptr, fromMigrate);
+    AuthorizationManager::get(txn->getServiceContext())
+        ->logOp(txn, "i", ns.c_str(), indexDoc, nullptr);
+    logInsertOpForSharding(txn, ns.c_str(), indexDoc, fromMigrate);
     logOpForDbHash(txn, ns.c_str());
 }
 
-void OpObserver::onInsert(OperationContext* txn,
-                          const NamespaceString& ns,
-                          BSONObj doc,
-                          bool fromMigrate) {
-    repl::_logOp(txn, "i", ns.ns().c_str(), doc, nullptr, fromMigrate);
+void OpObserver::onInserts(OperationContext* txn,
+                           const NamespaceString& nss,
+                           vector<BSONObj>::const_iterator begin,
+                           vector<BSONObj>::const_iterator end,
+                           bool fromMigrate) {
+    repl::logOps(txn, "i", nss, begin, end, fromMigrate);
 
-    getGlobalAuthorizationManager()->logOp(txn, "i", ns.ns().c_str(), doc, nullptr);
-    logOpForSharding(txn, "i", ns.ns().c_str(), doc, nullptr, fromMigrate);
-    logOpForDbHash(txn, ns.ns().c_str());
-    if (strstr(ns.ns().c_str(), ".system.js")) {
+    const char* ns = nss.ns().c_str();
+    for (auto it = begin; it != end; it++) {
+        AuthorizationManager::get(txn->getServiceContext())->logOp(txn, "i", ns, *it, nullptr);
+        logInsertOpForSharding(txn, ns, *it, fromMigrate);
+    }
+
+    logOpForDbHash(txn, ns);
+    if (strstr(ns, ".system.js")) {
         Scope::storedFuncMod(txn);
     }
 }
 
-void OpObserver::onUpdate(OperationContext* txn, oplogUpdateEntryArgs args) {
-    repl::_logOp(txn, "u", args.ns.c_str(), args.update, &args.criteria, args.fromMigrate);
+void OpObserver::onUpdate(OperationContext* txn, const OplogUpdateEntryArgs& args) {
+    // Do not log a no-op operation; see SERVER-21738
+    if (args.update.isEmpty()) {
+        return;
+    }
 
-    getGlobalAuthorizationManager()->logOp(txn, "u", args.ns.c_str(), args.update, &args.criteria);
-    logOpForSharding(txn, "u", args.ns.c_str(), args.update, &args.criteria, args.fromMigrate);
+    repl::logOp(txn, "u", args.ns.c_str(), args.update, &args.criteria, args.fromMigrate);
+    AuthorizationManager::get(txn->getServiceContext())
+        ->logOp(txn, "u", args.ns.c_str(), args.update, &args.criteria);
+    logUpdateOpForSharding(txn, args.ns.c_str(), args.updatedDoc, args.fromMigrate);
     logOpForDbHash(txn, args.ns.c_str());
     if (strstr(args.ns.c_str(), ".system.js")) {
         Scope::storedFuncMod(txn);
     }
 }
 
-void OpObserver::onDelete(OperationContext* txn,
-                          const std::string& ns,
-                          const BSONObj& idDoc,
-                          bool fromMigrate) {
-    repl::_logOp(txn, "d", ns.c_str(), idDoc, nullptr, fromMigrate);
+OpObserver::DeleteState OpObserver::aboutToDelete(OperationContext* txn,
+                                                  const NamespaceString& ns,
+                                                  const BSONObj& doc) {
+    OpObserver::DeleteState deleteState;
+    BSONElement idElement = doc["_id"];
+    if (!idElement.eoo()) {
+        deleteState.idDoc = idElement.wrap();
+    }
+    deleteState.isMigrating = isInMigratingChunk(txn, ns, doc);
+    return deleteState;
+}
 
-    getGlobalAuthorizationManager()->logOp(txn, "d", ns.c_str(), idDoc, nullptr);
-    logOpForSharding(txn, "d", ns.c_str(), idDoc, nullptr, fromMigrate);
-    logOpForDbHash(txn, ns.c_str());
-    if (strstr(ns.c_str(), ".system.js")) {
+void OpObserver::onDelete(OperationContext* txn,
+                          const NamespaceString& ns,
+                          OpObserver::DeleteState deleteState,
+                          bool fromMigrate) {
+    if (deleteState.idDoc.isEmpty())
+        return;
+
+    repl::logOp(txn, "d", ns.ns().c_str(), deleteState.idDoc, nullptr, fromMigrate);
+    AuthorizationManager::get(txn->getServiceContext())
+        ->logOp(txn, "d", ns.ns().c_str(), deleteState.idDoc, nullptr);
+    logDeleteOpForSharding(
+        txn, ns.ns().c_str(), deleteState.idDoc, fromMigrate || !deleteState.isMigrating);
+    logOpForDbHash(txn, ns.ns().c_str());
+    if (ns.coll() == "system.js") {
         Scope::storedFuncMod(txn);
     }
 }
 
 void OpObserver::onOpMessage(OperationContext* txn, const BSONObj& msgObj) {
-    repl::_logOp(txn, "n", "", msgObj, nullptr, false);
+    repl::logOp(txn, "n", "", msgObj, nullptr, false);
 }
 
 void OpObserver::onCreateCollection(OperationContext* txn,
@@ -108,7 +137,7 @@ void OpObserver::onCreateCollection(OperationContext* txn,
 
     if (!collectionName.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+        repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
     }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
@@ -123,7 +152,7 @@ void OpObserver::onCollMod(OperationContext* txn,
 
     if (!NamespaceString(NamespaceString(dbName).db(), coll).isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::_logOp(txn, "c", dbName.c_str(), collModCmd, nullptr, false);
+        repl::logOp(txn, "c", dbName.c_str(), collModCmd, nullptr, false);
     }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), collModCmd, nullptr);
@@ -133,7 +162,7 @@ void OpObserver::onCollMod(OperationContext* txn,
 void OpObserver::onDropDatabase(OperationContext* txn, const std::string& dbName) {
     BSONObj cmdObj = BSON("dropDatabase" << 1);
 
-    repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+    repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
     logOpForDbHash(txn, dbName.c_str());
@@ -145,7 +174,7 @@ void OpObserver::onDropCollection(OperationContext* txn, const NamespaceString& 
 
     if (!collectionName.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+        repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
     }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
@@ -155,7 +184,7 @@ void OpObserver::onDropCollection(OperationContext* txn, const NamespaceString& 
 void OpObserver::onDropIndex(OperationContext* txn,
                              const std::string& dbName,
                              const BSONObj& idxDescriptor) {
-    repl::_logOp(txn, "c", dbName.c_str(), idxDescriptor, nullptr, false);
+    repl::logOp(txn, "c", dbName.c_str(), idxDescriptor, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), idxDescriptor, nullptr);
     logOpForDbHash(txn, dbName.c_str());
@@ -171,7 +200,7 @@ void OpObserver::onRenameCollection(OperationContext* txn,
         BSON("renameCollection" << fromCollection.ns() << "to" << toCollection.ns() << "stayTemp"
                                 << stayTemp << "dropTarget" << dropTarget);
 
-    repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+    repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
     logOpForDbHash(txn, dbName.c_str());
@@ -180,7 +209,7 @@ void OpObserver::onRenameCollection(OperationContext* txn,
 void OpObserver::onApplyOps(OperationContext* txn,
                             const std::string& dbName,
                             const BSONObj& applyOpCmd) {
-    repl::_logOp(txn, "c", dbName.c_str(), applyOpCmd, nullptr, false);
+    repl::logOp(txn, "c", dbName.c_str(), applyOpCmd, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), applyOpCmd, nullptr);
     logOpForDbHash(txn, dbName.c_str());
@@ -194,7 +223,7 @@ void OpObserver::onConvertToCapped(OperationContext* txn,
 
     if (!collectionName.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+        repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
     }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);
@@ -207,7 +236,7 @@ void OpObserver::onEmptyCapped(OperationContext* txn, const NamespaceString& col
 
     if (!collectionName.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::_logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
+        repl::logOp(txn, "c", dbName.c_str(), cmdObj, nullptr, false);
     }
 
     getGlobalAuthorizationManager()->logOp(txn, "c", dbName.c_str(), cmdObj, nullptr);

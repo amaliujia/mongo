@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/s/chunk_manager.h"
@@ -55,7 +56,8 @@ using std::make_pair;
 // Utility function to create a CanonicalQuery
 unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
     BSONObj queryObj = fromjson(queryStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize("test.foo", queryObj, WhereCallbackNoop());
+    const NamespaceString nss("test.foo");
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }

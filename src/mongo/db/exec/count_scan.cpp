@@ -43,13 +43,12 @@ using stdx::make_unique;
 const char* CountScan::kStageType = "COUNT_SCAN";
 
 CountScan::CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet)
-    : _txn(txn),
+    : PlanStage(kStageType, txn),
       _workingSet(workingSet),
       _descriptor(params.descriptor),
       _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
       _shouldDedup(params.descriptor->isMultikey(txn)),
-      _params(params),
-      _commonStats(kStageType) {
+      _params(params) {
     _specificStats.keyPattern = _params.descriptor->keyPattern();
     _specificStats.indexName = _params.descriptor->indexName();
     _specificStats.isMultiKey = _params.descriptor->isMultikey(txn);
@@ -65,13 +64,9 @@ CountScan::CountScan(OperationContext* txn, const CountScanParams& params, Worki
 }
 
 
-PlanStage::StageState CountScan::work(WorkingSetID* out) {
-    ++_commonStats.works;
+PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
     if (_commonStats.isEOF)
         return PlanStage::IS_EOF;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
 
     boost::optional<IndexKeyEntry> entry;
     const bool needInit = !_cursor;
@@ -81,7 +76,7 @@ PlanStage::StageState CountScan::work(WorkingSetID* out) {
 
         if (needInit) {
             // First call to work().  Perform cursor init.
-            _cursor = _iam->newCursor(_txn);
+            _cursor = _iam->newCursor(getOpCtx());
             _cursor->setEndPosition(_params.endKey, _params.endKeyInclusive);
 
             entry = _cursor->seek(_params.startKey, _params.startKeyInclusive, kWantLoc);
@@ -107,12 +102,14 @@ PlanStage::StageState CountScan::work(WorkingSetID* out) {
 
     if (_shouldDedup && !_returned.insert(entry->loc).second) {
         // *loc was already in _returned.
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     }
 
-    *out = WorkingSet::INVALID_ID;
-    ++_commonStats.advanced;
+    WorkingSetID id = _workingSet->allocate();
+    WorkingSetMember* member = _workingSet->get(id);
+    member->obj = Snapshotted<BSONObj>(SnapshotId(), BSONObj().getOwned());
+    member->transitionToOwnedObj();
+    *out = id;
     return PlanStage::ADVANCED;
 }
 
@@ -120,29 +117,31 @@ bool CountScan::isEOF() {
     return _commonStats.isEOF;
 }
 
-void CountScan::saveState() {
-    _txn = NULL;
-    ++_commonStats.yields;
+void CountScan::doSaveState() {
     if (_cursor)
-        _cursor->savePositioned();
+        _cursor->save();
 }
 
-void CountScan::restoreState(OperationContext* opCtx) {
-    invariant(_txn == NULL);
-    _txn = opCtx;
-    ++_commonStats.unyields;
-
+void CountScan::doRestoreState() {
     if (_cursor)
-        _cursor->restore(opCtx);
+        _cursor->restore();
 
     // This can change during yielding.
     // TODO this isn't sufficient. See SERVER-17678.
-    _shouldDedup = _descriptor->isMultikey(_txn);
+    _shouldDedup = _descriptor->isMultikey(getOpCtx());
 }
 
-void CountScan::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-    ++_commonStats.invalidates;
+void CountScan::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+}
 
+void CountScan::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(getOpCtx());
+}
+
+void CountScan::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
     // The only state we're responsible for holding is what RecordIds to drop.  If a document
     // mutates the underlying index cursor will deal with it.
     if (INVALIDATION_MUTATION == type) {
@@ -157,11 +156,6 @@ void CountScan::invalidate(OperationContext* txn, const RecordId& dl, Invalidati
     }
 }
 
-vector<PlanStage*> CountScan::getChildren() const {
-    vector<PlanStage*> empty;
-    return empty;
-}
-
 unique_ptr<PlanStageStats> CountScan::getStats() {
     unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
 
@@ -170,10 +164,6 @@ unique_ptr<PlanStageStats> CountScan::getStats() {
     ret->specific = std::move(countStats);
 
     return ret;
-}
-
-const CommonStats* CountScan::getCommonStats() const {
-    return &_commonStats;
 }
 
 const SpecificStats* CountScan::getSpecificStats() const {

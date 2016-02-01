@@ -119,10 +119,7 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder, bool isProtoco
     }
     if (_opTimeSet) {
         if (isProtocolVersionV1) {
-            BSONObjBuilder opTime(builder->subobjStart(kOpTimeFieldName));
-            opTime.append(kTimestampFieldName, _opTime.getTimestamp());
-            opTime.append(kTermFieldName, _opTime.getTerm());
-            opTime.done();
+            _opTime.append(builder, kOpTimeFieldName);
         } else {
             builder->appendDate(kOpTimeFieldName,
                                 Date_t::fromMillisSinceEpoch(_opTime.getTimestamp().asLL()));
@@ -207,6 +204,11 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
 
     _isReplSet = doc[kIsReplSetFieldName].trueValue();
 
+    Status termStatus = bsonExtractIntegerField(doc, kTermFieldName, &_term);
+    if (!termStatus.isOK() && termStatus != ErrorCodes::NoSuchKey) {
+        return termStatus;
+    }
+
     // In order to support both the 3.0(V0) and 3.2(V1) heartbeats we must parse the OpTime
     // field based on its type. If it is a Date, we parse it as the timestamp and use
     // initialize's term argument to complete the OpTime type. If it is an Object, then it's
@@ -221,18 +223,8 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
         _opTimeSet = true;
         _opTime = OpTime(Timestamp(opTimeElement.date()), term);
     } else if (opTimeElement.type() == Object) {
-        BSONObj opTime = opTimeElement.Obj();
-        Timestamp ts;
-        Status status = bsonExtractTimestampField(opTime, kTimestampFieldName, &ts);
-        if (!status.isOK())
-            return status;
-        long long extractedTerm;
-        status = bsonExtractIntegerField(opTime, kTermFieldName, &extractedTerm);
-        if (!status.isOK())
-            return status;
-
+        Status status = bsonExtractOpTimeField(doc, kOpTimeFieldName, &_opTime);
         _opTimeSet = true;
-        _opTime = OpTime(ts, extractedTerm);
         // since a v1 OpTime was in the response, the member must be part of a replset
         _isReplSet = true;
     } else {

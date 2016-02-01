@@ -47,6 +47,9 @@ class StatusWith;
  */
 class LiteParsedQuery {
 public:
+    static const char kFindCommandName[];
+    static const char kShardVersionField[];
+
     /**
      * Parses a find command object, 'cmdObj'. Caller must indicate whether or not this lite
      * parsed query is an explained query or not via 'isExplain'.
@@ -77,42 +80,54 @@ public:
     /**
      * Constructs a LiteParseQuery object that can be used to serialize to find command
      * BSON object.
+     *
+     * Input must be fully validated (e.g. if there is a limit value, it must be non-negative).
      */
-    static StatusWith<std::unique_ptr<LiteParsedQuery>> makeAsFindCmd(
+    static std::unique_ptr<LiteParsedQuery> makeAsFindCmd(
         NamespaceString nss,
-        const BSONObj& query,
-        const BSONObj& sort,
-        boost::optional<long long> limit);
+        const BSONObj& filter = BSONObj(),
+        const BSONObj& projection = BSONObj(),
+        const BSONObj& sort = BSONObj(),
+        const BSONObj& hint = BSONObj(),
+        const BSONObj& readConcern = BSONObj(),
+        boost::optional<long long> skip = boost::none,
+        boost::optional<long long> limit = boost::none,
+        boost::optional<long long> batchSize = boost::none,
+        boost::optional<long long> ntoreturn = boost::none,
+        bool wantMore = true,
+        bool isExplain = false,
+        const std::string& comment = "",
+        int maxScan = 0,
+        int maxTimeMS = 0,
+        const BSONObj& min = BSONObj(),
+        const BSONObj& max = BSONObj(),
+        bool returnKey = false,
+        bool showRecordId = false,
+        bool isSnapshot = false,
+        bool hasReadPref = false,
+        bool isTailable = false,
+        bool isSlaveOk = false,
+        bool isOplogReplay = false,
+        bool isNoCursorTimeout = false,
+        bool isAwaitData = false,
+        bool allowPartialResults = false);
 
     /**
      * Converts this LPQ into a find command.
      */
     BSONObj asFindCommand() const;
+    void asFindCommand(BSONObjBuilder* cmdBuilder) const;
 
     /**
-     * Helper functions to parse maxTimeMS from a command object.  Returns the contained value,
-     * or an error on parsing fail.  When passed an EOO-type element, returns 0 (special value
-     * for "allow to run indefinitely").
+     * Parses maxTimeMS from the BSONElement containing its value.
      */
-    static StatusWith<int> parseMaxTimeMSCommand(const BSONObj& cmdObj);
-
-    /**
-     * Same as parseMaxTimeMSCommand, but for a query object.
-     */
-    static StatusWith<int> parseMaxTimeMSQuery(const BSONObj& queryObj);
+    static StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt);
 
     /**
      * Helper function to identify text search sort key
      * Example: {a: {$meta: "textScore"}}
      */
     static bool isTextScoreMeta(BSONElement elt);
-
-    /**
-     * Helper function to identify recordId projection.
-     *
-     * Example: {a: {$meta: "recordId"}}.
-     */
-    static bool isRecordIdMeta(BSONElement elt);
 
     /**
      * Helper function to validate a sort object.
@@ -129,19 +144,27 @@ public:
      */
     static bool isQueryIsolated(const BSONObj& query);
 
-    // Name of the find command parameter used to pass read preference.
-    static const char* kFindCommandReadPrefField;
+    // Read preference is attached to commands in "wrapped" form, e.g.
+    //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
+    //
+    // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
+    // command, e.g.
+    //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
+    static const std::string kWrappedReadPrefField;
+    static const std::string kUnwrappedReadPrefField;
 
     // Names of the maxTimeMS command and query option.
-    static const std::string cmdOptionMaxTimeMS;
-    static const std::string queryOptionMaxTimeMS;
+    // Char arrays because they are used in static initialization.
+    static const char cmdOptionMaxTimeMS[];
+    static const char queryOptionMaxTimeMS[];
 
     // Names of the $meta projection values.
-    static const std::string metaTextScore;
     static const std::string metaGeoNearDistance;
     static const std::string metaGeoNearPoint;
-    static const std::string metaRecordId;
     static const std::string metaIndexKey;
+    static const std::string metaRecordId;
+    static const std::string metaSortKey;
+    static const std::string metaTextScore;
 
     const NamespaceString& nss() const {
         return _nss;
@@ -162,10 +185,13 @@ public:
     const BSONObj& getHint() const {
         return _hint;
     }
+    const BSONObj& getReadConcern() const {
+        return _readConcern;
+    }
 
     static const long long kDefaultBatchSize;
 
-    long long getSkip() const {
+    boost::optional<long long> getSkip() const {
         return _skip;
     }
     boost::optional<long long> getLimit() const {
@@ -174,13 +200,20 @@ public:
     boost::optional<long long> getBatchSize() const {
         return _batchSize;
     }
+    boost::optional<long long> getNToReturn() const {
+        return _ntoreturn;
+    }
+
+    /**
+     * Returns batchSize or ntoreturn value if either is set. If neither is set,
+     * returns boost::none.
+     */
+    boost::optional<long long> getEffectiveBatchSize() const;
+
     bool wantMore() const {
         return _wantMore;
     }
 
-    bool isFromFindCommand() const {
-        return _fromCommand;
-    }
     bool isExplain() const {
         return _explain;
     }
@@ -234,8 +267,8 @@ public:
     bool isExhaust() const {
         return _exhaust;
     }
-    bool isPartial() const {
-        return _partial;
+    bool isAllowPartialResults() const {
+        return _allowPartialResults;
     }
 
     boost::optional<long long> getReplicationTerm() const {
@@ -276,8 +309,6 @@ private:
 
     Status initFullQuery(const BSONObj& top);
 
-    static StatusWith<int> parseMaxTimeMS(const BSONElement& maxTimeMSElt);
-
     /**
      * Updates the projection object with a $meta projection for the returnKey option.
      */
@@ -314,14 +345,28 @@ private:
     // the key pattern hinted.  If the hint was by index name, the value of '_hint' is
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
+    // The read concern is parsed elsewhere.
+    BSONObj _readConcern;
 
-    long long _skip = 0;
     bool _wantMore = true;
 
+    // Must be either unset or positive. Negative skip is illegal and a skip of zero received from
+    // the client is interpreted as the absence of a skip value.
+    boost::optional<long long> _skip;
+
+    // Must be either unset or positive. Negative limit is illegal and a limit value of zero
+    // received from the client is interpreted as the absence of a limit value.
     boost::optional<long long> _limit;
+
+    // Must be either unset or non-negative. Negative batchSize is illegal but batchSize of 0 is
+    // allowed.
     boost::optional<long long> _batchSize;
 
-    bool _fromCommand = false;
+    // Set only when parsed from an OP_QUERY find message. The value is computed by driver or shell
+    // and is set to be a min of batchSize and limit provided by user. LPQ can have set either
+    // ntoreturn or batchSize / limit.
+    boost::optional<long long> _ntoreturn;
+
     bool _explain = false;
 
     std::string _comment;
@@ -344,7 +389,7 @@ private:
     bool _noCursorTimeout = false;
     bool _awaitData = false;
     bool _exhaust = false;
-    bool _partial = false;
+    bool _allowPartialResults = false;
 
     boost::optional<long long> _replicationTerm;
 };

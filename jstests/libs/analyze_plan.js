@@ -3,32 +3,61 @@
 // scan or whether the plan is covered (index only).
 
 /**
+ * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
+ * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
+ * requested stage.
+ */
+function getPlanStages(root, stage) {
+    var results = [];
+
+    if (root.stage === stage) {
+        results.push(root);
+    }
+
+    if ("inputStage" in root) {
+        results = results.concat(getPlanStages(root.inputStage, stage));
+    }
+
+    if ("inputStages" in root) {
+        for (var i = 0; i < root.inputStages.length; i++) {
+            results = results.concat(getPlanStages(root.inputStages[i], stage));
+        }
+    }
+
+    if ("shards" in root) {
+        for (var i = 0; i < root.shards.length; i++) {
+            results = results.concat(getPlanStages(root.shards[i].winningPlan, stage));
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Given the root stage of explain's JSON representation of a query plan ('root'), returns the
+ * subdocument with its stage as 'stage'. Returns null if the plan does not have such a stage.
+ * Asserts that no more than one stage is a match.
+ */
+function getPlanStage(root, stage) {
+    var planStageList = getPlanStages(root, stage);
+
+    if (planStageList.length === 0) {
+        return null;
+    }
+    else {
+        assert(planStageList.length === 1,
+               "getPlanStage expects to find 0 or 1 matching stages. planStageList: "
+               + tojson(planStageList));
+        return planStageList[0];
+    }
+}
+
+/**
  * Given the root stage of explain's BSON representation of a query plan ('root'),
  * returns true if the plan has a stage called 'stage'.
  */
 function planHasStage(root, stage) {
-    if (root.stage === stage) {
-        return true;
-    }
-    else if ("inputStage" in root) {
-        return planHasStage(root.inputStage, stage);
-    }
-    else if ("inputStages" in root) {
-        for (var i = 0; i < root.inputStages.length; i++) {
-            if (planHasStage(root.inputStages[i], stage)) {
-                return true;
-            }
-        }
-    }
-    else if ("shards" in root) {
-        for (var i = 0; i < root.shards.length; i++) {
-            if (planHasStage(root.shards[i].winningPlan, stage)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
+    return getPlanStage(root, stage) !== null;
 }
 
 /**

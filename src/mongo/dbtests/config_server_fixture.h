@@ -39,9 +39,7 @@ namespace mongo {
 
 class CustomDirectClient : public DBDirectClient {
 public:
-    CustomDirectClient(OperationContext* txn) : DBDirectClient(txn) {
-        setWireVersions(minWireVersion, maxWireVersion);
-    }
+    CustomDirectClient(OperationContext* txn) : DBDirectClient(txn) {}
 
     virtual ConnectionString::ConnectionType type() const {
         return ConnectionString::CUSTOM;
@@ -118,8 +116,8 @@ protected:
     CustomDirectClient _client;
     CustomConnectHook* _connectHook;
 
-private:
     virtual void setUp();
     virtual void tearDown();
 };
-}
+
+}  // namespace mongo

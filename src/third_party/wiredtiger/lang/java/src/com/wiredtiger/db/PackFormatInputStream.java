@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-2016 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -180,5 +180,12 @@ public class PackFormatInputStream {
         }
         return valueLen;
     }
-}
 
+    /**
+     * Return whether there is an explicit length indicated in the format
+     * string.
+     */
+    protected boolean hasLength() {
+        return (getIntFromFormat(false) > 0);
+    }
+}

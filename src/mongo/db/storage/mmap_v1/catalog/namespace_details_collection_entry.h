@@ -49,6 +49,7 @@ public:
     NamespaceDetailsCollectionCatalogEntry(StringData ns,
                                            NamespaceDetails* details,
                                            RecordStore* namespacesRecordStore,
+                                           RecordId namespacesRecordId,
                                            RecordStore* indexRecordStore,
                                            MMAPV1DatabaseCatalogEntry* db);
 
@@ -95,17 +96,36 @@ public:
     void updateValidator(OperationContext* txn,
                          const BSONObj& validator,
                          StringData validationLevel,
-                         StringData validationState) final;
+                         StringData validationAction) final;
 
     // not part of interface, but available to my storage engine
 
     int _findIndexNumber(OperationContext* txn, StringData indexName) const;
 
+    RecordId getNamespacesRecordId() {
+        return _namespacesRecordId;
+    }
+
+    /**
+     * 'txn' is only allowed to be null when called from the constructor.
+     */
+    void setNamespacesRecordId(OperationContext* txn, RecordId newId);
+
 private:
     NamespaceDetails* _details;
     RecordStore* _namespacesRecordStore;
+
+    // Where this entry lives in the _namespacesRecordStore.
+    RecordId _namespacesRecordId;
+
     RecordStore* _indexRecordStore;
     MMAPV1DatabaseCatalogEntry* _db;
+
+    /**
+     * Updates the entry for this namespace in '_namespacesRecordStore', updating
+     * '_namespacesRecordId' if necessary.
+     */
+    void _updateSystemNamespaces(OperationContext* txn, const BSONObj& update);
 
     friend class MMAPV1DatabaseCatalogEntry;
 };

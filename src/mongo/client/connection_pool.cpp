@@ -33,6 +33,11 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
 
 namespace mongo {
 namespace {
@@ -45,7 +50,12 @@ const Minutes kMaxConnectionAge(30);
 
 }  // namespace
 
-ConnectionPool::ConnectionPool(int messagingPortTags) : _messagingPortTags(messagingPortTags) {}
+ConnectionPool::ConnectionPool(int messagingPortTags,
+                               std::unique_ptr<executor::NetworkConnectionHook> hook)
+    : _messagingPortTags(messagingPortTags), _hook(std::move(hook)) {}
+
+ConnectionPool::ConnectionPool(int messagingPortTags)
+    : ConnectionPool(messagingPortTags, nullptr) {}
 
 ConnectionPool::~ConnectionPool() {
     cleanUpOlderThan(Date_t::max());
@@ -139,9 +149,9 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
         try {
             if (candidate->conn->isStillConnected()) {
                 // setSoTimeout takes a double representing the number of seconds for send and
-                // receive timeouts.  Thus, we must take count() and divide by
+                // receive timeouts.  Thus, we must express 'timeout' in milliseconds and divide by
                 // 1000.0 to get the number of seconds with a fractional part.
-                candidate->conn->setSoTimeout(timeout.count() / 1000.0);
+                candidate->conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
                 return candidate;
             }
         } catch (...) {
@@ -157,17 +167,24 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     // No idle connection in the pool; make a new one.
     lk.unlock();
 
-    std::unique_ptr<DBClientConnection> conn(new DBClientConnection());
+    std::unique_ptr<DBClientConnection> conn;
+    if (_hook) {
+        conn.reset(new DBClientConnection(
+            false,  // auto reconnect
+            0,      // socket timeout
+            [this, target](const executor::RemoteCommandResponse& isMasterReply) {
+                return _hook->validateHost(target, isMasterReply);
+            }));
+    } else {
+        conn.reset(new DBClientConnection());
+    }
 
     // setSoTimeout takes a double representing the number of seconds for send and receive
-    // timeouts.  Thus, we must take count() and divide by 1000.0 to get the number
-    // of seconds with a fractional part.
-    conn->setSoTimeout(timeout.count() / 1000.0);
-    std::string errmsg;
-    uassert(ErrorCodes::HostUnreachable,
-            str::stream() << "Failed attempt to connect to " << target.toString() << "; " << errmsg,
-            conn->connect(target, errmsg));
+    // timeouts.  Thus, we must express 'timeout' in milliseconds and divide by 1000.0 to get
+    // the number of seconds with a fractional part.
+    conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
 
+    uassertStatusOK(conn->connect(target));
     conn->port().tag |= _messagingPortTags;
 
     if (getGlobalAuthorizationManager()->isAuthEnabled()) {
@@ -175,6 +192,26 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
                 "Missing credentials for authenticating as internal user",
                 isInternalAuthSet());
         conn->auth(getInternalUserAuthParamsWithFallback());
+    }
+
+    if (_hook) {
+        auto postConnectRequest = uassertStatusOK(_hook->makeRequest(target));
+
+        // We might not have a postConnectRequest
+        if (postConnectRequest != boost::none) {
+            auto start = Date_t::now();
+            auto reply =
+                conn->runCommandWithMetadata(postConnectRequest->dbname,
+                                             postConnectRequest->cmdObj.firstElementFieldName(),
+                                             postConnectRequest->metadata,
+                                             postConnectRequest->cmdObj);
+
+            auto rcr = executor::RemoteCommandResponse(reply->getCommandReply().getOwned(),
+                                                       reply->getMetadata().getOwned(),
+                                                       Date_t::now() - start);
+
+            uassertStatusOK(_hook->handleReply(target, std::move(rcr)));
+        }
     }
 
     lk.lock();
@@ -229,6 +266,11 @@ ConnectionPool::ConnectionPtr::ConnectionPtr(ConnectionPtr&& other)
 }
 
 ConnectionPool::ConnectionPtr& ConnectionPool::ConnectionPtr::operator=(ConnectionPtr&& other) {
+#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
+    if (&other == this)
+        return *this;
+#endif
+
     _pool = std::move(other._pool);
     _connInfo = std::move(other._connInfo);
     other._pool = nullptr;

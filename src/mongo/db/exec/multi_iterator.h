@@ -45,43 +45,34 @@ namespace mongo {
  * special commands that work with RecordCursors. For example, it is used by the
  * parallelCollectionScan and repairCursor commands
  */
-class MultiIteratorStage : public PlanStage {
+class MultiIteratorStage final : public PlanStage {
 public:
     MultiIteratorStage(OperationContext* txn, WorkingSet* ws, Collection* collection);
 
-    ~MultiIteratorStage() {}
-
     void addIterator(std::unique_ptr<RecordCursor> it);
 
-    virtual PlanStage::StageState work(WorkingSetID* out);
+    PlanStage::StageState doWork(WorkingSetID* out) final;
 
-    virtual bool isEOF();
+    bool isEOF() final;
 
     void kill();
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
     // Returns empty PlanStageStats object
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
     // Not used.
-    virtual CommonStats* getCommonStats() const {
+    SpecificStats* getSpecificStats() const final {
         return NULL;
     }
 
     // Not used.
-    virtual SpecificStats* getSpecificStats() const {
-        return NULL;
-    }
-
-    // Not used.
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    // Not used.
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_MULTI_ITERATOR;
     }
 

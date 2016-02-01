@@ -31,7 +31,9 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/clientcursor.h"
+#include "mongo/db/cursor_id.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/explain_common.h"
 
 namespace mongo {
 
@@ -39,13 +41,22 @@ template <typename T>
 class StatusWith;
 class CanonicalQuery;
 class OperationContext;
+struct GetMoreRequest;
 struct ReadPreferenceSetting;
+
+namespace rpc {
+class ServerSelectionMetadata;
+}  // namespace rpc
 
 /**
  * Methods for running find and getMore operations across a sharded cluster.
  */
 class ClusterFind {
 public:
+    // The number of times we are willing to re-target and re-run the query after receiving a stale
+    // config message.
+    static const size_t kMaxStaleConfigRetries;
+
     /**
      * Runs query 'query', targeting remote hosts according to the read preference in 'readPref'.
      *
@@ -57,6 +68,25 @@ public:
                                          const CanonicalQuery& query,
                                          const ReadPreferenceSetting& readPref,
                                          std::vector<BSONObj>* results);
+
+    /**
+     * Executes the getMore request 'request', and on success returns a CursorResponse.
+     */
+    static StatusWith<CursorResponse> runGetMore(OperationContext* txn,
+                                                 const GetMoreRequest& request);
+
+    /**
+     * Extracts the read preference from 'cmdObj', or determines the read pref based on 'isSlaveOk'
+     * if 'cmdObj' does not contain a read preference.
+     *
+     * Expects a read preference that has already been "unwrapped" by the mongos command handling
+     * code, e.g. { ... , $queryOptions: { $readPreference: { ... } } , ... }.
+     *
+     * Returns a non-OK status if 'cmdObj' has a read preference but the read preference does not
+     * parse correctly.
+     */
+    static StatusWith<ReadPreferenceSetting> extractUnwrappedReadPref(const BSONObj& cmdObj,
+                                                                      bool isSlaveOk);
 };
 
 }  // namespace mongo

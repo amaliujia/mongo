@@ -7,29 +7,33 @@ var replTest = new ReplSetTest({ nodes: 2 });
 replTest.startSet();
 
 var config = replTest.getReplSetConfig();
-// TODO: SERVER-18298 uncomment once implemented.
-//config.settings.protocolVersion = 1;
 replTest.initiate(config);
+config = replTest.getConfigFromPrimary();
 
 var runTest = function(testDB, primaryConn) {
     primaryConn.getDB('test').user.insert({ x: 1 }, { writeConcern: { w: 2 }});
 
     var localDB = primaryConn.getDB('local');
 
-    var oplogTS = localDB.oplog.rs.find().sort({ $natural: -1 }).limit(1).next().ts;
-    var twoSecTS = new Timestamp(oplogTS.getTime() + 2, 0);
+    var oplogTS = localDB.oplog.rs.find().sort({ $natural: -1 }).limit(1).next();
+    var twoSecTS = new Timestamp(oplogTS.ts.getTime() + 2, 0);
+
+    var term = -1;
+    if (config.protocolVersion === 1) {
+        term = oplogTS.t;
+    }
 
     // Test timeout with maxTimeMS
     var res = assert.commandFailed(testDB.runCommand({
         find: 'user',
         filter: { x: 1 },
-        $readConcern: {
-            afterOpTime: { ts: twoSecTS, term: 0 }
+        readConcern: {
+            afterOpTime: { ts: twoSecTS, t: term }
         },
         maxTimeMS: 1000
     }));
 
-    assert.eq(50, res.code); // ErrorCodes::ExceededTimeLimit
+    assert.eq(50, res.code, tojson(res)); // ErrorCodes::ExceededTimeLimit
     assert.gt(res.waitedMS, 500);
     assert.lt(res.waitedMS, 2500);
 
@@ -41,10 +45,10 @@ var runTest = function(testDB, primaryConn) {
     res = assert.commandWorked(testDB.runCommand({
         find: 'user',
         filter: { x: 1 },
-        $readConcern: {
-            afterOpTime: { ts: twoSecTS, term: 0 },
-            maxTimeMS: 10 * 1000
-        }
+        readConcern: {
+            afterOpTime: { ts: twoSecTS, t: term },
+        },
+        maxTimeMS: 10 * 1000,
     }));
 
     assert.eq(null, res.code);

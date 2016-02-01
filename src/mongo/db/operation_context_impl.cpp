@@ -99,8 +99,6 @@ RecoveryUnit* OperationContextImpl::recoveryUnit() const {
 }
 
 RecoveryUnit* OperationContextImpl::releaseRecoveryUnit() {
-    if (_recovery.get())
-        _recovery->beingReleasedFromOperationContext();
     return _recovery.release();
 }
 
@@ -109,8 +107,6 @@ OperationContext::RecoveryUnitState OperationContextImpl::setRecoveryUnit(Recove
     _recovery.reset(unit);
     RecoveryUnitState oldState = _ruState;
     _ruState = state;
-    if (unit)
-        unit->beingSetOnOperationContext();
     return oldState;
 }
 
@@ -144,6 +140,7 @@ uint64_t OperationContextImpl::getRemainingMaxTimeMicros() const {
 MONGO_FP_DECLARE(checkForInterruptFail);
 
 namespace {
+
 // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
 // being run by the given Client meet the (probabilistic) conditions for interruption as
 // specified in the fail point info.
@@ -198,8 +195,9 @@ Status OperationContextImpl::checkForInterruptNoAssert() {
         }
     }
 
-    if (isKillPending()) {
-        return Status(ErrorCodes::Interrupted, "operation was interrupted");
+    const auto killStatus = getKillStatus();
+    if (killStatus != ErrorCodes::OK) {
+        return Status(killStatus, "operation was interrupted");
     }
 
     return Status::OK();

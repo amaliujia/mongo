@@ -31,6 +31,7 @@
 #include <cctype>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -96,7 +97,7 @@ bool DocumentSourceMatch::coalesce(const intrusive_ptr<DocumentSource>& nextSour
 
     // Replace our matcher with the $and of ours and theirs.
     matcher.reset(new Matcher(BSON("$and" << BSON_ARRAY(getQuery() << otherMatch->getQuery())),
-                              MatchExpressionParser::WhereCallback()));
+                              ExtensionsCallbackNoop()));
 
     return true;
 }
@@ -161,6 +162,10 @@ Document redactSafePortionDollarOps(BSONObj expr) {
             case BSONObj::opREGEX:
             case BSONObj::opOPTIONS:
             case BSONObj::opMOD:
+            case BSONObj::opBITS_ALL_SET:
+            case BSONObj::opBITS_ALL_CLEAR:
+            case BSONObj::opBITS_ANY_SET:
+            case BSONObj::opBITS_ANY_CLEAR:
                 output[field.fieldNameStringData()] = Value(field);
                 break;
 
@@ -221,7 +226,6 @@ Document redactSafePortionDollarOps(BSONObj expr) {
 
             // These are never allowed
             case BSONObj::Equality:  // This actually means unknown
-            case BSONObj::opMAX_DISTANCE:
             case BSONObj::opNEAR:
             case BSONObj::NE:
             case BSONObj::opSIZE:
@@ -356,6 +360,6 @@ BSONObj DocumentSourceMatch::getQuery() const {
 DocumentSourceMatch::DocumentSourceMatch(const BSONObj& query,
                                          const intrusive_ptr<ExpressionContext>& pExpCtx)
     : DocumentSource(pExpCtx),
-      matcher(new Matcher(query.getOwned(), MatchExpressionParser::WhereCallback())),
+      matcher(new Matcher(query.getOwned(), ExtensionsCallbackNoop())),
       _isTextQuery(isTextQuery(query)) {}
 }

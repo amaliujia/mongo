@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/write_ops/batch_write_op.h"
 
 #include "mongo/base/error_codes.h"
@@ -226,7 +228,8 @@ static void cancelBatches(const WriteErrorDetail& why,
     batchMap->clear();
 }
 
-Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
+Status BatchWriteOp::targetBatch(OperationContext* txn,
+                                 const NSTargeter& targeter,
                                  bool recordTargetErrors,
                                  vector<TargetedWriteBatch*>* targetedBatches) {
     //
@@ -285,7 +288,7 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
         OwnedPointerVector<TargetedWrite> writesOwned;
         vector<TargetedWrite*>& writes = writesOwned.mutableVector();
 
-        Status targetStatus = writeOp.targetWrites(targeter, &writes);
+        Status targetStatus = writeOp.targetWrites(txn, targeter, &writes);
 
         if (!targetStatus.isOK()) {
             WriteErrorDetail targetError;
@@ -451,11 +454,7 @@ void BatchWriteOp::buildBatchRequest(const TargetedWriteBatch& targetedBatch,
         request->setOrdered(_clientRequest->getOrdered());
     }
 
-    unique_ptr<BatchedRequestMetadata> requestMetadata(new BatchedRequestMetadata());
-    requestMetadata->setShardName(targetedBatch.getEndpoint().shardName);
-    requestMetadata->setShardVersion(targetedBatch.getEndpoint().shardVersion);
-    requestMetadata->setSession(0);
-    request->setMetadata(requestMetadata.release());
+    request->setShardVersion(targetedBatch.getEndpoint().shardVersion);
 }
 
 //

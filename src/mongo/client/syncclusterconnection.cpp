@@ -41,8 +41,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
-// error codes 8000-8009
-
 namespace mongo {
 
 using std::unique_ptr;
@@ -52,6 +50,10 @@ using std::map;
 using std::string;
 using std::stringstream;
 using std::vector;
+
+namespace {
+SyncClusterConnection::ConnectionValidationHook connectionHook;
+}  // namespace
 
 SyncClusterConnection::SyncClusterConnection(const list<HostAndPort>& L, double socketTimeout)
     : _socketTimeout(socketTimeout) {
@@ -105,6 +107,10 @@ SyncClusterConnection::~SyncClusterConnection() {
     _conns.clear();
 }
 
+void SyncClusterConnection::setConnectionValidationHook(ConnectionValidationHook hook) {
+    connectionHook = std::move(hook);
+}
+
 bool SyncClusterConnection::prepare(string& errmsg) {
     _lastErrors.clear();
 
@@ -120,7 +126,10 @@ bool SyncClusterConnection::prepare(string& errmsg) {
             if (singleErr.size() == 0)
                 continue;
 
-        } catch (DBException& e) {
+        } catch (const DBException& e) {
+            if (e.getCode() == ErrorCodes::IncompatibleCatalogManager) {
+                throw;
+            }
             singleErr = e.toString();
         }
         ok = false;
@@ -180,22 +189,35 @@ BSONObj SyncClusterConnection::getLastErrorDetailed(
     return DBClientBase::getLastErrorDetailed(db, fsync, j, w, wtimeout);
 }
 
-void SyncClusterConnection::_connect(const std::string& host) {
-    log() << "SyncClusterConnection connecting to [" << host << "]" << endl;
-    DBClientConnection* c = new DBClientConnection(true);
+void SyncClusterConnection::_connect(const std::string& hostStr) {
+    log() << "SyncClusterConnection connecting to [" << hostStr << "]" << endl;
+    const HostAndPort host(hostStr);
+    DBClientConnection* c;
+    if (connectionHook) {
+        c = new DBClientConnection(
+            true,  // auto reconnect
+            0,     // socket timeout
+            [this, host](const executor::RemoteCommandResponse& isMasterReply) {
+                return connectionHook(host, isMasterReply);
+            });
+    } else {
+        c = new DBClientConnection(true);
+    }
+
     c->setRequestMetadataWriter(getRequestMetadataWriter());
     c->setReplyMetadataReader(getReplyMetadataReader());
     c->setSoTimeout(_socketTimeout);
-    string errmsg;
-    if (!c->connect(HostAndPort(host), errmsg))
-        log() << "SyncClusterConnection connect fail to: " << host << " errmsg: " << errmsg << endl;
-    _connAddresses.push_back(host);
+    Status status = c->connect(host);
+    if (!status.isOK()) {
+        log() << "SyncClusterConnection connect fail to: " << hostStr << causedBy(status);
+        if (status == ErrorCodes::IncompatibleCatalogManager) {
+            // Make sure to propagate IncompatibleCatalogManager errors to trigger catalog manager
+            // swapping.
+            uassertStatusOK(status);
+        }
+    }
+    _connAddresses.push_back(hostStr);
     _conns.push_back(c);
-}
-
-bool SyncClusterConnection::callRead(Message& toSend, Message& response) {
-    // TODO: need to save state of which one to go back to somehow...
-    return _conns[0]->callRead(toSend, response);
 }
 
 bool SyncClusterConnection::runCommand(const std::string& dbname,
@@ -219,7 +241,7 @@ bool SyncClusterConnection::runCommand(const std::string& dbname,
         BSONObjBuilder metadataBob;
         metadataBob.appendElements(upconvertedMetadata);
 
-        uassertStatusOK(getRequestMetadataWriter()(&metadataBob));
+        uassertStatusOK(getRequestMetadataWriter()(&metadataBob, getServerAddress()));
 
         std::tie(interposedCmd, options) = uassertStatusOK(
             rpc::downconvertRequestMetadata(std::move(upconvertedCommand), metadataBob.done()));
@@ -256,7 +278,7 @@ BSONObj SyncClusterConnection::findOne(const string& ns,
         if (lockType > 0) {  // write $cmd
             string errmsg;
             if (!prepare(errmsg))
-                throw UserException(PrepareConfigsFailedCode,
+                throw UserException(ErrorCodes::PrepareConfigsFailed,
                                     (string) "SyncClusterConnection::findOne prepare failed: " +
                                         errmsg);
 
@@ -409,8 +431,9 @@ unique_ptr<DBClientCursor> SyncClusterConnection::_queryOnActive(const string& n
                   << " failed to: " << _conns[i]->toString() << " exception" << endl;
         }
     }
-    throw UserException(
-        8002, str::stream() << "all servers down/unreachable when querying: " << _address);
+    throw UserException(ErrorCodes::HostUnreachable,
+                        str::stream()
+                            << "all servers down/unreachable when querying: " << _address);
 }
 
 unique_ptr<DBClientCursor> SyncClusterConnection::getMore(const string& ns,
@@ -552,7 +575,7 @@ bool SyncClusterConnection::call(Message& toSend,
 
     for (size_t i = 0; i < _conns.size(); i++) {
         try {
-            bool ok = _conns[i]->call(toSend, response, assertOk);
+            bool ok = _conns[i]->call(toSend, response, assertOk, nullptr);
             if (ok) {
                 if (actualServer)
                     *actualServer = _connAddresses[i];
@@ -578,10 +601,6 @@ void SyncClusterConnection::say(Message& toSend, bool isRetry, string* actualSer
     // TODO: should we set actualServer??
 
     _checkLast();
-}
-
-void SyncClusterConnection::sayPiggyBack(Message& toSend) {
-    verify(0);
 }
 
 int SyncClusterConnection::_lockType(const string& name) {
@@ -622,6 +641,22 @@ bool SyncClusterConnection::isStillConnected() {
             return false;
     }
     return true;
+}
+
+int SyncClusterConnection::getMinWireVersion() {
+    int minVersion = 0;
+    for (const auto& host : _conns) {
+        minVersion = std::max(minVersion, host->getMinWireVersion());
+    }
+    return minVersion;
+}
+
+int SyncClusterConnection::getMaxWireVersion() {
+    int maxVersion = std::numeric_limits<int>::max();
+    for (const auto& host : _conns) {
+        maxVersion = std::min(maxVersion, host->getMaxWireVersion());
+    }
+    return maxVersion;
 }
 
 void SyncClusterConnection::setAllSoTimeouts(double socketTimeout) {

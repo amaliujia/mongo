@@ -1,5 +1,5 @@
 // Test for SERVER-8786 - if the first operation on an authenticated shard is moveChunk, it breaks the cluster.
-var st = new ShardingTest({ keyFile : 'jstests/libs/key1', shards : 2, chunksize : 1, verbose : 2,
+var st = new ShardingTest({ keyFile : 'jstests/libs/key1', shards : 2, chunkSize: 1, verbose : 2,
                             other : { nopreallocj : 1, verbose : 2, useHostname : true,
                                       configOptions : { verbose : 2 }}});
 
@@ -14,7 +14,6 @@ adminDB.auth('admin', 'password');
 adminDB.runCommand({enableSharding : "test"});
 st.ensurePrimaryShard('test', 'shard0001');
 adminDB.runCommand({shardCollection : "test.foo", key : {x : 1}});
-st.stopBalancer();
 
 for (var i = 0; i < 100; i++) {
     db.foo.insert({x:i});

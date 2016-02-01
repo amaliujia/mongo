@@ -6,16 +6,32 @@ var dir = 'jstests/concurrency/fsm_workloads';
 
 var blacklist = [
     // Disabled due to known bugs
-    'agg_match.js', // SERVER-3645 .count() can be wrong on sharded collections
-    'count.js', // SERVER-3645 .count() can be wrong on sharded collections
-    'count_limit_skip.js', // SERVER-3645 .count() can be wrong on sharded collections
-    'count_noindex.js', // SERVER-3645 .count() can be wrong on sharded collections
     'distinct.js', // SERVER-13116 distinct isn't sharding aware
     'distinct_noindex.js', // SERVER-13116 distinct isn't sharding aware
     'distinct_projection.js', // SERVER-13116 distinct isn't sharding aware
-    'yield_sort.js', // SERVER-17011 Cursor can return objects out of order if updated during query
-    'yield_sort_merge.js', // SERVER-17011 also applies, since this query uses SORT stage,
-                           // not SORT_MERGE stage in sharded environment
+    'drop_database.js', // SERVER-17397 Drops of sharded namespaces may not fully succeed
+
+    // Disabled due to SERVER-3645, '.count() can be wrong on sharded collections'.
+    // This bug is problematic for these workloads because they assert on count() values:
+    'agg_match.js',
+    'count.js',
+    'count_limit_skip.js',
+    'count_noindex.js',
+
+    // Disabled due to SERVER-20057, 'Concurrent, sharded mapReduces can fail when temporary
+    // namespaces collide across mongos processes'
+    'map_reduce_drop.js',
+    'map_reduce_inline.js',
+    'map_reduce_merge.js',
+    'map_reduce_merge_nonatomic.js',
+    'map_reduce_reduce.js',
+    'map_reduce_reduce_nonatomic.js',
+    'map_reduce_replace.js',
+    'map_reduce_replace_nonexistent.js',
+
+    // Disabled because the TTL monitor can delete documents in the background while we're comparing
+    // dbhashes between the primaries and secondaries of the replica-set shards (SERVER-21881).
+    'indexed_insert_ttl.js',
 
     // Disabled due to MongoDB restrictions and/or workload restrictions
 
@@ -25,10 +41,10 @@ var blacklist = [
     'auth_create_role.js',
     'auth_create_user.js',
     'auth_drop_role.js',
-    'auth_drop_user.js', // SERVER-16739 OpenSSL libcrypto crash
+    'auth_drop_user.js',
 
-    'agg_group_external.js', // uses >100MB of data, and is flaky
-    'agg_sort_external.js', // uses >100MB of data, and is flaky
+    'agg_group_external.js', // uses >100MB of data, which can overwhelm test hosts
+    'agg_sort_external.js', // uses >100MB of data, which can overwhelm test hosts
     'compact.js', // compact can only be run against a standalone mongod
     'compact_simultaneous_padding_bytes.js', // compact can only be run against a mongod
     'convert_to_capped_collection.js', // convertToCapped can't be run on mongos processes

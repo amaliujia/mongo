@@ -3,6 +3,7 @@ selector:
     roots:
     - jstests/sharding/*.js
     - jstests/sharding/sync_cluster_config/*.js
+    exclude_files:
 
 executor:
   js_test:
@@ -12,3 +13,4 @@ executor:
           TestData:
             useLegacyConfigServers: true
         nodb: ''
+        readMode: commands

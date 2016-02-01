@@ -40,6 +40,7 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/storage/record_store.h"
@@ -88,7 +89,8 @@ public:
         params.tailable = false;
 
         // Make the filter.
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(filterObj);
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, ExtensionsCallbackDisallowExtensions());
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
@@ -299,9 +301,13 @@ public:
 
         // Remove locs[count].
         scan->saveState();
-        scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+        {
+            WriteUnitOfWork wunit(&_txn);
+            scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+            wunit.commit();  // to avoid rollback of the invalidate
+        }
         remove(coll->docFor(&_txn, locs[count]).value());
-        scan->restoreState(&_txn);
+        scan->restoreState();
 
         // Skip over locs[count].
         ++count;
@@ -360,9 +366,13 @@ public:
 
         // Remove locs[count].
         scan->saveState();
-        scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+        {
+            WriteUnitOfWork wunit(&_txn);
+            scan->invalidate(&_txn, locs[count], INVALIDATION_DELETION);
+            wunit.commit();  // to avoid rollback of the invalidate
+        }
         remove(coll->docFor(&_txn, locs[count]).value());
-        scan->restoreState(&_txn);
+        scan->restoreState();
 
         // Skip over locs[count].
         ++count;

@@ -87,6 +87,9 @@ void Scope::append(BSONObjBuilder& builder, const char* fieldName, const char* s
         case NumberLong:
             builder.append(fieldName, getNumberLongLong(scopeName));
             break;
+        case NumberDecimal:
+            builder.append(fieldName, getNumberDecimal(scopeName));
+            break;
         case String:
             builder.append(fieldName, getString(scopeName));
             break;
@@ -174,7 +177,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
     }
 
     StringData code(data.get() + offset, len - offset);
-    return exec(code, filename, printResult, reportError, timeoutMs);
+    return exec(code, filename, printResult, reportError, false, timeoutMs);
 }
 
 class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
@@ -216,7 +219,7 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
 
     set<string> thisTime;
     while (c->more()) {
-        BSONObj o = c->nextSafe();
+        BSONObj o = c->nextSafe().getOwned();
         BSONElement n = o["_id"];
         BSONElement v = o["value"];
 
@@ -224,7 +227,7 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
         uassert(10210, "value has to be set", v.type() != EOO);
 
         try {
-            setElement(n.valuestr(), v);
+            setElement(n.valuestr(), v, o);
             thisTime.insert(n.valuestr());
             _storedNames.insert(n.valuestr());
         } catch (const DBException& setElemEx) {
@@ -264,13 +267,14 @@ ScriptingFunction Scope::createFunction(const char* code) {
     //     lookup the source on an exception, but SpiderMonkey uses the value
     //     returned by JS_CompileFunction.
     ScriptingFunction defaultFunctionNumber = getFunctionCache().size() + 1;
-    ScriptingFunction& actualFunctionNumber = _cachedFunctions[code];
-    actualFunctionNumber = _createFunction(code, defaultFunctionNumber);
+    ScriptingFunction actualFunctionNumber = _createFunction(code, defaultFunctionNumber);
+    _cachedFunctions[code] = actualFunctionNumber;
     return actualFunctionNumber;
 }
 
 namespace JSFiles {
 extern const JSFile collection;
+extern const JSFile crud_api;
 extern const JSFile db;
 extern const JSFile explain_query;
 extern const JSFile explainable;
@@ -282,6 +286,7 @@ extern const JSFile utils;
 extern const JSFile utils_sh;
 extern const JSFile utils_auth;
 extern const JSFile bulk_api;
+extern const JSFile error_codes;
 }
 
 void Scope::execCoreFiles() {
@@ -293,7 +298,9 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::mr);
     execSetup(JSFiles::query);
     execSetup(JSFiles::bulk_api);
+    execSetup(JSFiles::error_codes);
     execSetup(JSFiles::collection);
+    execSetup(JSFiles::crud_api);
     execSetup(JSFiles::explain_query);
     execSetup(JSFiles::explainable);
     execSetup(JSFiles::upgrade_check);
@@ -345,6 +352,12 @@ public:
         return std::shared_ptr<Scope>();
     }
 
+    void clear() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        _pools.clear();
+    }
+
 private:
     struct ScopeAndPool {
         std::shared_ptr<Scope> scope;
@@ -362,6 +375,10 @@ private:
 
 ScopeCache scopeCache;
 }  // anonymous namespace
+
+void ScriptEngine::dropScopeCache() {
+    scopeCache.clear();
+}
 
 class PooledScope : public Scope {
 public:
@@ -400,6 +417,9 @@ public:
     void gc() {
         _real->gc();
     }
+    void advanceGeneration() {
+        _real->advanceGeneration();
+    }
     bool isKillPending() const {
         return _real->isKillPending();
     }
@@ -418,6 +438,9 @@ public:
     double getNumber(const char* field) {
         return _real->getNumber(field);
     }
+    Decimal128 getNumberDecimal(const char* field) {
+        return _real->getNumberDecimal(field);
+    }
     string getString(const char* field) {
         return _real->getString(field);
     }
@@ -433,8 +456,8 @@ public:
     void setString(const char* field, StringData val) {
         _real->setString(field, val);
     }
-    void setElement(const char* field, const BSONElement& val) {
-        _real->setElement(field, val);
+    void setElement(const char* field, const BSONElement& val, const BSONObj& parent) {
+        _real->setElement(field, val, parent);
     }
     void setObject(const char* field, const BSONObj& obj, bool readOnly = true) {
         _real->setObject(field, obj, readOnly);

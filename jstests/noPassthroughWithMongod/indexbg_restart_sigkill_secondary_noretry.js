@@ -33,7 +33,7 @@
 
     // Set up replica set
     var replTest = new ReplSetTest({ name: 'bgIndexNoRetry', nodes: 3, 
-                                     nodeOptions : {noIndexBuildRetry:""} });
+                                     nodeOptions : {noIndexBuildRetry:"", syncdelay:1} });
     var nodenames = replTest.nodeList();
 
     // We can't use an arbiter as the third node because the -auth test tries to log on there
@@ -53,7 +53,7 @@
                            {"_id" : 1, "host" : nodenames[1]},
                            {"_id" : 2, "host" : nodenames[2], arbiterOnly: true}]});
 
-    var master = replTest.getMaster();
+    var master = replTest.getPrimary();
     var second = replTest.getSecondary();
 
     var secondId = replTest.getNodeId(second);

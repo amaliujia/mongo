@@ -227,6 +227,12 @@ TEST_F(QueryPlannerTest, NearNoIndex) {
     runInvalidQuery(fromjson("{x:1, a: {$nearSphere: [0,0], $maxDistance: 0.31 }}"));
 }
 
+TEST_F(QueryPlannerTest, NearEmptyPath) {
+    addIndex(BSON(""
+                  << "2dsphere"));
+    runInvalidQuery(fromjson("{'': {$near: {$geometry: {type: 'Point', coordinates: [0, 0]}}}}"));
+}
+
 TEST_F(QueryPlannerTest, TwoDSphereNoGeoPred) {
     addIndex(BSON("x" << 1 << "a"
                       << "2dsphere"));
@@ -387,11 +393,9 @@ TEST_F(QueryPlannerTest, And2DSphereSameFieldNonNearMultikey) {
         "  {a: {$geoIntersects: {$geometry: "
         "{type: 'Point', coordinates: [4.0, 1.0]}}}}]}"));
 
-    assertNumSolutions(2U);
+    assertNumSolutions(3U);
     assertSolutionExists("{cscan: {dir: 1}}");
-    // Bounds of the two 2dsphere geo predicates are combined into
-    // a single index scan.
-    assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2dsphere'}}}}}");
+    assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: '2dsphere'}}}}}", 2U);
 }
 
 TEST_F(QueryPlannerTest, And2DSphereWithNearSameField) {
@@ -572,8 +576,8 @@ TEST_F(QueryPlannerTest, CompoundGeoNoGeoPredicate) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {creationDate: 1}, limit: 0, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {creationDate: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {ixscan: {pattern: {creationDate: 1, 'foo.bar': '2dsphere'}}}}}");
 }
@@ -589,8 +593,8 @@ TEST_F(QueryPlannerTest, CompoundGeoNoGeoPredicateMultikey) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {creationDate: 1}, limit: 0, "
-        "node: {cscan: {dir: 1}}}}");
+        "{sort: {pattern: {creationDate: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1}}}}}}");
     assertSolutionExists(
         "{fetch: {node: {ixscan: {pattern: {creationDate: 1, 'foo.bar': '2dsphere'}}}}}");
 }
@@ -640,8 +644,8 @@ TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSort) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSortWithIndexablePred) {
@@ -655,12 +659,11 @@ TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSortWithIndexablePre
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: "
-        "{fetch: {node: "
-        "{ixscan: {pattern: {x: '2dsphere'}}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{fetch: {node: {ixscan: {pattern: {x: '2dsphere'}}}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: "
-        "{cscan: {dir: 1}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSortIfNoGeoPred) {
@@ -670,8 +673,8 @@ TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSortIfNoGeoPred) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, "
-        "node: {cscan: {dir: 1, filter: {}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
+        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanUseCompoundGeoIndexToProvideSortWithGeoPred) {
@@ -688,8 +691,8 @@ TEST_F(QueryPlannerTest, CanUseCompoundGeoIndexToProvideSortWithGeoPred) {
         "{fetch: {node: "
         "{ixscan: {pattern: {x: 1, y: '2dsphere'}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: "
-        "{cscan: {dir: 1}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{cscan: {dir: 1}}}}}}");
 }
 
 //

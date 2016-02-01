@@ -69,40 +69,31 @@ class CollectionMetadata;
  * Preconditions: Child must be fetched.  TODO: when covering analysis is in just build doc
  * and check that against shard key.  See SERVER-5022.
  */
-class ShardFilterStage : public PlanStage {
+class ShardFilterStage final : public PlanStage {
 public:
-    ShardFilterStage(const std::shared_ptr<CollectionMetadata>& metadata,
+    ShardFilterStage(OperationContext* opCtx,
+                     const std::shared_ptr<CollectionMetadata>& metadata,
                      WorkingSet* ws,
                      PlanStage* child);
-    virtual ~ShardFilterStage();
+    ~ShardFilterStage();
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
-
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_SHARDING_FILTER;
     }
 
-    virtual std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    virtual const CommonStats* getCommonStats() const;
-
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
 private:
     WorkingSet* _ws;
-    std::unique_ptr<PlanStage> _child;
 
     // Stats
-    CommonStats _commonStats;
     ShardingFilterStats _specificStats;
 
     // Note: it is important that this is the metadata from the time this stage is constructed.

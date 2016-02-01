@@ -44,10 +44,10 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/set_shard_version_request.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -114,7 +114,7 @@ public:
         // Flush all cached information. This can't be perfect, but it's better than nothing.
         grid.catalogCache()->invalidate(dbname);
 
-        auto status = grid.catalogCache()->getDatabase(dbname);
+        auto status = grid.catalogCache()->getDatabase(txn, dbname);
         if (!status.isOK()) {
             return appendCommandStatus(result, status.getStatus());
         }
@@ -127,7 +127,7 @@ public:
             return false;
         }
 
-        shared_ptr<Shard> toShard = grid.shardRegistry()->getShard(to);
+        shared_ptr<Shard> toShard = grid.shardRegistry()->getShard(txn, to);
         if (!toShard) {
             string msg(str::stream() << "Could not move database '" << dbname << "' to shard '"
                                      << to << "' because the shard does not exist");
@@ -135,16 +135,11 @@ public:
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
 
-        shared_ptr<Shard> fromShard = grid.shardRegistry()->getShard(config->getPrimaryId());
+        shared_ptr<Shard> fromShard = grid.shardRegistry()->getShard(txn, config->getPrimaryId());
         invariant(fromShard);
 
         if (fromShard->getConnString().sameLogicalEndpoint(toShard->getConnString())) {
             errmsg = "it is already the primary";
-            return false;
-        }
-
-        if (!grid.catalogManager()->isShardHost(toShard->getConnString())) {
-            errmsg = "that server isn't known to me";
             return false;
         }
 
@@ -153,7 +148,7 @@ public:
 
         string whyMessage(str::stream() << "Moving primary shard of " << dbname);
         auto scopedDistLock =
-            grid.catalogManager()->getDistLockManager()->lock(dbname + "-movePrimary", whyMessage);
+            grid.forwardingCatalogManager()->distLock(txn, dbname + "-movePrimary", whyMessage);
 
         if (!scopedDistLock.isOK()) {
             return appendCommandStatus(result, scopedDistLock.getStatus());
@@ -166,22 +161,39 @@ public:
         BSONObj moveStartDetails =
             _buildMoveEntry(dbname, fromShard->toString(), toShard->toString(), shardedColls);
 
-        grid.catalogManager()->logChange(
-            txn->getClient()->clientAddress(true), "movePrimary.start", dbname, moveStartDetails);
+        uassertStatusOK(scopedDistLock.getValue().checkForPendingCatalogChange());
+
+        auto catalogManager = grid.catalogManager(txn);
+        catalogManager->logChange(txn, "movePrimary.start", dbname, moveStartDetails);
 
         BSONArrayBuilder barr;
         barr.append(shardedColls);
 
         ScopedDbConnection toconn(toShard->getConnString());
 
+        {
+            // Make sure the target node is sharding aware so that it can detect catalog manager
+            // swaps.
+            auto ssvRequest = SetShardVersionRequest::makeForInitNoPersist(
+                grid.shardRegistry()->getConfigServerConnectionString(),
+                toShard->getId(),
+                toShard->getConnString());
+            BSONObj res;
+            bool ok = toconn->runCommand("admin", ssvRequest.toBSON(), res);
+            if (!ok) {
+                return appendCommandStatus(result, getStatusFromCommandResult(res));
+            }
+        }
+
         // TODO ERH - we need a clone command which replays operations from clone start to now
         //            can just use local.oplog.$main
         BSONObj cloneRes;
-        bool worked = toconn->runCommand(
-            dbname.c_str(),
-            BSON("clone" << fromShard->getConnString().toString() << "collsToIgnore" << barr.arr()
-                         << bypassDocumentValidationCommandOption() << true),
-            cloneRes);
+        bool worked = toconn->runCommand(dbname.c_str(),
+                                         BSON("clone" << fromShard->getConnString().toString()
+                                                      << "collsToIgnore" << barr.arr()
+                                                      << bypassDocumentValidationCommandOption()
+                                                      << true << "_checkForCatalogChange" << true),
+                                         cloneRes);
         toconn.done();
 
         if (!worked) {
@@ -190,11 +202,14 @@ public:
             return false;
         }
 
+        uassertStatusOK(scopedDistLock.getValue().checkForPendingCatalogChange());
+
         const string oldPrimary = fromShard->getConnString().toString();
 
         ScopedDbConnection fromconn(fromShard->getConnString());
 
-        config->setPrimary(toShard->getConnString().toString());
+        config->setPrimary(txn, toShard->getId());
+        config->reload(txn);
 
         if (shardedColls.empty()) {
             // TODO: Collections can be created in the meantime, and we should handle in the future.
@@ -226,6 +241,7 @@ public:
                     try {
                         log() << "movePrimary dropping cloned collection " << el.String() << " on "
                               << oldPrimary;
+                        uassertStatusOK(scopedDistLock.getValue().checkForPendingCatalogChange());
                         fromconn->dropCollection(el.String());
                     } catch (DBException& e) {
                         e.addContext(str::stream()
@@ -245,8 +261,7 @@ public:
         BSONObj moveFinishDetails =
             _buildMoveEntry(dbname, oldPrimary, toShard->toString(), shardedColls);
 
-        grid.catalogManager()->logChange(
-            txn->getClient()->clientAddress(true), "movePrimary", dbname, moveFinishDetails);
+        catalogManager->logChange(txn, "movePrimary", dbname, moveFinishDetails);
         return true;
     }
 

@@ -35,10 +35,12 @@
 #include <list>
 
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
 #include "mongo/s/catalog/type_config_version.h"
+#include "mongo/s/client/shard_connection.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
@@ -55,6 +57,7 @@ string ConfigServerFixture::shardName() {
 }
 
 void ConfigServerFixture::setUp() {
+    shardConnectionPool.clear();
     DBException::traceExceptions = true;
 
     // Make all connections redirect to the direct client
@@ -74,9 +77,10 @@ void ConfigServerFixture::setUp() {
                              ChunkType::ConfigNS,
                              BSON(ChunkType::ns() << 1 << ChunkType::DEPRECATED_lastmod() << 1)));
 
-    ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
-    shardingState.initialize(connStr.toString());
-    shardingState.gotShardName(shardName());
+    const ConnectionString connStr(uassertStatusOK(ConnectionString::parse("$dummy:10000")));
+
+    ShardingState::get(&_txn)->initialize(&_txn, connStr.toString());
+    ShardingState::get(&_txn)->setShardName(shardName());
 }
 
 void ConfigServerFixture::clearServer() {
@@ -108,7 +112,7 @@ void ConfigServerFixture::dumpServer() {
 }
 
 void ConfigServerFixture::tearDown() {
-    shardingState.clearCollectionMetadata();
+    ShardingState::get(&_txn)->clearCollectionMetadata();
     clearServer();
 
     // Make all connections redirect to the direct client

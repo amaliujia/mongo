@@ -43,9 +43,9 @@
 #include "mongo/db/repl/replica_set_config_checks.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_executor.h"
-#include "mongo/db/repl/replication_metadata.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
@@ -61,6 +61,8 @@ namespace {
 typedef ReplicationExecutor::CallbackHandle CBHandle;
 
 }  // namespace
+
+using executor::RemoteCommandRequest;
 
 void ReplicationCoordinatorImpl::_doMemberHeartbeat(ReplicationExecutor::CallbackArgs cbData,
                                                     const HostAndPort& target,
@@ -86,7 +88,7 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(ReplicationExecutor::Callbac
     }
 
     const RemoteCommandRequest request(
-        target, "admin", heartbeatObj, BSON(rpc::kReplicationMetadataFieldName << 1), timeout);
+        target, "admin", heartbeatObj, BSON(rpc::kReplSetMetadataFieldName << 1), timeout);
     const ReplicationExecutor::RemoteCommandCallbackFn callback =
         stdx::bind(&ReplicationCoordinatorImpl::_handleHeartbeatResponse,
                    this,
@@ -127,9 +129,13 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     if (responseStatus.isOK()) {
         resp = cbData.response.getValue().data;
         responseStatus = hbResponse.initialize(resp, _topCoord->getTerm());
-        ReplicationMetadata replMetadata;
-        replMetadata.initialize(cbData.response.getValue().metadata);
-        _processReplicationMetadata_incallback(replMetadata);
+        StatusWith<rpc::ReplSetMetadata> replMetadata =
+            rpc::ReplSetMetadata::readFromMetadata(cbData.response.getValue().metadata);
+        if (replMetadata.isOK()) {
+            // Asynchronous stepdown could happen, but it will be queued in executor after
+            // this function, so we cannot and don't need to wait for it to finish.
+            _processReplSetMetadata_incallback(replMetadata.getValue());
+        }
     }
     const Date_t now = _replExecutor.now();
     const OpTime lastApplied = getMyLastOptime();  // Locks and unlocks _mutex.
@@ -138,7 +144,14 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
 
     if (responseStatus.isOK()) {
         networkTime = cbData.response.getValue().elapsedMillis;
-        _updateTerm_incallback(hbStatusResponse.getValue().getTerm(), nullptr);
+        // TODO(sz) Because the term is duplicated in ReplSetMetaData, we can get rid of this
+        // and update tests.
+        _updateTerm_incallback(hbStatusResponse.getValue().getTerm());
+        // Postpone election timeout if we have a successful heartbeat response from the primary.
+        const auto& hbResponse = hbStatusResponse.getValue();
+        if (hbResponse.hasState() && hbResponse.getState().primary()) {
+            cancelAndRescheduleElectionTimeout();
+        }
     } else {
         log() << "Error in heartbeat request to " << target << "; " << responseStatus;
         if (!resp.isEmpty()) {
@@ -164,6 +177,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         }
     }
 
+    // In case our updated OpTime allows a waiter to finish stepping down, we wake all the waiters.
     _signalStepDownWaiters();
 
     _scheduleHeartbeatToTarget(
@@ -202,15 +216,14 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
             _scheduleHeartbeatReconfig(responseStatus.getValue().getConfig());
             break;
         case HeartbeatResponseAction::StartElection:
-            if (isV1ElectionProtocol()) {
-                _startElectSelfV1();
-            } else {
-                _startElectSelf();
-            }
+            _startElectSelf();
             break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
-            _heartbeatStepDownStart();
+            log() << "Stepping down from primary in response to heartbeat";
+            _topCoord->prepareForStepDown();
+            // Don't need to wait for stepdown to finish.
+            _stepDownStart();
             break;
         case HeartbeatResponseAction::StepDownRemotePrimary: {
             invariant(action.getPrimaryConfigIndex() != _selfIndex);
@@ -218,9 +231,19 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
                 _rsConfig.getMemberAt(action.getPrimaryConfigIndex()).getHostAndPort());
             break;
         }
-        default:
-            severe() << "Illegal heartbeat response action code " << int(action.getAction());
-            invariant(false);
+        case HeartbeatResponseAction::PriorityTakeover: {
+            stdx::unique_lock<stdx::mutex> lk(_mutex);
+            if (!_priorityTakeoverCbh.isValid()) {
+                _priorityTakeoverWhen =
+                    _replExecutor.now() + _rsConfig.getPriorityTakeoverDelay(_selfIndex);
+                log() << "Scheduling priority takeover at " << _priorityTakeoverWhen;
+                _priorityTakeoverCbh = _scheduleWorkAt(
+                    _priorityTakeoverWhen,
+                    stdx::bind(
+                        &ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1, this, true));
+            }
+            break;
+        }
     }
 }
 
@@ -254,13 +277,19 @@ void ReplicationCoordinatorImpl::_requestRemotePrimaryStepdown(const HostAndPort
     }
 }
 
-void ReplicationCoordinatorImpl::_heartbeatStepDownStart() {
-    log() << "Stepping down from primary in response to heartbeat";
-    _replExecutor.scheduleWorkWithGlobalExclusiveLock(
-        stdx::bind(&ReplicationCoordinatorImpl::_stepDownFinish, this, stdx::placeholders::_1));
+ReplicationExecutor::EventHandle ReplicationCoordinatorImpl::_stepDownStart() {
+    auto finishEvent = _makeEvent();
+    if (!finishEvent) {
+        return finishEvent;
+    }
+    _replExecutor.scheduleWorkWithGlobalExclusiveLock(stdx::bind(
+        &ReplicationCoordinatorImpl::_stepDownFinish, this, stdx::placeholders::_1, finishEvent));
+    return finishEvent;
 }
 
-void ReplicationCoordinatorImpl::_stepDownFinish(const ReplicationExecutor::CallbackArgs& cbData) {
+void ReplicationCoordinatorImpl::_stepDownFinish(
+    const ReplicationExecutor::CallbackArgs& cbData,
+    const ReplicationExecutor::EventHandle& finishedEvent) {
     if (cbData.status == ErrorCodes::CallbackCanceled) {
         return;
     }
@@ -272,6 +301,7 @@ void ReplicationCoordinatorImpl::_stepDownFinish(const ReplicationExecutor::Call
     const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator_inlock();
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
+    _replExecutor.signalEvent(finishedEvent);
 }
 
 void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(const ReplicaSetConfig& newConfig) {
@@ -281,10 +311,6 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(const ReplicaSetConf
     }
 
     switch (_rsConfigState) {
-        case kConfigStartingUp:
-            LOG(1) << "Ignoring new configuration with version " << newConfig.getConfigVersion()
-                   << " because still attempting to load local configuration information";
-            return;
         case kConfigUninitialized:
         case kConfigSteady:
             LOG(1) << "Received new config via heartbeat with version "
@@ -296,7 +322,9 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(const ReplicaSetConf
             LOG(1) << "Ignoring new configuration with version " << newConfig.getConfigVersion()
                    << " because already in the midst of a configuration process";
             return;
-        default:
+        case kConfigPreStart:
+        case kConfigStartingUp:
+        case kConfigReplicationDisabled:
             severe() << "Reconfiguration request occurred while _rsConfigState == "
                      << int(_rsConfigState) << "; aborting.";
             fassertFailed(18807);
@@ -389,7 +417,11 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
 
         lk.unlock();
 
-        _externalState->startThreads(&_replExecutor);
+        bool isArbiter = myIndex.isOK() && myIndex.getValue() != -1 &&
+            newConfig.getMemberAt(myIndex.getValue()).isArbiter();
+        if (!isArbiter) {
+            _externalState->startThreads(_settings);
+        }
     }
 
     const stdx::function<void(const ReplicationExecutor::CallbackArgs&)> reconfigFinishFn(
@@ -460,9 +492,11 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
         }
         myIndex = StatusWith<int>(-1);
     }
+    const ReplicaSetConfig oldConfig = _rsConfig;
     const PostMemberStateUpdateAction action =
-        _setCurrentRSConfig_inlock(newConfig, myIndex.getValue());
+        _setCurrentRSConfig_inlock(cbData, newConfig, myIndex.getValue());
     lk.unlock();
+    _resetElectionInfoOnProtocolVersionUpgrade(oldConfig, newConfig);
     _performPostMemberStateUpdateAction(action);
 }
 
@@ -481,15 +515,26 @@ void ReplicationCoordinatorImpl::_untrackHeartbeatHandle(const CBHandle& handle)
     _heartbeatHandles.erase(newEnd, _heartbeatHandles.end());
 }
 
-void ReplicationCoordinatorImpl::_cancelHeartbeats() {
+void ReplicationCoordinatorImpl::_cancelHeartbeats_inlock() {
     std::for_each(_heartbeatHandles.begin(),
                   _heartbeatHandles.end(),
                   stdx::bind(&ReplicationExecutor::cancel, &_replExecutor, stdx::placeholders::_1));
     // Heartbeat callbacks will remove themselves from _heartbeatHandles when they execute with
     // CallbackCanceled status, so it's better to leave the handles in the list, for now.
+
+    if (_handleLivenessTimeoutCbh.isValid()) {
+        _replExecutor.cancel(_handleLivenessTimeoutCbh);
+    }
 }
 
-void ReplicationCoordinatorImpl::_startHeartbeats() {
+void ReplicationCoordinatorImpl::_restartHeartbeats_inlock(
+    const ReplicationExecutor::CallbackArgs& cbData) {
+    _cancelHeartbeats_inlock();
+    _startHeartbeats_inlock(cbData);
+}
+
+void ReplicationCoordinatorImpl::_startHeartbeats_inlock(
+    const ReplicationExecutor::CallbackArgs& cbData) {
     const Date_t now = _replExecutor.now();
     _seedList.clear();
     for (int i = 0; i < _rsConfig.getNumMembers(); ++i) {
@@ -498,6 +543,211 @@ void ReplicationCoordinatorImpl::_startHeartbeats() {
         }
         _scheduleHeartbeatToTarget(_rsConfig.getMemberAt(i).getHostAndPort(), i, now);
     }
+    if (isV1ElectionProtocol()) {
+        for (auto&& slaveInfo : _slaveInfo) {
+            slaveInfo.lastUpdate = _replExecutor.now();
+            slaveInfo.down = false;
+        }
+        _scheduleNextLivenessUpdate_inlock(cbData);
+    }
+}
+
+void ReplicationCoordinatorImpl::_handleLivenessTimeout(
+    const ReplicationExecutor::CallbackArgs& cbData) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    // Only reset the callback handle if it matches, otherwise more will be coming through
+    if (cbData.myHandle == _handleLivenessTimeoutCbh) {
+        _handleLivenessTimeoutCbh = CallbackHandle();
+    } else {
+        warning() << "The liveness timeout does not match callback handle, so not resetting it.";
+    }
+    if (!cbData.status.isOK()) {
+        return;
+    }
+    if (!isV1ElectionProtocol()) {
+        return;
+    }
+
+    // Scan liveness table for problems and mark nodes as down by calling into topocoord.
+    auto now(_replExecutor.now());
+    for (auto&& slaveInfo : _slaveInfo) {
+        if (slaveInfo.self) {
+            continue;
+        }
+        if (slaveInfo.down) {
+            continue;
+        }
+
+        if (now - slaveInfo.lastUpdate >= _rsConfig.getElectionTimeoutPeriod()) {
+            int memberIndex = _rsConfig.findMemberIndexByConfigId(slaveInfo.memberId);
+            if (memberIndex == -1) {
+                continue;
+            }
+
+            slaveInfo.down = true;
+
+            if (_memberState.primary()) {
+                // Only adjust hbdata if we are primary, since only the primary has a full view
+                // of the entire cluster.
+                // Secondaries might not see other secondaries in the cluster if they are not
+                // downstream.
+                HeartbeatResponseAction action =
+                    _topCoord->setMemberAsDown(now, memberIndex, _getMyLastOptime_inlock());
+                // Don't mind potential asynchronous stepdown as this is the last step of
+                // liveness check.
+                _handleHeartbeatResponseAction(action, makeStatusWith<ReplSetHeartbeatResponse>());
+            }
+        }
+    }
+    _scheduleNextLivenessUpdate_inlock(cbData);
+}
+
+void ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate(
+    const ReplicationExecutor::CallbackArgs& cbData) {
+    if (cbData.status == ErrorCodes::CallbackCanceled)
+        return;
+
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _scheduleNextLivenessUpdate_inlock(cbData);
+}
+
+void ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate_inlock(
+    const ReplicationExecutor::CallbackArgs& cbData) {
+    if (!isV1ElectionProtocol()) {
+        return;
+    }
+    // Scan liveness table for earliest date; schedule a run at (that date plus election
+    // timeout).
+    Date_t earliestDate = Date_t::max();
+    int earliestMemberId = -1;
+    for (auto&& slaveInfo : _slaveInfo) {
+        if (slaveInfo.self) {
+            continue;
+        }
+        if (slaveInfo.down) {
+            // Already down.
+            continue;
+        }
+        LOG(3) << "slaveinfo lastupdate is: " << slaveInfo.lastUpdate;
+        if (earliestDate > slaveInfo.lastUpdate) {
+            earliestDate = slaveInfo.lastUpdate;
+            earliestMemberId = slaveInfo.memberId;
+        }
+    }
+    LOG(3) << "earliest member " << earliestMemberId << " date: " << earliestDate;
+    if (earliestMemberId == -1 || earliestDate == Date_t::max()) {
+        _earliestMemberId = -1;
+        // Nobody here but us.
+        return;
+    }
+
+    if (_handleLivenessTimeoutCbh.isValid() && !_handleLivenessTimeoutCbh.isCanceled()) {
+        // don't bother to schedule; one is already scheduled and pending.
+        return;
+    }
+
+    auto nextTimeout = earliestDate + _rsConfig.getElectionTimeoutPeriod();
+    if (nextTimeout > _replExecutor.now()) {
+        LOG(3) << "scheduling next check at " << nextTimeout;
+        auto cbh = _replExecutor.scheduleWorkAt(
+            nextTimeout,
+            stdx::bind(
+                &ReplicationCoordinatorImpl::_handleLivenessTimeout, this, stdx::placeholders::_1));
+        if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
+            return;
+        }
+        fassert(22002, cbh.getStatus());
+        _handleLivenessTimeoutCbh = cbh.getValue();
+        _earliestMemberId = earliestMemberId;
+    }
+}
+
+void ReplicationCoordinatorImpl::_cancelAndRescheduleLivenessUpdate_inlock(int updatedMemberId) {
+    if ((_earliestMemberId != -1) && (_earliestMemberId != updatedMemberId)) {
+        return;
+    }
+    if (_handleLivenessTimeoutCbh.isValid()) {
+        _replExecutor.cancel(_handleLivenessTimeoutCbh);
+    }
+    _replExecutor.scheduleWork(stdx::bind(
+        &ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate, this, stdx::placeholders::_1));
+}
+
+void ReplicationCoordinatorImpl::_cancelPriorityTakeover_inlock() {
+    if (_priorityTakeoverCbh.isValid()) {
+        log() << "Canceling priority takeover callback";
+        _replExecutor.cancel(_priorityTakeoverCbh);
+        _priorityTakeoverCbh = CallbackHandle();
+        _priorityTakeoverWhen = Date_t();
+    }
+}
+
+void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
+    if (_handleElectionTimeoutCbh.isValid()) {
+        LOG(4) << "Canceling election timeout callback at " << _handleElectionTimeoutWhen;
+        _replExecutor.cancel(_handleElectionTimeoutCbh);
+        _handleElectionTimeoutCbh = CallbackHandle();
+        _handleElectionTimeoutWhen = Date_t();
+    }
+
+    if (!isV1ElectionProtocol()) {
+        return;
+    }
+
+    if (!_memberState.secondary()) {
+        return;
+    }
+
+    if (_selfIndex < 0) {
+        return;
+    }
+
+    if (!_rsConfig.getMemberAt(_selfIndex).isElectable()) {
+        return;
+    }
+
+    Milliseconds randomOffset = Milliseconds(_replExecutor.nextRandomInt64(
+        durationCount<Milliseconds>(_rsConfig.getElectionTimeoutPeriod()) *
+        _externalState->getElectionTimeoutOffsetLimitFraction()));
+    auto now = _replExecutor.now();
+    auto when = now + _rsConfig.getElectionTimeoutPeriod() + randomOffset;
+    invariant(when > now);
+    LOG(4) << "Scheduling election timeout callback at " << when;
+    _handleElectionTimeoutWhen = when;
+    _handleElectionTimeoutCbh = _scheduleWorkAt(
+        when, stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1, this, false));
+}
+
+void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(bool isPriorityTakeOver) {
+    if (!isV1ElectionProtocol()) {
+        return;
+    }
+
+    // We should always reschedule this callback even if we do not make it to the election
+    // process.
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _cancelPriorityTakeover_inlock();
+        _cancelAndRescheduleElectionTimeout_inlock();
+    }
+
+    if (!_topCoord->becomeCandidateIfElectable(_replExecutor.now(), getMyLastOptime())) {
+        if (isPriorityTakeOver) {
+            log() << "Not starting an election for a priority takeover, since we are not "
+                     "electable";
+        } else {
+            log() << "Not starting an election, since we are not electable";
+        }
+        return;
+    }
+    if (isPriorityTakeOver) {
+        log() << "Starting an election for a priority takeover";
+    } else {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        log() << "Starting an election, since we've seen no PRIMARY in the past "
+              << _rsConfig.getElectionTimeoutPeriod();
+    }
+    _startElectSelfV1();
 }
 
 }  // namespace repl

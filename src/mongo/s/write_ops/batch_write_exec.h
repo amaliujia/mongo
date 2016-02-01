@@ -34,6 +34,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/shard_resolver.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -43,6 +44,7 @@ namespace mongo {
 
 class BatchWriteExecStats;
 class MultiCommandDispatch;
+class OperationContext;
 
 /**
  * The BatchWriteExec is able to execute client batch write requests, resulting in a batch
@@ -71,12 +73,10 @@ public:
      *
      * This function does not throw, any errors are reported via the clientResponse.
      */
-    void executeBatch(const BatchedCommandRequest& clientRequest,
-                      BatchedCommandResponse* clientResponse);
-
-    const BatchWriteExecStats& getStats();
-
-    BatchWriteExecStats* releaseStats();
+    void executeBatch(OperationContext* txn,
+                      const BatchedCommandRequest& clientRequest,
+                      BatchedCommandResponse* clientResponse,
+                      BatchWriteExecStats* stats);
 
 private:
     // Not owned here
@@ -87,15 +87,12 @@ private:
 
     // Not owned here
     MultiCommandDispatch* _dispatcher;
-
-    // Stats
-    std::unique_ptr<BatchWriteExecStats> _stats;
 };
 
 struct HostOpTime {
-    HostOpTime(Timestamp ot, OID e) : opTime(ot), electionId(e){};
+    HostOpTime(repl::OpTime ot, OID e) : opTime(ot), electionId(e){};
     HostOpTime(){};
-    Timestamp opTime;
+    repl::OpTime opTime;
     OID electionId;
 };
 
@@ -106,7 +103,7 @@ public:
     BatchWriteExecStats()
         : numRounds(0), numTargetErrors(0), numResolveErrors(0), numStaleBatches(0) {}
 
-    void noteWriteAt(const ConnectionString& host, Timestamp opTime, const OID& electionId);
+    void noteWriteAt(const ConnectionString& host, repl::OpTime opTime, const OID& electionId);
 
     const HostOpTimeMap& getWriteOpTimes() const;
 

@@ -38,6 +38,7 @@
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
+#include "mongo/db/exec/ensure_sorted.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/geo_near.h"
 #include "mongo/db/exec/index_scan.h"
@@ -48,17 +49,21 @@
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/sort.h"
+#include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/skip.h"
 #include "mongo/db/exec/text.h"
 #include "mongo/db/index/fts_access_method.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::unique_ptr;
+using stdx::make_unique;
 
 PlanStage* buildStages(OperationContext* txn,
                        Collection* collection,
@@ -113,9 +118,16 @@ PlanStage* buildStages(OperationContext* txn,
         SortStageParams params;
         params.collection = collection;
         params.pattern = sn->pattern;
-        params.query = sn->query;
         params.limit = sn->limit;
-        return new SortStage(params, ws, childStage);
+        return new SortStage(txn, params, ws, childStage);
+    } else if (STAGE_SORT_KEY_GENERATOR == root->getType()) {
+        const SortKeyGeneratorNode* keyGenNode = static_cast<const SortKeyGeneratorNode*>(root);
+        PlanStage* childStage = buildStages(txn, collection, qsol, keyGenNode->children[0], ws);
+        if (NULL == childStage) {
+            return NULL;
+        }
+        return new SortKeyGeneratorStage(
+            txn, childStage, ws, keyGenNode->sortSpec, keyGenNode->queryObj);
     } else if (STAGE_PROJECTION == root->getType()) {
         const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
         PlanStage* childStage = buildStages(txn, collection, qsol, pn->children[0], ws);
@@ -123,7 +135,7 @@ PlanStage* buildStages(OperationContext* txn,
             return NULL;
         }
 
-        ProjectionStageParams params(WhereCallbackReal(txn, collection->ns().db()));
+        ProjectionStageParams params(ExtensionsCallbackReal(txn, &collection->ns()));
         params.projObj = pn->projection;
 
         // Stuff the right data into the params depending on what proj impl we use.
@@ -139,24 +151,24 @@ PlanStage* buildStages(OperationContext* txn,
             params.projImpl = ProjectionStageParams::SIMPLE_DOC;
         }
 
-        return new ProjectionStage(params, ws, childStage);
+        return new ProjectionStage(txn, params, ws, childStage);
     } else if (STAGE_LIMIT == root->getType()) {
         const LimitNode* ln = static_cast<const LimitNode*>(root);
         PlanStage* childStage = buildStages(txn, collection, qsol, ln->children[0], ws);
         if (NULL == childStage) {
             return NULL;
         }
-        return new LimitStage(ln->limit, ws, childStage);
+        return new LimitStage(txn, ln->limit, ws, childStage);
     } else if (STAGE_SKIP == root->getType()) {
         const SkipNode* sn = static_cast<const SkipNode*>(root);
         PlanStage* childStage = buildStages(txn, collection, qsol, sn->children[0], ws);
         if (NULL == childStage) {
             return NULL;
         }
-        return new SkipStage(sn->skip, ws, childStage);
+        return new SkipStage(txn, sn->skip, ws, childStage);
     } else if (STAGE_AND_HASH == root->getType()) {
         const AndHashNode* ahn = static_cast<const AndHashNode*>(root);
-        unique_ptr<AndHashStage> ret(new AndHashStage(ws, collection));
+        auto ret = make_unique<AndHashStage>(txn, ws, collection);
         for (size_t i = 0; i < ahn->children.size(); ++i) {
             PlanStage* childStage = buildStages(txn, collection, qsol, ahn->children[i], ws);
             if (NULL == childStage) {
@@ -167,7 +179,7 @@ PlanStage* buildStages(OperationContext* txn,
         return ret.release();
     } else if (STAGE_OR == root->getType()) {
         const OrNode* orn = static_cast<const OrNode*>(root);
-        unique_ptr<OrStage> ret(new OrStage(ws, orn->dedup, orn->filter.get()));
+        auto ret = make_unique<OrStage>(txn, ws, orn->dedup, orn->filter.get());
         for (size_t i = 0; i < orn->children.size(); ++i) {
             PlanStage* childStage = buildStages(txn, collection, qsol, orn->children[i], ws);
             if (NULL == childStage) {
@@ -178,7 +190,7 @@ PlanStage* buildStages(OperationContext* txn,
         return ret.release();
     } else if (STAGE_AND_SORTED == root->getType()) {
         const AndSortedNode* asn = static_cast<const AndSortedNode*>(root);
-        unique_ptr<AndSortedStage> ret(new AndSortedStage(ws, collection));
+        auto ret = make_unique<AndSortedStage>(txn, ws, collection);
         for (size_t i = 0; i < asn->children.size(); ++i) {
             PlanStage* childStage = buildStages(txn, collection, qsol, asn->children[i], ws);
             if (NULL == childStage) {
@@ -192,7 +204,7 @@ PlanStage* buildStages(OperationContext* txn,
         MergeSortStageParams params;
         params.dedup = msn->dedup;
         params.pattern = msn->sort;
-        unique_ptr<MergeSortStage> ret(new MergeSortStage(params, ws, collection));
+        auto ret = make_unique<MergeSortStage>(txn, params, ws, collection);
         for (size_t i = 0; i < msn->children.size(); ++i) {
             PlanStage* childStage = buildStages(txn, collection, qsol, msn->children[i], ws);
             if (NULL == childStage) {
@@ -245,37 +257,22 @@ PlanStage* buildStages(OperationContext* txn,
         return new GeoNear2DSphereStage(params, txn, ws, collection, s2Index);
     } else if (STAGE_TEXT == root->getType()) {
         const TextNode* node = static_cast<const TextNode*>(root);
-
-        if (NULL == collection) {
-            warning() << "Null collection for text";
-            return NULL;
-        }
-        vector<IndexDescriptor*> idxMatches;
-        collection->getIndexCatalog()->findIndexByType(txn, "text", idxMatches);
-        if (1 != idxMatches.size()) {
-            warning() << "No text index, or more than one text index";
-            return NULL;
-        }
-        IndexDescriptor* index = idxMatches[0];
+        IndexDescriptor* desc =
+            collection->getIndexCatalog()->findIndexByKeyPattern(txn, node->indexKeyPattern);
+        invariant(desc);
         const FTSAccessMethod* fam =
-            static_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(index));
-        TextStageParams params(fam->getSpec());
+            static_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
+        invariant(fam);
 
-        // params.collection = collection;
-        params.index = index;
+        TextStageParams params(fam->getSpec());
+        params.index = desc;
         params.spec = fam->getSpec();
         params.indexPrefix = node->indexPrefix;
-
-        const std::string& language =
-            ("" == node->language ? fam->getSpec().defaultLanguage().str() : node->language);
-
-        Status parseStatus = params.query.parse(
-            node->query, language, node->caseSensitive, fam->getSpec().getTextIndexVersion());
-        if (!parseStatus.isOK()) {
-            warning() << "Can't parse text search query";
-            return NULL;
-        }
-
+        // We assume here that node->ftsQuery is an FTSQueryImpl, not an FTSQueryNoop. In practice,
+        // this means that it is illegal to use the StageBuilder on a QuerySolution created by
+        // planning a query that contains "no-op" expressions. TODO: make StageBuilder::build()
+        // fail in this case (this improvement is being tracked by SERVER-21510).
+        params.query = static_cast<FTSQueryImpl&>(*node->ftsQuery);
         return new TextStage(txn, params, ws, node->filter.get());
     } else if (STAGE_SHARDING_FILTER == root->getType()) {
         const ShardingFilterNode* fn = static_cast<const ShardingFilterNode*>(root);
@@ -284,14 +281,17 @@ PlanStage* buildStages(OperationContext* txn,
             return NULL;
         }
         return new ShardFilterStage(
-            shardingState.getCollectionMetadata(collection->ns().ns()), ws, childStage);
+            txn,
+            ShardingState::get(txn)->getCollectionMetadata(collection->ns().ns()),
+            ws,
+            childStage);
     } else if (STAGE_KEEP_MUTATIONS == root->getType()) {
         const KeepMutationsNode* km = static_cast<const KeepMutationsNode*>(root);
         PlanStage* childStage = buildStages(txn, collection, qsol, km->children[0], ws);
         if (NULL == childStage) {
             return NULL;
         }
-        return new KeepMutationsStage(km->filter.get(), ws, childStage);
+        return new KeepMutationsStage(txn, km->filter.get(), ws, childStage);
     } else if (STAGE_DISTINCT_SCAN == root->getType()) {
         const DistinctNode* dn = static_cast<const DistinctNode*>(root);
 
@@ -309,7 +309,7 @@ PlanStage* buildStages(OperationContext* txn,
         params.fieldNo = dn->fieldNo;
         return new DistinctScan(txn, params, ws);
     } else if (STAGE_COUNT_SCAN == root->getType()) {
-        const CountNode* cn = static_cast<const CountNode*>(root);
+        const CountScanNode* csn = static_cast<const CountScanNode*>(root);
 
         if (NULL == collection) {
             warning() << "Can't fast-count null namespace (collection null)";
@@ -319,13 +319,20 @@ PlanStage* buildStages(OperationContext* txn,
         CountScanParams params;
 
         params.descriptor =
-            collection->getIndexCatalog()->findIndexByKeyPattern(txn, cn->indexKeyPattern);
-        params.startKey = cn->startKey;
-        params.startKeyInclusive = cn->startKeyInclusive;
-        params.endKey = cn->endKey;
-        params.endKeyInclusive = cn->endKeyInclusive;
+            collection->getIndexCatalog()->findIndexByKeyPattern(txn, csn->indexKeyPattern);
+        params.startKey = csn->startKey;
+        params.startKeyInclusive = csn->startKeyInclusive;
+        params.endKey = csn->endKey;
+        params.endKeyInclusive = csn->endKeyInclusive;
 
         return new CountScan(txn, params, ws);
+    } else if (STAGE_ENSURE_SORTED == root->getType()) {
+        const EnsureSortedNode* esn = static_cast<const EnsureSortedNode*>(root);
+        PlanStage* childStage = buildStages(txn, collection, qsol, esn->children[0], ws);
+        if (NULL == childStage) {
+            return NULL;
+        }
+        return new EnsureSortedStage(txn, esn->pattern, ws, childStage);
     } else {
         mongoutils::str::stream ss;
         root->appendToString(&ss, 0);
@@ -338,9 +345,16 @@ PlanStage* buildStages(OperationContext* txn,
 // static (this one is used for Cached and MultiPlanStage)
 bool StageBuilder::build(OperationContext* txn,
                          Collection* collection,
+                         const CanonicalQuery& cq,
                          const QuerySolution& solution,
                          WorkingSet* wsIn,
                          PlanStage** rootOut) {
+    // Only QuerySolutions derived from queries parsed with context, or QuerySolutions derived from
+    // queries that disallow extensions, can be properly executed. If the query does not have
+    // $text/$where context (and $text/$where are allowed), then no attempt should be made to
+    // execute the query.
+    invariant(!cq.hasNoopExtensions());
+
     if (NULL == wsIn || NULL == rootOut) {
         return false;
     }

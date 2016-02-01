@@ -156,14 +156,14 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* txn,
         return status;
 
     mutablebson::Document resultDoc(*result, mutablebson::Document::kInPlaceDisabled);
-    resolveUserRoles(&resultDoc, directRoles);
+    _resolveUserRoles(&resultDoc, directRoles);
     *result = resultDoc.getObject();
 
     return Status::OK();
 }
 
-void AuthzManagerExternalStateLocal::resolveUserRoles(mutablebson::Document* userDoc,
-                                                      const std::vector<RoleName>& directRoles) {
+void AuthzManagerExternalStateLocal::_resolveUserRoles(mutablebson::Document* userDoc,
+                                                       const std::vector<RoleName>& directRoles) {
     unordered_set<RoleName> indirectRoles;
     PrivilegeVector allPrivileges;
     bool isRoleGraphInconsistent;
@@ -227,7 +227,8 @@ Status AuthzManagerExternalStateLocal::_getUserDocument(OperationContext* txn,
     return status;
 }
 
-Status AuthzManagerExternalStateLocal::getRoleDescription(const RoleName& roleName,
+Status AuthzManagerExternalStateLocal::getRoleDescription(OperationContext* txn,
+                                                          const RoleName& roleName,
                                                           bool showPrivileges,
                                                           BSONObj* result) {
     stdx::lock_guard<stdx::mutex> lk(_roleGraphMutex);
@@ -286,7 +287,8 @@ Status AuthzManagerExternalStateLocal::_getRoleDescription_inlock(const RoleName
     return Status::OK();
 }
 
-Status AuthzManagerExternalStateLocal::getRoleDescriptionsForDB(const std::string dbname,
+Status AuthzManagerExternalStateLocal::getRoleDescriptionsForDB(OperationContext* txn,
+                                                                const std::string dbname,
                                                                 bool showPrivileges,
                                                                 bool showBuiltinRoles,
                                                                 vector<BSONObj>* result) {
@@ -421,7 +423,7 @@ private:
 };
 
 void AuthzManagerExternalStateLocal::logOp(
-    OperationContext* txn, const char* op, const char* ns, const BSONObj& o, BSONObj* o2) {
+    OperationContext* txn, const char* op, const char* ns, const BSONObj& o, const BSONObj* o2) {
     if (ns == AuthorizationManager::rolesCollectionNamespace.ns() ||
         ns == AuthorizationManager::adminCommandNamespace.ns()) {
         txn->recoveryUnit()->registerChange(new AuthzManagerLogOpHandler(this, op, ns, o, o2));

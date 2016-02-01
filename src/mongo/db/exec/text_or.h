@@ -51,8 +51,7 @@ class OperationContext;
  * A blocking stage that returns the set of WSMs with RecordIDs of all of the documents that contain
  * the positive terms in the search query, as well as their scores.
  *
- * The WorkingSetMembers returned are in the LOC_AND_IDX state. If a filter is passed in, some
- * WorkingSetMembers may be returned in the LOC_AND_OBJ state.
+ * The WorkingSetMembers returned are fetched and in the LOC_AND_OBJ state.
  */
 class TextOrStage final : public PlanStage {
 public:
@@ -78,27 +77,25 @@ public:
                 WorkingSet* ws,
                 const MatchExpression* filter,
                 IndexDescriptor* index);
-    ~TextOrStage() final;
+    ~TextOrStage();
 
     void addChild(unique_ptr<PlanStage> child);
 
     bool isEOF() final;
 
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
 
-    void saveState() final;
-    void restoreState(OperationContext* opCtx) final;
-    void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
-
-    std::vector<PlanStage*> getChildren() const final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_TEXT_OR;
     }
 
     std::unique_ptr<PlanStageStats> getStats() final;
-
-    const CommonStats* getCommonStats() const final;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -137,9 +134,6 @@ private:
     // What state are we in?  See the State enum above.
     State _internalState = State::kInit;
 
-    // Children owned by us.
-    vector<unique_ptr<PlanStage>> _children;
-
     // Which of _children are we calling work(...) on now?
     size_t _currentChild = 0;
 
@@ -158,15 +152,12 @@ private:
     ScoreMap _scores;
     ScoreMap::const_iterator _scoreIterator;
 
-    // Stats
-    CommonStats _commonStats;
     TextOrStats _specificStats;
 
     // Members needed only for using the TextMatchableDocument.
     const MatchExpression* _filter;
-    OperationContext* _txn;
     WorkingSetID _idRetrying;
-    std::unique_ptr<RecordCursor> _recordCursor;
+    std::unique_ptr<SeekableRecordCursor> _recordCursor;
     IndexDescriptor* _index;
 };
 }

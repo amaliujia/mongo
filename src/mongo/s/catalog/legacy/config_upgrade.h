@@ -33,6 +33,8 @@
 namespace mongo {
 
 class CatalogManager;
+class DistLockManager;
+class OperationContext;
 class Status;
 class VersionType;
 
@@ -46,14 +48,10 @@ Status getConfigVersion(CatalogManager* catalogManager, VersionType* versionInfo
 /**
  * Checks the config version and ensures it's the latest version, otherwise tries to update.
  *
- * @return true if the config version is now compatible.
- * @return initial and finalVersionInfo indicating the start and end versions of the upgrade.
- *         These are the same if no upgrade occurred.
+ * Returns Status::OK() on success, or an error status indicating the source of failure.
  */
-bool checkAndUpgradeConfigVersion(CatalogManager* catalogManager,
-                                  bool upgrade,
-                                  VersionType* initialVersionInfo,
-                                  VersionType* finalVersionInfo,
-                                  std::string* errMsg);
+Status checkAndInitConfigVersion(OperationContext* txn,
+                                 CatalogManager* catalogManager,
+                                 DistLockManager* distLockManager);
 
 }  // namespace mongo

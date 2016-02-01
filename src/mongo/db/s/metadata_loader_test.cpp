@@ -35,6 +35,7 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
@@ -63,7 +64,8 @@ public:
     void setUp() {
         ConnectionString configLoc = ConnectionString(HostAndPort(CONFIG_HOST_PORT));
         ASSERT(configLoc.isValid());
-        ASSERT_OK(_catalogManager.init(configLoc));
+        std::string lockProcessId = "testhost:123455:1234567890:9876543210";
+        ASSERT_OK(_catalogManager.init(configLoc, lockProcessId));
     }
 
 protected:
@@ -77,6 +79,7 @@ private:
 
 
 TEST_F(MetadataLoaderFixture, DroppedColl) {
+    OperationContextNoop txn;
     MockRemoteDBServer dummyConfig(CONFIG_HOST_PORT);
     mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
     MockConnRegistry::get()->addServer(&dummyConfig);
@@ -95,7 +98,8 @@ TEST_F(MetadataLoaderFixture, DroppedColl) {
 
     string errmsg;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -108,6 +112,7 @@ TEST_F(MetadataLoaderFixture, DroppedColl) {
 }
 
 TEST_F(MetadataLoaderFixture, EmptyColl) {
+    OperationContextNoop txn;
     MockRemoteDBServer dummyConfig(CONFIG_HOST_PORT);
     mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
     MockConnRegistry::get()->addServer(&dummyConfig);
@@ -116,7 +121,8 @@ TEST_F(MetadataLoaderFixture, EmptyColl) {
 
     string errmsg;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -129,6 +135,7 @@ TEST_F(MetadataLoaderFixture, EmptyColl) {
 }
 
 TEST_F(MetadataLoaderFixture, BadColl) {
+    OperationContextNoop txn;
     MockRemoteDBServer dummyConfig(CONFIG_HOST_PORT);
     mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
     MockConnRegistry::get()->addServer(&dummyConfig);
@@ -139,7 +146,8 @@ TEST_F(MetadataLoaderFixture, BadColl) {
 
     string errmsg;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -152,6 +160,7 @@ TEST_F(MetadataLoaderFixture, BadColl) {
 }
 
 TEST_F(MetadataLoaderFixture, BadChunk) {
+    OperationContextNoop txn;
     MockRemoteDBServer dummyConfig(CONFIG_HOST_PORT);
     mongo::ConnectionString::setConnectionHook(MockConnRegistry::get()->getConnStrHook());
     MockConnRegistry::get()->addServer(&dummyConfig);
@@ -176,7 +185,8 @@ TEST_F(MetadataLoaderFixture, BadChunk) {
 
     string errmsg;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -218,10 +228,12 @@ private:
 };
 
 TEST_F(NoChunkFixture, NoChunksIsDropped) {
+    OperationContextNoop txn;
     MetadataLoader loader;
 
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -280,10 +292,12 @@ private:
 };
 
 TEST_F(NoChunkHereFixture, CheckNumChunk) {
+    OperationContextNoop txn;
     MetadataLoader loader;
 
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -348,9 +362,11 @@ private:
 };
 
 TEST_F(ConfigServerFixture, SingleChunkCheckNumChunk) {
+    OperationContextNoop txn;
     MetadataLoader loader;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -360,9 +376,11 @@ TEST_F(ConfigServerFixture, SingleChunkCheckNumChunk) {
 }
 
 TEST_F(ConfigServerFixture, SingleChunkGetNext) {
+    OperationContextNoop txn;
     MetadataLoader loader;
     CollectionMetadata metadata;
-    loader.makeCollectionMetadata(catalogManager(),
+    loader.makeCollectionMetadata(&txn,
+                                  catalogManager(),
                                   "test.foo",
                                   "shard0000",
                                   NULL, /* no old metadata */
@@ -372,9 +390,11 @@ TEST_F(ConfigServerFixture, SingleChunkGetNext) {
 }
 
 TEST_F(ConfigServerFixture, SingleChunkGetShardKey) {
+    OperationContextNoop txn;
     MetadataLoader loader;
     CollectionMetadata metadata;
-    loader.makeCollectionMetadata(catalogManager(),
+    loader.makeCollectionMetadata(&txn,
+                                  catalogManager(),
                                   "test.foo",
                                   "shard0000",
                                   NULL, /* no old metadata */
@@ -383,9 +403,11 @@ TEST_F(ConfigServerFixture, SingleChunkGetShardKey) {
 }
 
 TEST_F(ConfigServerFixture, SingleChunkGetMaxCollVersion) {
+    OperationContextNoop txn;
     MetadataLoader loader;
     CollectionMetadata metadata;
-    loader.makeCollectionMetadata(catalogManager(),
+    loader.makeCollectionMetadata(&txn,
+                                  catalogManager(),
                                   "test.foo",
                                   "shard0000",
                                   NULL, /* no old metadata */
@@ -395,9 +417,11 @@ TEST_F(ConfigServerFixture, SingleChunkGetMaxCollVersion) {
 }
 
 TEST_F(ConfigServerFixture, SingleChunkGetMaxShardVersion) {
+    OperationContextNoop txn;
     MetadataLoader loader;
     CollectionMetadata metadata;
-    loader.makeCollectionMetadata(catalogManager(),
+    loader.makeCollectionMetadata(&txn,
+                                  catalogManager(),
                                   "test.foo",
                                   "shard0000",
                                   NULL, /* no old metadata */
@@ -407,11 +431,13 @@ TEST_F(ConfigServerFixture, SingleChunkGetMaxShardVersion) {
 }
 
 TEST_F(ConfigServerFixture, NoChunks) {
+    OperationContextNoop txn;
     getConfigServer()->remove(ChunkType::ConfigNS, BSONObj());
 
     MetadataLoader loader;
     CollectionMetadata metadata;
-    Status status = loader.makeCollectionMetadata(catalogManager(),
+    Status status = loader.makeCollectionMetadata(&txn,
+                                                  catalogManager(),
                                                   "test.foo",
                                                   "shard0000",
                                                   NULL, /* no old metadata */
@@ -439,7 +465,9 @@ protected:
         return *_loader;
     }
 
-    void getMetadataFor(const OwnedPointerVector<ChunkType>& chunks, CollectionMetadata* metadata) {
+    void getMetadataFor(OperationContext* txn,
+                        const OwnedPointerVector<ChunkType>& chunks,
+                        CollectionMetadata* metadata) {
         // Infer namespace, shard, epoch, keypattern from first chunk
         const ChunkType* firstChunk = *(chunks.vector().begin());
 
@@ -481,7 +509,7 @@ protected:
         }
 
         Status status =
-            loader().makeCollectionMetadata(catalogManager(), ns, shardName, NULL, metadata);
+            loader().makeCollectionMetadata(txn, catalogManager(), ns, shardName, NULL, metadata);
         ASSERT(status.isOK());
     }
 
@@ -495,6 +523,7 @@ private:
 };
 
 TEST_F(MultipleMetadataFixture, PromotePendingNA) {
+    OperationContextNoop txn;
     unique_ptr<ChunkType> chunk(new ChunkType());
     chunk->setNS("foo.bar");
     chunk->setShard("shard0000");
@@ -506,13 +535,13 @@ TEST_F(MultipleMetadataFixture, PromotePendingNA) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
+    getMetadataFor(&txn, chunks, &afterMetadata);
 
     // Metadata of different epoch
     (*chunks.vector().begin())->setVersion(ChunkVersion(1, 0, OID::gen()));
 
     CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
+    getMetadataFor(&txn, chunks, &remoteMetadata);
 
     Status status = loader().promotePendingChunks(&afterMetadata, &remoteMetadata);
     ASSERT(status.isOK());
@@ -531,6 +560,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingNA) {
 }
 
 TEST_F(MultipleMetadataFixture, PromotePendingNAVersion) {
+    OperationContextNoop txn;
     OID epoch = OID::gen();
 
     unique_ptr<ChunkType> chunk(new ChunkType());
@@ -544,13 +574,13 @@ TEST_F(MultipleMetadataFixture, PromotePendingNAVersion) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
+    getMetadataFor(&txn, chunks, &afterMetadata);
 
     // Metadata of same epoch, but lower version
     (*chunks.vector().begin())->setVersion(ChunkVersion(1, 0, epoch));
 
     CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
+    getMetadataFor(&txn, chunks, &remoteMetadata);
 
     Status status = loader().promotePendingChunks(&afterMetadata, &remoteMetadata);
     ASSERT(status.isOK());
@@ -569,6 +599,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingNAVersion) {
 }
 
 TEST_F(MultipleMetadataFixture, PromotePendingGoodOverlap) {
+    OperationContextNoop txn;
     OID epoch = OID::gen();
 
     //
@@ -600,7 +631,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingGoodOverlap) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
+    getMetadataFor(&txn, chunks, &remoteMetadata);
 
     //
     // Setup chunk and pending range for afterMetadata
@@ -618,7 +649,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingGoodOverlap) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
+    getMetadataFor(&txn, chunks, &afterMetadata);
 
     string errMsg;
     ChunkType pending;
@@ -654,6 +685,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingGoodOverlap) {
 }
 
 TEST_F(MultipleMetadataFixture, PromotePendingBadOverlap) {
+    OperationContextNoop txn;
     OID epoch = OID::gen();
 
     //
@@ -672,7 +704,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingBadOverlap) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
+    getMetadataFor(&txn, chunks, &remoteMetadata);
 
     //
     // Setup chunk and pending range for afterMetadata
@@ -690,7 +722,7 @@ TEST_F(MultipleMetadataFixture, PromotePendingBadOverlap) {
     chunks.mutableVector().push_back(chunk.release());
 
     CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
+    getMetadataFor(&txn, chunks, &afterMetadata);
 
     string errMsg;
     ChunkType pending;

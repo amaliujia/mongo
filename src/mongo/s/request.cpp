@@ -40,7 +40,6 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/cluster_last_error_info.h"
-#include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
 #include "mongo/util/log.h"
@@ -48,7 +47,6 @@
 
 namespace mongo {
 
-using std::endl;
 using std::string;
 
 Request::Request(Message& m, AbstractMessagingPort* p)
@@ -56,7 +54,7 @@ Request::Request(Message& m, AbstractMessagingPort* p)
     ClusterLastErrorInfo::get(_clientInfo).newRequest();
 }
 
-void Request::init() {
+void Request::init(OperationContext* txn) {
     if (_didInit) {
         return;
     }
@@ -77,26 +75,25 @@ void Request::init() {
                 nss.isValid());
     }
 
-    AuthorizationSession::get(_clientInfo)->startRequest(NULL);
+    AuthorizationSession::get(_clientInfo)->startRequest(txn);
     _didInit = true;
 }
 
-void Request::process(int attempt) {
-    init();
+void Request::process(OperationContext* txn, int attempt) {
+    init(txn);
     int op = _m.operation();
     verify(op > dbMsg);
 
     const MSGID msgId = _m.header().getId();
 
-    Timer t;
-    LOG(3) << "Request::process begin ns: " << getns() << " msg id: " << msgId << " op: " << op
-           << " attempt: " << attempt << endl;
+    LOG(3) << "Request::process begin ns: " << getnsIfPresent() << " msg id: " << msgId
+           << " op: " << op << " attempt: " << attempt;
 
     _d.markSet();
 
     bool iscmd = false;
     if (op == dbKillCursors) {
-        cursorCache.gotKillCursors(_m);
+        Strategy::killCursors(txn, *this);
         globalOpCounters.gotOp(op, iscmd);
     } else if (op == dbQuery) {
         NamespaceString nss(getns());
@@ -109,35 +106,20 @@ void Request::process(int attempt) {
                                   << ") for $cmd type ns - can only be 1 or -1",
                     n == 1 || n == -1);
 
-            Strategy::clientCommandOp(*this);
+            Strategy::clientCommandOp(txn, *this);
         } else {
-            Strategy::queryOp(*this);
+            Strategy::queryOp(txn, *this);
         }
     } else if (op == dbGetMore) {
-        Strategy::getMore(*this);
+        Strategy::getMore(txn, *this);
         globalOpCounters.gotOp(op, iscmd);
     } else {
-        Strategy::writeOp(op, *this);
+        Strategy::writeOp(txn, op, *this);
         // globalOpCounters are handled by write commands.
     }
 
-    LOG(3) << "Request::process end ns: " << getns() << " msg id: " << msgId << " op: " << op
-           << " attempt: " << attempt << " " << t.millis() << "ms" << endl;
-}
-
-void Request::reply(Message& response, const string& fromServer) {
-    verify(_didInit);
-    long long cursor = response.header().getCursor();
-    if (cursor) {
-        if (fromServer.size()) {
-            cursorCache.storeRef(fromServer, cursor, getns());
-        } else {
-            // probably a getMore
-            // make sure we have a ref for this
-            verify(cursorCache.getRef(cursor).size());
-        }
-    }
-    _p->reply(_m, response, _id);
+    LOG(3) << "Request::process end ns: " << getnsIfPresent() << " msg id: " << msgId
+           << " op: " << op << " attempt: " << attempt;
 }
 
 }  // namespace mongo

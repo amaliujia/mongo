@@ -37,47 +37,51 @@
 
 namespace mongo {
 
+class IndexAccessMethod;
 class RecordCursor;
 
 /**
  * A standalone stage implementing the fast path for key-value retrievals
  * via the _id index.
  */
-class IDHackStage : public PlanStage {
+class IDHackStage final : public PlanStage {
 public:
     /** Takes ownership of all the arguments -collection. */
     IDHackStage(OperationContext* txn,
                 const Collection* collection,
                 CanonicalQuery* query,
-                WorkingSet* ws);
+                WorkingSet* ws,
+                const IndexDescriptor* descriptor);
 
-    IDHackStage(OperationContext* txn, Collection* collection, const BSONObj& key, WorkingSet* ws);
+    IDHackStage(OperationContext* txn,
+                Collection* collection,
+                const BSONObj& key,
+                WorkingSet* ws,
+                const IndexDescriptor* descriptor);
 
-    virtual ~IDHackStage();
+    ~IDHackStage();
 
-    virtual bool isEOF();
-    virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-    virtual void saveState();
-    virtual void restoreState(OperationContext* opCtx);
-    virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
     /**
      * ID Hack has a very strict criteria for the queries it supports.
      */
     static bool supportsQuery(const CanonicalQuery& query);
 
-    virtual std::vector<PlanStage*> getChildren() const;
-
-    virtual StageType stageType() const {
+    StageType stageType() const final {
         return STAGE_IDHACK;
     }
 
     std::unique_ptr<PlanStageStats> getStats();
 
-    virtual const CommonStats* getCommonStats() const;
-
-    virtual const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const final;
 
     static const char* kStageType;
 
@@ -89,16 +93,16 @@ private:
      */
     StageState advance(WorkingSetID id, WorkingSetMember* member, WorkingSetID* out);
 
-    // transactional context for read locks. Not owned by us
-    OperationContext* _txn;
-
     // Not owned here.
     const Collection* _collection;
 
-    std::unique_ptr<RecordCursor> _recordCursor;
+    std::unique_ptr<SeekableRecordCursor> _recordCursor;
 
     // The WorkingSet we annotate with results.  Not owned by us.
     WorkingSet* _workingSet;
+
+    // Not owned here.
+    const IndexAccessMethod* _accessMethod;
 
     // The value to match against the _id field.
     BSONObj _key;
@@ -106,7 +110,7 @@ private:
     // Have we returned our one document?
     bool _done;
 
-    // Do we need to add index key metadata for $returnKey?
+    // Do we need to add index key metadata for returnKey?
     bool _addKeyMetadata;
 
     // If we want to return a RecordId and it points to something that's not in memory,
@@ -115,7 +119,6 @@ private:
     // the fetch request.
     WorkingSetID _idBeingPagedIn;
 
-    CommonStats _commonStats;
     IDHackStats _specificStats;
 };
 

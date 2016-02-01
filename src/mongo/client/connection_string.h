@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
@@ -39,8 +40,6 @@
 namespace mongo {
 
 class DBClientBase;
-template <typename T>
-class StatusWith;
 
 /**
  * ConnectionString handles parsing different ways to connect to mongo and determining method
@@ -75,7 +74,17 @@ public:
      */
     explicit ConnectionString(const HostAndPort& server);
 
+    /**
+     * Creates a connection string from an unparsed list of servers, type, and setName.
+     */
     ConnectionString(ConnectionType type, const std::string& s, const std::string& setName);
+
+    /**
+     * Creates a connection string from a pre-parsed list of servers, type, and setName.
+     */
+    ConnectionString(ConnectionType type,
+                     std::vector<HostAndPort> servers,
+                     const std::string& setName);
 
     ConnectionString(const std::string& s, ConnectionType favoredMultipleType);
 
@@ -109,7 +118,6 @@ public:
 
     DBClientBase* connect(std::string& errmsg, double socketTimeout = 0) const;
 
-    static ConnectionString parse(const std::string& url, std::string& errmsg);
     static StatusWith<ConnectionString> parse(const std::string& url);
 
     static std::string typeToString(ConnectionType type);

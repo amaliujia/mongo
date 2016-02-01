@@ -36,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/unittest/unittest.h"
@@ -51,7 +52,8 @@ bool filterMatches(const BSONObj& testFilter, const QuerySolutionNode* trueFilte
     if (NULL == trueFilterNode->filter) {
         return false;
     }
-    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(testFilter);
+    StatusWithMatchExpression statusWithMatcher =
+        MatchExpressionParser::parse(testFilter, ExtensionsCallbackDisallowExtensions());
     if (!statusWithMatcher.isOK()) {
         return false;
     }
@@ -297,21 +299,28 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
 
         BSONElement searchElt = textObj["search"];
         if (!searchElt.eoo()) {
-            if (searchElt.String() != node->query) {
+            if (searchElt.String() != node->ftsQuery->getQuery()) {
                 return false;
             }
         }
 
         BSONElement languageElt = textObj["language"];
         if (!languageElt.eoo()) {
-            if (languageElt.String() != node->language) {
+            if (languageElt.String() != node->ftsQuery->getLanguage()) {
                 return false;
             }
         }
 
         BSONElement caseSensitiveElt = textObj["caseSensitive"];
         if (!caseSensitiveElt.eoo()) {
-            if (caseSensitiveElt.trueValue() != node->caseSensitive) {
+            if (caseSensitiveElt.trueValue() != node->ftsQuery->getCaseSensitive()) {
+                return false;
+            }
+        }
+
+        BSONElement diacriticSensitiveElt = textObj["diacriticSensitive"];
+        if (!diacriticSensitiveElt.eoo()) {
+            if (diacriticSensitiveElt.trueValue() != node->ftsQuery->getDiacriticSensitive()) {
                 return false;
             }
         }
@@ -479,6 +488,20 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         size_t expectedLimit = limitEl.numberInt();
         return (patternEl.Obj() == sn->pattern) && (expectedLimit == sn->limit) &&
             solutionMatches(child.Obj(), sn->children[0]);
+    } else if (STAGE_SORT_KEY_GENERATOR == trueSoln->getType()) {
+        const SortKeyGeneratorNode* keyGenNode = static_cast<const SortKeyGeneratorNode*>(trueSoln);
+        BSONElement el = testSoln["sortKeyGen"];
+        if (el.eoo() || !el.isABSONObj()) {
+            return false;
+        }
+        BSONObj keyGenObj = el.Obj();
+
+        BSONElement child = keyGenObj["node"];
+        if (child.eoo() || !child.isABSONObj()) {
+            return false;
+        }
+
+        return solutionMatches(child.Obj(), keyGenNode->children[0]);
     } else if (STAGE_SORT_MERGE == trueSoln->getType()) {
         const MergeSortNode* msn = static_cast<const MergeSortNode*>(trueSoln);
         BSONElement el = testSoln["mergeSort"];
@@ -554,6 +577,25 @@ bool QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
 
         return solutionMatches(child.Obj(), fn->children[0]);
+    } else if (STAGE_ENSURE_SORTED == trueSoln->getType()) {
+        const EnsureSortedNode* esn = static_cast<const EnsureSortedNode*>(trueSoln);
+
+        BSONElement el = testSoln["ensureSorted"];
+        if (el.eoo() || !el.isABSONObj()) {
+            return false;
+        }
+        BSONObj esObj = el.Obj();
+
+        BSONElement patternEl = esObj["pattern"];
+        if (patternEl.eoo() || !patternEl.isABSONObj()) {
+            return false;
+        }
+        BSONElement child = esObj["node"];
+        if (child.eoo() || !child.isABSONObj()) {
+            return false;
+        }
+
+        return (patternEl.Obj() == esn->pattern) && solutionMatches(child.Obj(), esn->children[0]);
     }
 
     return false;

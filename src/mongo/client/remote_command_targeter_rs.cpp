@@ -58,24 +58,21 @@ ConnectionString RemoteCommandTargeterRS::connectionString() {
     return fassertStatusOK(28712, ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref) {
-    if (!_rsMonitor) {
-        return Status(ErrorCodes::ReplicaSetNotFound,
-                      str::stream() << "unknown replica set " << _rsName);
-    }
+StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref,
+                                                          Milliseconds maxWait) {
+    return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+}
 
-    HostAndPort hostAndPort = _rsMonitor->getHostOrRefresh(readPref);
-    if (hostAndPort.empty()) {
-        if (readPref.pref == ReadPreference::PrimaryOnly) {
-            return Status(ErrorCodes::NotMaster,
-                          str::stream() << "No master found for set " << _rsName);
-        }
-        return Status(ErrorCodes::FailedToSatisfyReadPreference,
-                      str::stream() << "could not find host matching read preference "
-                                    << readPref.toString() << " for set " << _rsName);
-    }
+void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host) {
+    invariant(_rsMonitor);
 
-    return hostAndPort;
+    _rsMonitor->failedHost(host);
+}
+
+void RemoteCommandTargeterRS::markHostUnreachable(const HostAndPort& host) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host);
 }
 
 }  // namespace mongo
